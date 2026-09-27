@@ -123,3 +123,29 @@ S4: Reduce the comment-heavy implementation narration to short explanations of g
 Other notes:
 
 Fix all the issues in this revision
+
+---
+
+## v17 — tg 1239 — revision_requested — 2026-09-27 21:00
+
+Quality score: 5
+
+Problem Description - (2/3) Minor
+P4: Qualify whole-word retention with “when such a word exists.” Punctuation-only and non-ASCII descriptions cannot satisfy the unconditional requirement. Shorten the dense classification paragraph without changing its behavioral contract.
+
+Tests - (1/3) Weak
+T3/T4: The sole current passing implementation fails six independent public-behavior probes; the reference passes all six. Add regressions covering:
+- Legacy backslash–CR contents: independently seed an existing violation file. The passing implementation removes a literal backslash; candidate-written round trips conceal this corruption.
+- Original callback input: verify that custom naming strategies receive the original CRLF-bearing description, not a normalized replacement.
+- Inherited configuration: supply default.fileNames through Properties defaults and verify rejection when a constructor strategy is also supplied.
+- Symlinked store directories: exercise initialization, saving and reading through a directory alias. This works at the pinned baseline but the passing implementation rejects it.
+- Strategy-class visibility: cover a non-public implementation with the required public no-argument constructor. The passing implementation imposes an additional, unstated public-class restriction.
+- Distinct raw index keys: repair a broken CRLF-bearing key beside a healthy LF-bearing key. The passing implementation removes the healthy mapping and leaves the broken one.
+T5: Two overlong-word tests still require lowercase controllers. A deterministic uppercase variant preserves the qualifying word and satisfies the remaining naming requirements, yet fails exactly these two assertions. Remove the redundant case-sensitive checks or make them case-insensitive.
+T1/T6: Trim remaining comments that merely narrate fixture contents or expected behavior.
+
+Solution & Code - (3/3) Clean
+
+Other notes:
+
+This is your last revision

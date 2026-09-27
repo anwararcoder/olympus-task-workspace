@@ -7,7 +7,7 @@ cd archunit-kh76b5kmd3qae2eprydzvb9k4x8cve47
 git checkout ab6a677dd4b678f0ab1d9481df17222916705170
 
 # Create challenge branch
-git checkout -b shipd-challenge/kh76b5kmd3qae2eprydzvb9k4x8cve47-v17
+git checkout -b shipd-challenge/kh76b5kmd3qae2eprydzvb9k4x8cve47-v18
 
 # Write problem description (reference only)
 cat > problem.md << '__SHIPD_PROBLEM_CONTENT__'
