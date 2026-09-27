@@ -1,29 +1,28 @@
 diff --git a/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java b/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java
-index fd2bcc5..ac55f75 100644
+index fd2bcc5..a1ea950 100644
 --- a/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java
 +++ b/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java
-@@ -17,13 +17,30 @@ package com.tngtech.archunit.library.freeze;
+@@ -15,15 +15,28 @@
+  */
+ package com.tngtech.archunit.library.freeze;
  
++import java.io.ByteArrayOutputStream;
  import java.io.File;
- import java.io.FileInputStream;
+-import java.io.FileInputStream;
 -import java.io.FileOutputStream;
  import java.io.IOException;
-+import java.lang.reflect.InvocationTargetException;
-+import java.lang.reflect.Modifier;
-+import java.nio.file.DirectoryStream;
-+import java.nio.file.FileAlreadyExistsException;
++import java.lang.reflect.Constructor;
++import java.nio.file.AtomicMoveNotSupportedException;
  import java.nio.file.Files;
 +import java.nio.file.LinkOption;
 +import java.nio.file.Path;
 +import java.nio.file.StandardCopyOption;
-+import java.nio.file.StandardOpenOption;
 +import java.security.MessageDigest;
 +import java.security.NoSuchAlgorithmException;
 +import java.util.ArrayList;
 +import java.util.Collections;
 +import java.util.Comparator;
 +import java.util.HashMap;
-+import java.util.HashSet;
  import java.util.List;
 +import java.util.Map;
  import java.util.Properties;
@@ -34,7 +33,7 @@ index fd2bcc5..ac55f75 100644
  import java.util.regex.Pattern;
  
  import com.google.common.base.Splitter;
-@@ -33,39 +50,35 @@ import org.slf4j.Logger;
+@@ -33,6 +46,7 @@ import org.slf4j.Logger;
  import org.slf4j.LoggerFactory;
  
  import static com.google.common.base.Preconditions.checkArgument;
@@ -42,11 +41,7 @@ index fd2bcc5..ac55f75 100644
  import static com.google.common.io.Files.toByteArray;
  import static com.tngtech.archunit.PublicAPI.Usage.ACCESS;
  import static com.tngtech.archunit.PublicAPI.Usage.INHERITANCE;
- import static com.tngtech.archunit.library.freeze.FreezingArchRule.ensureUnixLineBreaks;
- import static java.nio.charset.StandardCharsets.UTF_8;
-+import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
- import static java.util.stream.Collectors.toList;
- 
+@@ -43,29 +57,24 @@ import static java.util.stream.Collectors.toList;
  /**
   * A text file based implementation of a {@link ViolationStore}.<br>
   * This {@link ViolationStore} will store the violations of every single {@link FreezingArchRule} in a dedicated file.<br>
@@ -69,8 +64,8 @@ index fd2bcc5..ac55f75 100644
   * default.path=...               # string: the path of the folder where violation files will be stored
   * default.allowStoreCreation=... # boolean: whether to allow creating a new index file
   * default.allowStoreUpdate=...   # boolean: whether to allow updating any store file
-+ * default.fileNames=random       # random, description, or a RuleViolationFileNameStrategy class
-+ * default.integrity=ignore       # ignore, repair, or fail
++ * default.fileNames=...          # random, description, or a strategy class name
++ * default.integrity=...          # repair, fail, or ignore
   * </code></pre>
   */
  @PublicAPI(usage = ACCESS)
@@ -79,48 +74,46 @@ index fd2bcc5..ac55f75 100644
  
 -    private static final Pattern UNESCAPED_LINE_BREAK_PATTERN = Pattern.compile("(?<!\\\\)\n");
 +    private static final Pattern UNESCAPED_LINE_BREAK_PATTERN = Pattern.compile("(?<!\\\\)\\n");
-+    private static final Pattern DESCRIPTION_WORD_PATTERN = Pattern.compile("[A-Za-z0-9]+");
++    private static final Pattern ONLY_LINE_BREAKS_PATTERN = Pattern.compile("(?:\\n|\\r\\n|\\r)*");
++    private static final Pattern DESCRIPTION_WORD_PATTERN = Pattern.compile("(?<![A-Za-z0-9])([A-Za-z0-9]{4,120})(?![A-Za-z0-9])");
      private static final String STORE_PATH_PROPERTY_NAME = "default.path";
      private static final String STORE_PATH_DEFAULT = "archunit_store";
      private static final String STORED_RULES_FILE_NAME = "stored.rules";
-@@ -73,126 +86,439 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+@@ -73,217 +82,846 @@ public final class TextFileBasedViolationStore implements ViolationStore {
      private static final String ALLOW_STORE_CREATION_DEFAULT = "false";
      private static final String ALLOW_STORE_UPDATE_PROPERTY_NAME = "default.allowStoreUpdate";
      private static final String ALLOW_STORE_UPDATE_DEFAULT = "true";
 +    private static final String FILE_NAMES_PROPERTY_NAME = "default.fileNames";
-+    private static final String FILE_NAMES_RANDOM = "random";
-+    private static final String FILE_NAMES_DESCRIPTION = "description";
 +    private static final String INTEGRITY_PROPERTY_NAME = "default.integrity";
-+    private static final String INTEGRITY_IGNORE = "ignore";
-+    private static final String INTEGRITY_REPAIR = "repair";
-+    private static final String INTEGRITY_FAIL = "fail";
++    private static final String INTEGRITY_DEFAULT = "ignore";
  
-     private static final ConcurrentHashMap<String, FileSyncedProperties> STORED_RULES_BY_PATH = new ConcurrentHashMap<>();
-+    private static final ConcurrentHashMap<String, Object> STORE_LOCKS_BY_PATH = new ConcurrentHashMap<>();
+-    private static final ConcurrentHashMap<String, FileSyncedProperties> STORED_RULES_BY_PATH = new ConcurrentHashMap<>();
++    private static final ConcurrentHashMap<String, StoreState> STORES_BY_PATH = new ConcurrentHashMap<>();
  
 -    private final RuleViolationFileNameStrategy ruleViolationFileNameStrategy;
-+    private final RuleViolationFileNameStrategy constructorStrategy;
-+    private final boolean strategyWasPassedToConstructor;
++    private final RuleViolationFileNameStrategy constructorFileNameStrategy;
++    private final boolean hasConstructorFileNameStrategy;
  
-     private boolean storeCreationAllowed;
-     private boolean storeUpdateAllowed;
+-    private boolean storeCreationAllowed;
++    private RuleViolationFileNameStrategy fileNameStrategy;
++    private boolean randomFileNames;
++    private boolean configuredRandomFileNames;
 +    private IntegrityMode integrityMode;
+     private boolean storeUpdateAllowed;
      private File storeFolder;
-+    private Path storeFolderPath;
-     private FileSyncedProperties storedRules;
-+    private RuleViolationFileNameStrategy ruleViolationFileNameStrategy;
+-    private FileSyncedProperties storedRules;
++    private StoreState storeState;
  
      /**
 -     * Creates a standard {@link TextFileBasedViolationStore} that names rule violation files by random {@link UUID}s
-+     * Creates a standard {@link TextFileBasedViolationStore} that names rule violation files randomly.
-+     * The strategy can be changed to the deterministic description strategy with {@code default.fileNames=description}.
++     * Creates a standard {@link TextFileBasedViolationStore} that names rule violation files by random {@link UUID}s.
       *
       * @see #TextFileBasedViolationStore(RuleViolationFileNameStrategy)
       */
      public TextFileBasedViolationStore() {
 -        this(__ -> UUID.randomUUID().toString());
-+        constructorStrategy = null;
-+        strategyWasPassedToConstructor = false;
++        constructorFileNameStrategy = __ -> UUID.randomUUID().toString();
++        hasConstructorFileNameStrategy = false;
      }
  
      /**
@@ -131,8 +124,8 @@ index fd2bcc5..ac55f75 100644
       */
      public TextFileBasedViolationStore(RuleViolationFileNameStrategy ruleViolationFileNameStrategy) {
 -        this.ruleViolationFileNameStrategy = ruleViolationFileNameStrategy;
-+        constructorStrategy = checkNotNull(ruleViolationFileNameStrategy);
-+        strategyWasPassedToConstructor = true;
++        constructorFileNameStrategy = checkNotNull(ruleViolationFileNameStrategy);
++        hasConstructorFileNameStrategy = true;
      }
  
      @Override
@@ -145,158 +138,168 @@ index fd2bcc5..ac55f75 100644
 -        log.trace("Initializing {} at {}", TextFileBasedViolationStore.class.getSimpleName(), storedRulesFile.getAbsolutePath());
 -        storedRules = getOrCreateStoredRules(storedRulesFile);
 -        checkInitialization(storedRules.initializationSuccessful(), "Cannot create rule store at %s", storedRulesFile.getAbsolutePath());
-+        Properties configuration = checkNotNull(properties);
++        Properties configuration = properties == null ? new Properties() : properties;
 +        boolean configuredStoreCreationAllowed = Boolean.parseBoolean(
 +                configuration.getProperty(ALLOW_STORE_CREATION_PROPERTY_NAME, ALLOW_STORE_CREATION_DEFAULT));
 +        boolean configuredStoreUpdateAllowed = Boolean.parseBoolean(
 +                configuration.getProperty(ALLOW_STORE_UPDATE_PROPERTY_NAME, ALLOW_STORE_UPDATE_DEFAULT));
-+        IntegrityMode configuredIntegrityMode = integrityMode(configuration);
-+        RuleViolationFileNameStrategy configuredStrategy = fileNameStrategy(configuration);
-+        boolean configuredCanDeriveNames = !(configuredStrategy instanceof RandomFileNameStrategy);
++        IntegrityMode configuredIntegrityMode = parseIntegrity(configuration.getProperty(INTEGRITY_PROPERTY_NAME, INTEGRITY_DEFAULT));
++        RuleViolationFileNameStrategy configuredFileNameStrategy = configureFileNameStrategy(configuration);
++        boolean configuredRandomFileNames = this.configuredRandomFileNames;
 +
-+        File configuredStoreFolder = new File(configuration.getProperty(STORE_PATH_PROPERTY_NAME, STORE_PATH_DEFAULT));
-+        Path configuredStoreFolderPath = configuredStoreFolder.toPath().toAbsolutePath().normalize();
-+        File configuredStoredRulesFile = new File(configuredStoreFolder, STORED_RULES_FILE_NAME);
-+        String storeKey = canonicalStoreKey(configuredStoredRulesFile);
-+        Object storeLock = STORE_LOCKS_BY_PATH.computeIfAbsent(storeKey, ignored -> new Object());
++        File configuredFolder = new File(configuration.getProperty(STORE_PATH_PROPERTY_NAME, STORE_PATH_DEFAULT));
++        File configuredStoredRulesFile = new File(configuredFolder, STORED_RULES_FILE_NAME);
++        StoreState configuredStoreState = getStoreState(configuredStoredRulesFile);
 +
-+        synchronized (storeLock) {
-+            prepareFolder(configuredStoreFolderPath, configuredStoreCreationAllowed, configuredStoredRulesFile);
-+            boolean indexExists = Files.exists(configuredStoredRulesFile.toPath(), NOFOLLOW_LINKS);
++        synchronized (configuredStoreState.lock) {
++            ensureStoreFolder(configuredFolder);
++
++            boolean indexExists = existsWithoutFollowingLinks(configuredStoredRulesFile.toPath());
++            if (indexExists && !isRegularFileDirectlyIn(configuredStoredRulesFile.toPath(), configuredFolder.toPath())) {
++                throw new StoreInitializationFailedException(String.format(
++                        "The violation store index must be a regular file directly in %s: %s",
++                        configuredFolder.getAbsolutePath(), configuredStoredRulesFile.getAbsolutePath()));
++            }
 +            if (!indexExists && !configuredStoreCreationAllowed) {
 +                throw new StoreInitializationFailedException(String.format(
 +                        "Creating new violation store is disabled (enable by configuration %s.%s=true)",
 +                        ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_CREATION_PROPERTY_NAME));
 +            }
++            if (configuredIntegrityMode == IntegrityMode.REPAIR && !configuredStoreUpdateAllowed) {
++                throw new StoreInitializationFailedException(String.format(
++                        "Integrity repair requires configuration %s.%s=true",
++                        ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_UPDATE_PROPERTY_NAME));
++            }
 +
-+            // A failing initialization must not create an index merely as a side effect of inspecting the folder.
-+            if (!indexExists && configuredIntegrityMode == IntegrityMode.FAIL) {
-+                IntegrityAnalysis emptyAnalysis = analyzeEmptyFolder(configuredStoreFolderPath);
-+                if (!emptyAnalysis.isClean()) {
-+                    throw new StoreInitializationFailedException(emptyAnalysis.report());
++            Properties loadedRules = indexExists ? loadProperties(configuredStoredRulesFile) : new Properties();
++            IntegrityReport report = configuredIntegrityMode == IntegrityMode.IGNORE
++                    ? IntegrityReport.empty(configuredFolder)
++                    : inspect(configuredFolder, configuredStoredRulesFile, loadedRules, configuredFileNameStrategy,
++                    configuredRandomFileNames);
++
++            if (configuredIntegrityMode == IntegrityMode.FAIL && report.hasProblems()) {
++                throw new StoreInitializationFailedException(report.asMessage());
++            }
++
++            Properties resultingRules = copyOf(loadedRules);
++            if (configuredIntegrityMode == IntegrityMode.REPAIR) {
++                boolean changed = repair(configuredFolder, configuredStoredRulesFile, resultingRules, report);
++                if (changed || !indexExists) {
++                    writeInitializationProperties(configuredStoredRulesFile.toPath(), resultingRules);
 +                }
-+                createIndex(configuredStoredRulesFile);
 +            } else if (!indexExists) {
-+                createIndex(configuredStoredRulesFile);
++                // The index is deliberately created only after a fail-mode inspection succeeded.
++                writeInitializationProperties(configuredStoredRulesFile.toPath(), resultingRules);
 +            }
 +
-+            validateIndex(configuredStoredRulesFile, configuredStoreFolderPath);
-+            FileSyncedProperties configuredStoredRules = getOrCreateStoredRules(configuredStoredRulesFile);
-+            // Repair helpers operate on the configured folder before initialization is committed.
-+            storeFolder = configuredStoreFolder;
-+            storeFolderPath = configuredStoreFolderPath;
-+            ruleViolationFileNameStrategy = configuredStrategy;
-+            synchronized (configuredStoredRules) {
-+                configuredStoredRules.reload();
-+                if (configuredIntegrityMode != IntegrityMode.IGNORE) {
-+                    if (configuredIntegrityMode == IntegrityMode.REPAIR && !configuredStoreUpdateAllowed) {
-+                        throw new StoreInitializationFailedException(String.format(
-+                                "Integrity repair requires %s.%s=true",
-+                                ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_UPDATE_PROPERTY_NAME));
-+                    }
-+                    IntegrityAnalysis analysis = analyze(configuredStoredRules, configuredStoreFolderPath,
-+                            configuredStrategy, configuredCanDeriveNames);
-+                    if (configuredIntegrityMode == IntegrityMode.FAIL) {
-+                        if (!analysis.isClean()) {
-+                            throw new StoreInitializationFailedException(analysis.report());
-+                        }
-+                    } else {
-+                        repair(analysis, configuredStoredRules, configuredStoreFolderPath);
-+                    }
-+                }
-+            }
++            configuredStoreState.folder = configuredFolder;
++            configuredStoreState.index = configuredStoredRulesFile;
++            configuredStoreState.properties = resultingRules;
++        }
 +
-+            storeCreationAllowed = configuredStoreCreationAllowed;
-+            storeUpdateAllowed = configuredStoreUpdateAllowed;
-+            integrityMode = configuredIntegrityMode;
-+            storeFolder = configuredStoreFolder;
-+            storeFolderPath = configuredStoreFolderPath;
-+            storedRules = configuredStoredRules;
-+            ruleViolationFileNameStrategy = configuredStrategy;
-+            log.trace("Initialized {} at {}", TextFileBasedViolationStore.class.getSimpleName(),
-+                    configuredStoredRulesFile.getAbsolutePath());
++        storeFolder = configuredFolder;
++        storeState = configuredStoreState;
++        fileNameStrategy = configuredFileNameStrategy;
++        randomFileNames = configuredRandomFileNames;
++        integrityMode = configuredIntegrityMode;
++        storeUpdateAllowed = configuredStoreUpdateAllowed;
++        log.trace("Initialized {} at {}", TextFileBasedViolationStore.class.getSimpleName(), configuredStoredRulesFile.getAbsolutePath());
++    }
++
++    private RuleViolationFileNameStrategy configureFileNameStrategy(Properties properties) {
++        if (hasConstructorFileNameStrategy && properties.containsKey(FILE_NAMES_PROPERTY_NAME)) {
++            throw new StoreInitializationFailedException(String.format(
++                    "Cannot configure %s when a %s was supplied to the constructor",
++                    FILE_NAMES_PROPERTY_NAME, RuleViolationFileNameStrategy.class.getSimpleName()));
++        }
++        if (!properties.containsKey(FILE_NAMES_PROPERTY_NAME)) {
++            configuredRandomFileNames = !hasConstructorFileNameStrategy;
++            return constructorFileNameStrategy;
++        }
++
++        String configuredValue = properties.getProperty(FILE_NAMES_PROPERTY_NAME);
++        if ("random".equals(configuredValue)) {
++            configuredRandomFileNames = true;
++            return __ -> UUID.randomUUID().toString();
++        }
++        if ("description".equals(configuredValue)) {
++            configuredRandomFileNames = false;
++            return TextFileBasedViolationStore::fileNameFromDescription;
++        }
++        configuredRandomFileNames = false;
++        try {
++            Class<?> strategyClass = Class.forName(configuredValue);
++            Class<? extends RuleViolationFileNameStrategy> typedStrategy = strategyClass.asSubclass(RuleViolationFileNameStrategy.class);
++            Constructor<? extends RuleViolationFileNameStrategy> constructor = typedStrategy.getConstructor();
++            return constructor.newInstance();
++        } catch (Exception e) {
++            throw new StoreInitializationFailedException(String.format(
++                    "Could not instantiate %s configured through %s=%s; expected 'random', 'description', or a strategy class with a public no-argument constructor",
++                    RuleViolationFileNameStrategy.class.getSimpleName(), FILE_NAMES_PROPERTY_NAME, configuredValue), e);
++        }
++    }
++
++    private static IntegrityMode parseIntegrity(String value) {
++        if ("repair".equals(value)) {
++            return IntegrityMode.REPAIR;
++        }
++        if ("fail".equals(value)) {
++            return IntegrityMode.FAIL;
++        }
++        if ("ignore".equals(value)) {
++            return IntegrityMode.IGNORE;
++        }
++        throw new StoreInitializationFailedException(String.format(
++                "Invalid value '%s' for %s; accepted values are 'repair', 'fail' and 'ignore'",
++                value, INTEGRITY_PROPERTY_NAME));
++    }
++
++    private static String fileNameFromDescription(String description) {
++        Matcher matcher = DESCRIPTION_WORD_PATTERN.matcher(description);
++        String keptWord = null;
++        while (matcher.find()) {
++            keptWord = matcher.group(1);
++        }
++        String digest = digest(description);
++        return (keptWord == null ? "rule" : keptWord) + "-" + digest;
++    }
++
++    private static String digest(String value) {
++        try {
++            byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(UTF_8));
++            StringBuilder result = new StringBuilder(digest.length * 2);
++            for (byte current : digest) {
++                result.append(String.format("%02x", current & 0xff));
++            }
++            return result.toString();
++        } catch (NoSuchAlgorithmException e) {
++            throw new IllegalStateException("SHA-256 is required by the JRE", e);
 +        }
      }
  
 -    private FileSyncedProperties getOrCreateStoredRules(File storedRulesFile) {
-+    private IntegrityMode integrityMode(Properties properties) {
-+        String value = properties.getProperty(INTEGRITY_PROPERTY_NAME, INTEGRITY_IGNORE);
-+        if (INTEGRITY_IGNORE.equals(value)) {
-+            return IntegrityMode.IGNORE;
-+        }
-+        if (INTEGRITY_REPAIR.equals(value)) {
-+            return IntegrityMode.REPAIR;
-+        }
-+        if (INTEGRITY_FAIL.equals(value)) {
-+            return IntegrityMode.FAIL;
-+        }
-+        throw new StoreInitializationFailedException(String.format(
-+                "Invalid %s '%s'; accepted values are '%s', '%s' and '%s'",
-+                INTEGRITY_PROPERTY_NAME, value, INTEGRITY_REPAIR, INTEGRITY_FAIL, INTEGRITY_IGNORE));
-+    }
-+
-+    private RuleViolationFileNameStrategy fileNameStrategy(Properties properties) {
-+        if (strategyWasPassedToConstructor) {
-+            if (properties.containsKey(FILE_NAMES_PROPERTY_NAME)) {
-+                throw new StoreInitializationFailedException(String.format(
-+                        "Cannot configure %s when a RuleViolationFileNameStrategy was passed to the constructor",
-+                        FILE_NAMES_PROPERTY_NAME));
-+            }
-+            return constructorStrategy;
-+        }
-+
-+        String value = properties.getProperty(FILE_NAMES_PROPERTY_NAME, FILE_NAMES_RANDOM);
-+        if (FILE_NAMES_RANDOM.equals(value)) {
-+            return new RandomFileNameStrategy();
-+        }
-+        if (FILE_NAMES_DESCRIPTION.equals(value)) {
-+            return new DescriptionFileNameStrategy();
-+        }
-+        try {
-+            Class<?> strategyType = Class.forName(value);
-+            if (!RuleViolationFileNameStrategy.class.isAssignableFrom(strategyType)
-+                    || !Modifier.isPublic(strategyType.getModifiers())) {
-+                throw new IllegalArgumentException("type is not a public RuleViolationFileNameStrategy");
-+            }
-+            return (RuleViolationFileNameStrategy) strategyType.getConstructor().newInstance();
-+        } catch (ClassNotFoundException | NoSuchMethodException | InstantiationException | IllegalAccessException
-+                 | InvocationTargetException | ClassCastException | IllegalArgumentException e) {
-+            throw new StoreInitializationFailedException(String.format(
-+                    "Could not instantiate RuleViolationFileNameStrategy configured by %s=%s; expected a public class "
-+                            + "with a public no-argument constructor",
-+                    FILE_NAMES_PROPERTY_NAME, value), e);
-+        }
-+    }
-+
-+    private void prepareFolder(Path folder, boolean creationAllowed, File storedRulesFile) {
-+        try {
-+            if (!Files.exists(folder, NOFOLLOW_LINKS)) {
-+                if (!creationAllowed) {
-+                    throw new StoreInitializationFailedException(String.format(
-+                            "Creating new violation store is disabled (enable by configuration %s.%s=true)",
-+                            ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_CREATION_PROPERTY_NAME));
-+                }
-+                Files.createDirectories(folder);
-+            }
-+            if (!Files.isDirectory(folder, NOFOLLOW_LINKS)) {
-+                throw new StoreInitializationFailedException(String.format(
-+                        "Violation store folder is not a directory: %s", folder));
-+            }
-+            if (storedRulesFile.toPath().getParent() == null
-+                    || !storedRulesFile.toPath().getParent().toAbsolutePath().normalize().equals(folder)) {
-+                throw new StoreInitializationFailedException(String.format("Invalid violation store path: %s", storedRulesFile));
-+            }
-+        } catch (IOException e) {
-+            throw new StoreInitializationFailedException(String.format("Cannot create violation store folder: %s", folder), e);
-+        }
-+    }
-+
-+    private void createIndex(File storedRulesFile) {
++    private static StoreState getStoreState(File storedRulesFile) {
          try {
 -            return STORED_RULES_BY_PATH.computeIfAbsent(storedRulesFile.getCanonicalPath(), path -> new FileSyncedProperties(storedRulesFile));
-+            Files.createFile(storedRulesFile.toPath());
-+        } catch (FileAlreadyExistsException ignored) {
-+            // Another store may have created it while this store was waiting for a filesystem operation.
++            String canonicalPath = storedRulesFile.getCanonicalPath();
++            return STORES_BY_PATH.computeIfAbsent(canonicalPath, ignored -> new StoreState());
++        } catch (IOException e) {
++            throw new StoreInitializationFailedException(e);
++        }
++    }
++
++    private static void ensureStoreFolder(File folder) {
++        if (!folder.mkdirs() && !folder.isDirectory()) {
++            throw new StoreInitializationFailedException(String.format(
++                    "Cannot create violation store folder %s", folder.getAbsolutePath()));
++        }
++    }
++
++    private static Properties loadProperties(File file) {
++        Properties result = new Properties();
++        try (java.io.InputStream input = Files.newInputStream(file.toPath())) {
++            result.load(input);
++            return result;
          } catch (IOException e) {
              throw new StoreInitializationFailedException(e);
          }
@@ -305,223 +308,464 @@ index fd2bcc5..ac55f75 100644
 -    private File getStoredRulesFile() {
 -        File rulesFile = new File(storeFolder, STORED_RULES_FILE_NAME);
 -        if (!rulesFile.exists() && !storeCreationAllowed) {
-+    private void validateIndex(File storedRulesFile, Path folder) {
-+        Path index = storedRulesFile.toPath();
-+        if (!Files.isRegularFile(index, NOFOLLOW_LINKS)
-+                || index.getParent() == null
-+                || !index.getParent().toAbsolutePath().normalize().equals(folder)) {
++    private IntegrityReport inspect(File folder, File storedRulesFile, Properties properties,
++                                    RuleViolationFileNameStrategy strategy, boolean randomNames) {
++        List<Entry> entries = new ArrayList<>();
++        for (String description : properties.stringPropertyNames()) {
++            String name = properties.getProperty(description);
++            String derivedName = randomNames ? name : deriveNameForInitialization(strategy, description);
++            entries.add(new Entry(description, name, derivedName, folder, storedRulesFile));
++        }
++        markShared(entries);
++        if (!randomNames) {
++            markCollisions(entries);
++        }
++        for (Entry entry : entries) {
++            entry.misplaced = !entry.name.equals(entry.derivedName);
++            entry.occupied = entry.misplaced && isOccupied(entry, entries, folder);
++        }
++        Collections.sort(entries, ENTRY_COMPARATOR);
++        return new IntegrityReport(folder, entries, findUnownedFiles(folder, storedRulesFile, entries));
++    }
++
++    private String deriveNameForInitialization(RuleViolationFileNameStrategy strategy, String description) {
++        String result;
++        try {
++            result = strategy.createRuleFileName(description);
++        } catch (RuntimeException e) {
++            throw new StoreInitializationFailedException(String.format(
++                    "Could not derive a violation file name for rule '%s'", description), e);
++        }
++        return requireFileName(result, "initializing rule '" + description + "'");
++    }
++
++    private String deriveNameForUpdate(String description) {
++        String result;
++        try {
++            result = fileNameStrategy.createRuleFileName(description);
++        } catch (RuntimeException e) {
++            throw new StoreUpdateFailedException(String.format(
++                    "Could not derive a violation file name for rule '%s'", description));
++        }
++        return requireFileNameForUpdate(result, "storing rule '" + description + "'");
++    }
++
++    private static String requireFileName(String name, String context) {
++        if (name == null || name.trim().length() == 0) {
              throw new StoreInitializationFailedException(String.format(
 -                    "Creating new violation store is disabled (enable by configuration %s.%s=true)",
 -                    ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_CREATION_PROPERTY_NAME));
-+                    "The violation store index must be a regular file directly in the store folder: %s", index));
++                    "A rule violation file name is required when %s", context));
          }
 -        return rulesFile;
++        return name;
      }
  
 -    private void checkInitialization(boolean initializationSuccessful, String message, Object... args) {
 -        if (!initializationSuccessful) {
 -            throw new StoreInitializationFailedException(String.format(message, args));
-+    private String canonicalStoreKey(File storedRulesFile) {
-+        try {
-+            return storedRulesFile.getCanonicalPath();
-+        } catch (IOException e) {
-+            return storedRulesFile.getAbsoluteFile().toPath().normalize().toString();
++    private static String requireFileNameForUpdate(String name, String context) {
++        if (name == null || name.trim().length() == 0) {
++            throw new StoreUpdateFailedException(String.format(
++                    "A rule violation file name is required when %s", context));
++        }
++        return name;
++    }
++
++    private static void markShared(List<Entry> entries) {
++        Map<String, List<Entry>> byName = new HashMap<>();
++        for (Entry entry : entries) {
++            addToGroup(byName, entry.name, entry);
++        }
++        for (List<Entry> group : byName.values()) {
++            if (group.size() > 1) {
++                markSharedEntries(group);
++            }
++        }
++
++        for (int i = 0; i < entries.size(); i++) {
++            Entry first = entries.get(i);
++            if (first.resolvedPath == null) {
++                continue;
++            }
++            for (int j = i + 1; j < entries.size(); j++) {
++                Entry second = entries.get(j);
++                if (second.resolvedPath != null && sameFile(first.resolvedPath, second.resolvedPath)) {
++                    first.shared = true;
++                    second.shared = true;
++                }
++            }
 +        }
 +    }
 +
-+    private FileSyncedProperties getOrCreateStoredRules(File storedRulesFile) {
++    private static void addToGroup(Map<String, List<Entry>> groups, String key, Entry entry) {
++        List<Entry> group = groups.get(key);
++        if (group == null) {
++            group = new ArrayList<>();
++            groups.put(key, group);
++        }
++        group.add(entry);
++    }
++
++    private static void markSharedEntries(List<Entry> group) {
++        for (Entry entry : group) {
++            entry.shared = true;
++        }
++    }
++
++    private static boolean sameFile(Path first, Path second) {
 +        try {
-+            return STORED_RULES_BY_PATH.computeIfAbsent(storedRulesFile.getCanonicalPath(),
-+                    ignored -> new FileSyncedProperties(storedRulesFile));
++            return Files.isSameFile(first, second);
++        } catch (IOException e) {
++            return first.equals(second);
++        }
++    }
++
++    private static void markCollisions(List<Entry> entries) {
++        Map<String, List<Entry>> byDerivedName = new HashMap<>();
++        for (Entry entry : entries) {
++            addToGroup(byDerivedName, entry.derivedName, entry);
++        }
++        for (List<Entry> group : byDerivedName.values()) {
++            if (group.size() > 1) {
++                for (Entry entry : group) {
++                    entry.colliding = true;
++                }
++            }
++        }
++    }
++
++    private static boolean isOccupied(Entry entry, List<Entry> entries, File folder) {
++        if (!isDirectChildName(entry.derivedName, folder)) {
++            return true;
++        }
++        for (Entry other : entries) {
++            if (other != entry && other.name.equals(entry.derivedName)) {
++                return true;
++            }
++        }
++        return existsWithoutFollowingLinks(new File(folder, entry.derivedName).toPath());
++    }
++
++    private static List<String> findUnownedFiles(File folder, File storedRulesFile, List<Entry> entries) {
++        List<String> result = new ArrayList<>();
++        File[] files = folder.listFiles();
++        if (files == null) {
++            return result;
++        }
++        for (File file : files) {
++            if (file.getName().equals(STORED_RULES_FILE_NAME)
++                    || !Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
++                continue;
++            }
++            boolean owned = false;
++            for (Entry entry : entries) {
++                if (entry.resolvedPath != null && sameFile(entry.resolvedPath, file.toPath())) {
++                    owned = true;
++                    break;
++                }
++            }
++            if (!owned) {
++                result.add(file.getName());
++            }
++        }
++        Collections.sort(result);
++        return result;
++    }
++
++    private static boolean isDirectChildName(String name, File folder) {
++        try {
++            Path folderPath = folder.getCanonicalFile().toPath();
++            Path candidate = folderPath.resolve(name).toAbsolutePath().normalize();
++            return folderPath.equals(candidate.getParent());
++        } catch (IOException e) {
++            return false;
++        }
++    }
++
++    private boolean repair(File folder, File storedRulesFile, Properties properties, IntegrityReport report) {
++        boolean changed = false;
++        for (Entry entry : report.entries) {
++            // Sharing has precedence over every repair action. In particular, a shared empty file
++            // must not be deleted merely because one of its rules was resolved.
++            if (entry.shared) {
++                continue;
++            }
++            if (entry.broken) {
++                properties.remove(entry.description);
++                changed = true;
++            } else if (entry.resolved) {
++                deleteEntryFile(entry, storedRulesFile);
++                properties.remove(entry.description);
++                changed = true;
++            } else if (entry.misplaced && !entry.colliding && !entry.occupied) {
++                moveEntryFile(entry, entry.derivedName, folder, storedRulesFile);
++                properties.setProperty(entry.description, entry.derivedName);
++                changed = true;
++            }
++        }
++        return changed;
++    }
++
++    private static void deleteEntryFile(Entry entry, File storedRulesFile) {
++        if (entry.resolvedPath == null || sameFile(entry.resolvedPath, storedRulesFile.toPath())) {
++            return;
++        }
++        try {
++            Files.deleteIfExists(entry.resolvedPath);
++            if (Files.isSymbolicLink(entry.path)) {
++                Files.deleteIfExists(entry.path);
++            }
++        } catch (IOException e) {
++            throw new StoreInitializationFailedException(String.format(
++                    "Could not delete resolved violation file '%s'", entry.name), e);
++        }
++    }
++
++    private static void moveEntryFile(Entry entry, String destinationName, File folder, File storedRulesFile) {
++        Path destination = folder.toPath().resolve(destinationName);
++        if (!isDirectChildName(destinationName, folder)
++                || destinationName.equals(STORED_RULES_FILE_NAME)
++                || existsWithoutFollowingLinks(destination)
++                || sameFile(entry.resolvedPath, storedRulesFile.toPath())) {
++            throw new StoreInitializationFailedException(String.format(
++                    "Cannot move violation file for rule '%s' to '%s'", entry.description, destinationName));
++        }
++        try {
++            Files.move(entry.resolvedPath, destination);
++            if (Files.isSymbolicLink(entry.path)) {
++                try {
++                    Files.delete(entry.path);
++                } catch (IOException deleteFailure) {
++                    try {
++                        Files.move(destination, entry.resolvedPath);
++                    } catch (IOException ignored) {
++                        // The original exception is the useful one to report.
++                    }
++                    throw deleteFailure;
++                }
++            }
++        } catch (IOException e) {
++            throw new StoreInitializationFailedException(String.format(
++                    "Could not move violation file for rule '%s' to '%s'", entry.description, destinationName), e);
++        }
++    }
++
++    private static final Comparator<Entry> ENTRY_COMPARATOR = (first, second) -> {
++        int descriptionComparison = first.description.compareTo(second.description);
++        return descriptionComparison != 0 ? descriptionComparison : first.name.compareTo(second.name);
++    };
++
++    private static boolean existsWithoutFollowingLinks(Path path) {
++        return Files.exists(path, LinkOption.NOFOLLOW_LINKS);
++    }
++
++    private static boolean isRegularFileDirectlyIn(Path path, Path folder) {
++        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
++            return false;
++        }
++        try {
++            return path.toFile().getCanonicalFile().getParentFile().equals(folder.toFile().getCanonicalFile());
++        } catch (IOException e) {
++            return false;
++        }
++    }
++
++    private static Properties copyOf(Properties source) {
++        Properties result = new Properties();
++        result.putAll(source);
++        return result;
++    }
++
++    private static void writeProperties(Path target, Properties properties) {
++        try {
++            ByteArrayOutputStream output = new ByteArrayOutputStream();
++            properties.store(output, "");
++            atomicWrite(target, output.toByteArray());
++        } catch (IOException e) {
++            throw new StoreUpdateFailedException(e);
++        }
++    }
++
++    private static void writeInitializationProperties(Path target, Properties properties) {
++        try {
++            ByteArrayOutputStream output = new ByteArrayOutputStream();
++            properties.store(output, "");
++            atomicWrite(target, output.toByteArray());
 +        } catch (IOException e) {
 +            throw new StoreInitializationFailedException(e);
++        }
++    }
++
++    private static void atomicWrite(Path target, byte[] contents) throws IOException {
++        Path parent = target.toAbsolutePath().normalize().getParent();
++        Path temporary = Files.createTempFile(parent, "." + target.getFileName().toString() + ".", ".tmp");
++        try {
++            Files.write(temporary, contents);
++            try {
++                Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++            } catch (AtomicMoveNotSupportedException e) {
++                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
++            }
++        } finally {
++            Files.deleteIfExists(temporary);
          }
      }
  
      @Override
      public boolean contains(ArchRule rule) {
 -        return storedRules.containsKey(rule.getDescription());
-+        synchronized (storedRules) {
-+            return storedRules.containsKey(rule.getDescription());
++        synchronized (storeState.lock) {
++            return storeState.properties.containsKey(normalize(rule.getDescription()));
 +        }
      }
  
      @Override
      public void save(ArchRule rule, List<String> violations) {
-+        checkNotNull(rule);
 +        checkNotNull(violations);
          log.trace("Storing evaluated rule '{}' with {} violations: {}", rule.getDescription(), violations.size(), violations);
-         if (!storeUpdateAllowed) {
-             throw new StoreUpdateFailedException(String.format(
-                     "Updating frozen violations is disabled (enable by configuration %s.%s=true)",
-                     ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_UPDATE_PROPERTY_NAME));
-         }
--        String ruleFileName = ensureRuleFileName(rule);
--        write(violations, new File(storeFolder, ruleFileName));
+-        if (!storeUpdateAllowed) {
+-            throw new StoreUpdateFailedException(String.format(
+-                    "Updating frozen violations is disabled (enable by configuration %s.%s=true)",
+-                    ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_UPDATE_PROPERTY_NAME));
++        synchronized (storeState.lock) {
++            if (!storeUpdateAllowed) {
++                throw new StoreUpdateFailedException(String.format(
++                        "Updating frozen violations is disabled (enable by configuration %s.%s=true)",
++                        ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_UPDATE_PROPERTY_NAME));
++            }
 +
-+        synchronized (storedRules) {
-+            String ruleDescription = rule.getDescription();
-+            String existingFileName = storedRules.getProperty(ruleDescription);
++            String description = normalize(rule.getDescription());
++            String existingFileName = storeState.properties.getProperty(description);
 +            if (violations.isEmpty() && integrityMode == IntegrityMode.REPAIR) {
 +                if (existingFileName != null) {
-+                    forgetKnownRule(ruleDescription, existingFileName);
++                    forgetRuleWithEmptyViolations(description, existingFileName);
 +                }
 +                return;
 +            }
 +
-+            String fileName = existingFileName != null ? existingFileName : createRuleFileName(ruleDescription);
-+            Path target = validateSaveTarget(ruleDescription, fileName);
-+            byte[] contents = encodedViolations(violations);
-+            boolean newlyCreated = existingFileName == null;
++            boolean newRule = existingFileName == null;
++            String fileName = newRule ? deriveNameForUpdate(rule.getDescription()) : existingFileName;
++            Path target = validateSaveTarget(fileName, newRule);
++            Properties before = copyOf(storeState.properties);
++            byte[] oldIndex = readIndexBytes();
 +            try {
-+                writeViolationFile(ruleDescription, fileName, target, contents);
-+                if (newlyCreated) {
++                atomicWrite(target, violationBytes(violations));
++                if (newRule) {
++                    Properties updated = copyOf(before);
++                    updated.setProperty(description, fileName);
++                    writeProperties(storeState.index.toPath(), updated);
++                    storeState.properties = updated;
++                }
++            } catch (Exception e) {
++                if (newRule) {
 +                    try {
-+                        storedRules.putIfAbsent(ruleDescription, fileName);
-+                    } catch (RuntimeException e) {
-+                        deleteQuietly(target);
-+                        throw e;
++                        Files.deleteIfExists(target);
++                        atomicWrite(storeState.index.toPath(), oldIndex);
++                        storeState.properties = before;
++                    } catch (IOException ignored) {
++                        // Preserve the original failure. The normal path is atomic and this is only rollback.
 +                    }
 +                }
-+            } catch (IOException e) {
++                if (e instanceof StoreUpdateFailedException) {
++                    throw (StoreUpdateFailedException) e;
++                }
 +                throw new StoreUpdateFailedException(e);
 +            }
-+        }
+         }
+-        String ruleFileName = ensureRuleFileName(rule);
+-        write(violations, new File(storeFolder, ruleFileName));
      }
  
 -    private void write(List<String> violations, File ruleDetails) {
 -        StringBuilder builder = new StringBuilder();
 -        for (String violation : violations) {
 -            builder.append(escape(violation)).append("\n");
-+    private String createRuleFileName(String ruleDescription) {
-+        return checkedFileName(ruleViolationFileNameStrategy.createRuleFileName(ruleDescription), false);
-+    }
-+
-+    private String checkedFileName(String fileName, boolean initialization) {
-+        if (fileName == null || fileName.trim().isEmpty()) {
-+            String message = "RuleViolationFileNameStrategy returned no file name";
-+            if (initialization) {
-+                throw new StoreInitializationFailedException(message);
++    private void forgetRuleWithEmptyViolations(String description, String fileName) {
++        Properties before = copyOf(storeState.properties);
++        List<Entry> entries = entriesForCurrentState();
++        Entry targetEntry = null;
++        for (Entry entry : entries) {
++            if (entry.description.equals(description)) {
++                targetEntry = entry;
++                break;
 +            }
-+            throw new StoreUpdateFailedException(message);
-+        }
-+        return fileName;
-+    }
-+
-+    private Path validateSaveTarget(String ruleDescription, String fileName) {
-+        Path indexPath = storeFolderPath.resolve(STORED_RULES_FILE_NAME).normalize();
-+        if (STORED_RULES_FILE_NAME.equals(fileName)
-+                || indexPath.equals(storeFolderPath.resolve(fileName).normalize())) {
-+            throw new StoreUpdateFailedException("A rule violation file cannot be named stored.rules");
-+        }
-+        Path recordedPath = storeFolderPath.resolve(fileName).normalize();
-+        if (!isDirectChild(recordedPath, storeFolderPath)) {
-+            throw new StoreUpdateFailedException(String.format(
-+                    "Refusing to write rule '%s' outside the violation store folder: %s", ruleDescription, fileName));
          }
++        if (targetEntry == null) {
++            targetEntry = new Entry(description, fileName, fileName, storeFolder, storeState.index);
++        }
++        boolean sharedByAnotherEntry = false;
++        for (Entry entry : entries) {
++            if (!entry.description.equals(description) && (entry.name.equals(fileName)
++                    || (targetEntry.resolvedPath != null && entry.resolvedPath != null
++                    && sameFile(targetEntry.resolvedPath, entry.resolvedPath)))) {
++                sharedByAnotherEntry = true;
++                break;
++            }
++        }
++        if (!sharedByAnotherEntry) {
++            validateSaveTarget(fileName, false);
++            try {
++                deleteEntryFile(targetEntry, storeState.index);
++            } catch (StoreInitializationFailedException e) {
++                throw new StoreUpdateFailedException(e);
++            }
++        }
++        Properties updated = copyOf(before);
++        updated.remove(description);
          try {
 -            Files.write(ruleDetails.toPath(), builder.toString().getBytes(UTF_8));
-+            if (Files.exists(recordedPath, NOFOLLOW_LINKS)) {
-+                ResolvedPath resolved = resolvePath(fileName);
-+                if (!resolved.isUsable()) {
-+                    throw new StoreUpdateFailedException(String.format(
-+                            "Refusing to overwrite an unsafe violation file for rule '%s': %s", ruleDescription, fileName));
-+                }
-+                try {
-+                    if (sameFile(resolved.realPath, indexPath.toRealPath())) {
-+                        throw new StoreUpdateFailedException("A rule violation file cannot overwrite stored.rules");
-+                    }
-+                } catch (IOException e) {
-+                    throw new StoreUpdateFailedException(e);
-+                }
-+                String ownFileName = storedRules.getProperty(ruleDescription);
-+                boolean isRecordedByThisRule = fileName.equals(ownFileName)
-+                        || (ownFileName != null && isSameResolvedFile(ownFileName, resolved));
-+                if (!isRecordedByThisRule) {
-+                    throw new StoreUpdateFailedException(String.format(
-+                            "Refusing to overwrite a file not recorded by rule '%s': %s", ruleDescription, fileName));
-+                }
-+                return resolved.realPath;
-+            }
-+            return recordedPath;
-         } catch (IOException e) {
+-        } catch (IOException e) {
++            writeProperties(storeState.index.toPath(), updated);
++            storeState.properties = updated;
++        } catch (RuntimeException e) {
++            storeState.properties = before;
              throw new StoreUpdateFailedException(e);
          }
      }
  
 -    private String escape(String violation) {
 -        return violation.replace("\n", "\\\n");
-+    private boolean isSameResolvedFile(String fileName, ResolvedPath resolved) {
++    private List<Entry> entriesForCurrentState() {
++        IntegrityReport report = inspect(storeFolder, storeState.index, storeState.properties, fileNameStrategy, randomFileNames);
++        return report.entries;
++    }
++
++    private Path validateSaveTarget(String fileName, boolean newRule) {
++        if (fileName.equals(STORED_RULES_FILE_NAME) || !isDirectChildName(fileName, storeFolder)) {
++            throw new StoreUpdateFailedException(String.format(
++                    "Refusing to store violations in unsafe file '%s'", fileName));
++        }
++        Path target = storeFolder.toPath().resolve(fileName);
 +        try {
-+            ResolvedPath ownPath = resolvePath(fileName);
-+            return ownPath.isUsable() && sameFile(resolved.realPath, ownPath.realPath);
-+        } catch (IOException ignored) {
-+            return false;
++            if (existsWithoutFollowingLinks(target)) {
++                if (sameFile(target, storeState.index.toPath())) {
++                    throw new StoreUpdateFailedException("Refusing to overwrite the stored.rules index");
++                }
++                Path realTarget = target.toRealPath();
++                if (!isRegularFileDirectlyIn(realTarget, storeFolder.toPath())) {
++                    throw new StoreUpdateFailedException(String.format(
++                            "Refusing to write outside the violation store: '%s'", fileName));
++                }
++                if (newRule) {
++                    throw new StoreUpdateFailedException(String.format(
++                            "A file already exists for new rule '%s'", fileName));
++                }
++            }
++            return target;
++        } catch (IOException e) {
++            throw new StoreUpdateFailedException(e);
 +        }
      }
  
 -    private String unescape(String violation) {
 -        return violation.replace("\\\n", "\n");
-+    private void writeViolationFile(String ruleDescription, String fileName, Path target, byte[] contents) throws IOException {
-+        Path temporary = Files.createTempFile(storeFolderPath, ".archunit-", ".tmp");
++    private byte[] readIndexBytes() {
 +        try {
-+            Files.write(temporary, contents, StandardOpenOption.TRUNCATE_EXISTING);
-+            // Replacing the directory entry of a link would leave the link in place and write the wrong object.
-+            Path recordedPath = storeFolderPath.resolve(fileName).normalize();
-+            if (Files.isSymbolicLink(recordedPath) || hasOtherReference(target, fileName)) {
-+                Files.write(target, contents, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-+            } else {
-+                moveReplacing(temporary, target);
-+                temporary = null;
-+            }
-+        } finally {
-+            if (temporary != null) {
-+                deleteQuietly(temporary);
-+            }
-+        }
-+    }
-+
-+    private boolean hasOtherReference(Path target, String ownFileName) {
-+        for (String description : storedRules.keys()) {
-+            String recorded = storedRules.getProperty(description);
-+            if (recorded != null && !recorded.equals(ownFileName)) {
-+                try {
-+                    ResolvedPath other = resolvePath(recorded);
-+                    if (other.isUsable() && sameFile(target, other.realPath)) {
-+                        return true;
-+                    }
-+                } catch (IOException ignored) {
-+                    // Ignore an unrelated broken entry.
-+                }
-+            }
-+        }
-+        return false;
-+    }
-+
-+    private byte[] encodedViolations(List<String> violations) {
-+        StringBuilder builder = new StringBuilder();
-+        for (String violation : violations) {
-+            builder.append(escape(checkNotNull(violation))).append("\n");
-+        }
-+        return builder.toString().getBytes(UTF_8);
-+    }
-+
-+    private void forgetKnownRule(String description, String fileName) {
-+        ResolvedPath resolved;
-+        try {
-+            resolved = resolvePath(fileName);
++            return Files.readAllBytes(storeState.index.toPath());
 +        } catch (IOException e) {
 +            throw new StoreUpdateFailedException(e);
 +        }
-+        if (resolved.isUsable() && !sharedWithAnother(description, fileName, resolved)) {
-+            try {
-+                deleteResolvedFile(fileName, resolved);
-+            } catch (IOException e) {
-+                throw new StoreUpdateFailedException(new IOException(String.format(
-+                        "Cannot discard the violation file for rule '%s'", description), e));
-+            }
-+        }
-+        storedRules.remove(description);
      }
  
 -    private String ensureRuleFileName(ArchRule rule) {
@@ -531,29 +775,22 @@ index fd2bcc5..ac55f75 100644
 -        if (existingFileName == null) {
 -            log.trace("Assigning new file {} to rule '{}'", candidateFileName, ruleDescription);
 -            return candidateFileName;
-+    private boolean sharedWithAnother(String description, String fileName, ResolvedPath resolved) {
-+        for (String otherDescription : storedRules.keys()) {
-+            if (description.equals(otherDescription)) {
-+                continue;
-+            }
-+            String otherName = storedRules.getProperty(otherDescription);
-+            if (fileName.equals(otherName)) {
-+                return true;
-+            }
-+            if (resolved.isUsable() && otherName != null) {
-+                try {
-+                    ResolvedPath other = resolvePath(otherName);
-+                    if (other.isUsable() && sameFile(resolved.realPath, other.realPath)) {
-+                        return true;
-+                    }
-+                } catch (IOException ignored) {
-+                    // A broken other entry cannot share a file which it cannot resolve.
-+                }
-+            }
++    private static byte[] violationBytes(List<String> violations) {
++        StringBuilder builder = new StringBuilder();
++        for (String violation : violations) {
++            builder.append(escape(violation)).append("\n");
          }
 -        log.trace("Rule '{}' is already stored in file {}", ruleDescription, existingFileName);
 -        return existingFileName;
-+        return false;
++        return builder.toString().getBytes(UTF_8);
++    }
++
++    private static String escape(String violation) {
++        return violation.replace("\r", "\\\r").replace("\n", "\\\n");
++    }
++
++    private static String normalize(String value) {
++        return ensureUnixLineBreaks(value);
      }
  
      @Override
@@ -563,23 +800,61 @@ index fd2bcc5..ac55f75 100644
 -        List<String> result = readLines(ruleDetailsFileName);
 -        log.trace("Retrieved stored rule '{}' with {} violations: {}", rule.getDescription(), result.size(), result);
 -        return result;
-+        synchronized (storedRules) {
-+            String ruleDetailsFileName = storedRules.getProperty(rule.getDescription());
++        synchronized (storeState.lock) {
++            String ruleDetailsFileName = storeState.properties.getProperty(normalize(rule.getDescription()));
 +            checkArgument(ruleDetailsFileName != null, "No rule stored with description '%s'", rule.getDescription());
-+            List<String> result = readLines(ruleDetailsFileName);
++            Path file = validateReadTarget(ruleDetailsFileName);
++            List<String> result = readLines(file);
 +            log.trace("Retrieved stored rule '{}' with {} violations: {}", rule.getDescription(), result.size(), result);
 +            return result;
 +        }
      }
  
-     private List<String> readLines(String ruleDetailsFileName) {
-@@ -204,44 +530,294 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+-    private List<String> readLines(String ruleDetailsFileName) {
+-        String violationsText = readStoreFile(ruleDetailsFileName);
++    private Path validateReadTarget(String fileName) {
++        if (fileName.equals(STORED_RULES_FILE_NAME) || !isDirectChildName(fileName, storeFolder)) {
++            throw new StoreReadException(new IOException("Unsafe violation file name: " + fileName));
++        }
++        Path file = storeFolder.toPath().resolve(fileName);
++        if (!Files.isRegularFile(file)) {
++            throw new StoreReadException(new IOException("Violation file is not a regular file: " + fileName));
++        }
++        try {
++            Path realFile = file.toRealPath();
++            if (!isRegularFileDirectlyIn(realFile, storeFolder.toPath())) {
++                throw new StoreReadException(new IOException("Violation file escapes the store: " + fileName));
++            }
++            return realFile;
++        } catch (IOException e) {
++            throw new StoreReadException(e);
++        }
++    }
++
++    private static List<String> readLines(Path file) {
++        String violationsText = readStoreFile(file);
++        if (ONLY_LINE_BREAKS_PATTERN.matcher(violationsText).matches()) {
++            return Collections.emptyList();
++        }
+         return Splitter.on(UNESCAPED_LINE_BREAK_PATTERN).omitEmptyStrings().splitToStream(violationsText)
+-                .map(this::unescape)
++                .map(TextFileBasedViolationStore::removeCarriageReturnFromLineBreak)
++                .map(TextFileBasedViolationStore::unescape)
+                 .collect(toList());
+     }
  
-     private String readStoreFile(String fileName) {
+-    private String readStoreFile(String fileName) {
++    private static String removeCarriageReturnFromLineBreak(String line) {
++        return line.endsWith("\r") && (line.length() == 1 || line.charAt(line.length() - 2) != '\\')
++                ? line.substring(0, line.length() - 1)
++                : line;
++    }
++
++    private static String readStoreFile(Path file) {
          try {
 -            String result = new String(toByteArray(new File(storeFolder, fileName)), UTF_8);
-+            String result = new String(toByteArray(storeFolderPath.resolve(fileName).toFile()), UTF_8);
-             return ensureUnixLineBreaks(result);
+-            return ensureUnixLineBreaks(result);
++            return new String(toByteArray(file.toFile()), UTF_8);
          } catch (IOException e) {
              throw new StoreReadException(e);
          }
@@ -588,534 +863,182 @@ index fd2bcc5..ac55f75 100644
 -    private static class FileSyncedProperties {
 -        private final File propertiesFile;
 -        private final Properties loadedProperties;
-+    private String escape(String violation) {
-+        return violation.replace("\n", "\\\n");
++    private static String unescape(String violation) {
++        return violation.replace("\\\r", "\r").replace("\\\n", "\n");
 +    }
  
 -        FileSyncedProperties(File file) {
 -            propertiesFile = initializePropertiesFile(file);
 -            loadedProperties = initializationSuccessful() ? loadRulesFrom(propertiesFile) : null;
-+    private String unescape(String violation) {
-+        return violation.replace("\\\n", "\n");
+-        }
++    private enum IntegrityMode {
++        REPAIR, FAIL, IGNORE
 +    }
-+
-+    private IntegrityAnalysis analyzeEmptyFolder(Path folder) {
-+        return new IntegrityAnalysis(Collections.emptyList(), directRegularFiles(folder));
-+    }
-+
-+    private IntegrityAnalysis analyze(FileSyncedProperties rules, Path folder,
-+            RuleViolationFileNameStrategy strategy, boolean deterministicNames) {
-+        List<EntryAnalysis> entries = new ArrayList<>();
-+        for (String description : rules.keys()) {
-+            String recordedName = rules.getProperty(description);
-+            String derivedName = null;
-+            if (deterministicNames) {
-+                derivedName = checkedFileName(strategy.createRuleFileName(description), true);
-+            }
-+            ResolvedPath resolved;
-+            try {
-+                resolved = resolvePath(folder, recordedName);
-+            } catch (IOException e) {
-+                resolved = ResolvedPath.broken(recordedName, BrokenReason.MISSING);
-+            }
-+            boolean noViolations = resolved.isUsable() && hasNoViolations(resolved.realPath);
-+            entries.add(new EntryAnalysis(description, recordedName, derivedName, resolved, noViolations));
-         }
  
 -        boolean initializationSuccessful() {
 -            return propertiesFile != null;
-+        Map<String, List<EntryAnalysis>> recordedNames = groupByRecordedName(entries);
-+        Map<String, List<EntryAnalysis>> derivedNames = groupByDerivedName(entries);
-+        for (EntryAnalysis entry : entries) {
-+            entry.shared = recordedNames.get(entry.recordedName).size() > 1
-+                    || sharesResolvedFile(entry, entries);
-+            entry.misplaced = entry.derivedName != null && !entry.derivedName.equals(entry.recordedName);
-+            entry.colliding = entry.derivedName != null && derivedNames.get(entry.derivedName).size() > 1;
-+            entry.occupied = entry.misplaced && isOccupied(entry, entries, folder);
-+        }
-+        return new IntegrityAnalysis(entries, directRegularFiles(folder, entries));
++    private static class StoreState {
++        private final Object lock = new Object();
++        private File folder;
++        private File index;
++        private Properties properties = new Properties();
 +    }
 +
-+    private Map<String, List<EntryAnalysis>> groupByRecordedName(List<EntryAnalysis> entries) {
-+        Map<String, List<EntryAnalysis>> result = new HashMap<>();
-+        for (EntryAnalysis entry : entries) {
-+            result.computeIfAbsent(entry.recordedName, ignored -> new ArrayList<>()).add(entry);
-+        }
-+        return result;
-+    }
-+
-+    private Map<String, List<EntryAnalysis>> groupByDerivedName(List<EntryAnalysis> entries) {
-+        Map<String, List<EntryAnalysis>> result = new HashMap<>();
-+        for (EntryAnalysis entry : entries) {
-+            if (entry.derivedName != null) {
-+                result.computeIfAbsent(entry.derivedName, ignored -> new ArrayList<>()).add(entry);
-+            }
-         }
-+        return result;
-+    }
- 
--        private File initializePropertiesFile(File file) {
-+    private boolean sharesResolvedFile(EntryAnalysis entry, List<EntryAnalysis> entries) {
-+        if (!entry.resolved.isUsable()) {
-+            return false;
-+        }
-+        for (EntryAnalysis other : entries) {
-+            if (entry == other || !other.resolved.isUsable()) {
-+                continue;
-+            }
-             try {
--                File directory = file.getParentFile();
-+                if (sameFile(entry.resolved.realPath, other.resolved.realPath)) {
-+                    return true;
-+                }
-+            } catch (IOException ignored) {
-+                // Continue checking the remaining entries.
-+            }
-+        }
-+        return false;
-+    }
-+
-+    private boolean isOccupied(EntryAnalysis entry, List<EntryAnalysis> entries, Path folder) {
-+        if (entry.derivedName.equals(entry.recordedName)) {
-+            return false;
-+        }
-+        Path derivedPath = folder.resolve(entry.derivedName).normalize();
-+        if (!isDirectChild(derivedPath, folder)) {
-+            return true;
-+        }
-+        for (EntryAnalysis other : entries) {
-+            if (other != entry && entry.derivedName.equals(other.recordedName)) {
-+                return true;
-+            }
-+        }
-+        return Files.exists(derivedPath, NOFOLLOW_LINKS);
-+    }
-+
-+    private boolean hasNoViolations(Path resolvedFile) {
-+        try {
-+            String text = new String(Files.readAllBytes(resolvedFile), UTF_8);
-+            if (text.isEmpty() || text.matches("[\\r\\n]+")) {
-+                return true;
-+            }
-+            return readLinesFromText(text).isEmpty();
-+        } catch (IOException e) {
-+            return false;
-+        }
-+    }
-+
-+    private List<String> readLinesFromText(String text) {
-+        return Splitter.on(UNESCAPED_LINE_BREAK_PATTERN).omitEmptyStrings().splitToStream(ensureUnixLineBreaks(text))
-+                .map(this::unescape)
-+                .collect(toList());
-+    }
-+
-+    private List<String> directRegularFiles(Path folder) {
-+        return directRegularFiles(folder, Collections.emptyList());
-+    }
-+
-+    private List<String> directRegularFiles(Path folder, List<EntryAnalysis> entries) {
-+        List<String> result = new ArrayList<>();
-+        try (DirectoryStream<Path> files = Files.newDirectoryStream(folder)) {
-+            for (Path file : files) {
-+                if (!STORED_RULES_FILE_NAME.equals(file.getFileName().toString())
-+                        && Files.isRegularFile(file, NOFOLLOW_LINKS)
-+                        && !isOwnedByEntry(file, entries)) {
-+                    result.add(file.getFileName().toString());
-+                }
-+            }
-+        } catch (IOException e) {
-+            throw new StoreInitializationFailedException(e);
-+        }
-+        Collections.sort(result);
-+        return result;
-+    }
- 
--                // mkdirs() returns false both on failure and if another process concurrently
--                // created the directory, so isDirectory() distinguishes the two
--                if (!directory.mkdirs() && !directory.isDirectory()) {
--                    return null;
-+    private boolean isOwnedByEntry(Path file, List<EntryAnalysis> entries) {
-+        for (EntryAnalysis entry : entries) {
-+            if (entry.resolved.isUsable()) {
-+                try {
-+                    if (sameFile(file, entry.resolved.realPath)) {
-+                        return true;
-+                    }
-+                } catch (IOException ignored) {
-+                    // If the file cannot be compared, it remains reportable as unowned.
-                 }
-+            }
-+        }
-+        return false;
-+    }
- 
--                if (!file.exists() && !file.createNewFile()) {
--                    return null;
-+    private void repair(IntegrityAnalysis analysis, FileSyncedProperties rules, Path folder) {
-+        boolean changed = false;
-+        for (EntryAnalysis entry : analysis.entriesInRuleOrder()) {
-+            if (entry.shared) {
-+                continue;
-+            }
-+            if (entry.resolved.isBroken()) {
-+                rules.removeWithoutSync(entry.description);
-+                changed = true;
-+            } else if (entry.noViolations) {
-+                try {
-+                    deleteResolvedFile(entry.recordedName, entry.resolved);
-+                } catch (IOException e) {
-+                    throw new StoreInitializationFailedException(String.format(
-+                            "Cannot discard resolved violation file '%s'", entry.recordedName), e);
-                 }
-+                rules.removeWithoutSync(entry.description);
-+                changed = true;
-+            } else if (entry.misplaced && !entry.colliding && !entry.occupied) {
-+                moveToDerivedName(entry, folder);
-+                rules.setWithoutSync(entry.description, entry.derivedName);
-+                changed = true;
-+            }
-+        }
-+        if (changed) {
-+            rules.sync();
-+        }
-+    }
- 
--                return file;
--            } catch (IOException e) {
--                return null;
-+    private void moveToDerivedName(EntryAnalysis entry, Path folder) {
-+        if (STORED_RULES_FILE_NAME.equals(entry.derivedName)) {
-+            throw new StoreInitializationFailedException("A rule violation file cannot be named stored.rules");
-+        }
-+        Path destination = folder.resolve(entry.derivedName).normalize();
-+        if (!isDirectChild(destination, folder) || Files.exists(destination, NOFOLLOW_LINKS)) {
-+            throw new StoreInitializationFailedException(String.format(
-+                    "Cannot move misplaced violation file '%s' to '%s'", entry.recordedName, entry.derivedName));
-+        }
-+        try {
-+            Path source = entry.resolved.realPath;
-+            if (sameFile(source, folder.resolve(STORED_RULES_FILE_NAME))) {
-+                throw new IOException("The index is not a movable violation file");
-+            }
-+            moveReplacing(source, destination);
-+            Path recordedPath = folder.resolve(entry.recordedName).normalize();
-+            if (!recordedPath.equals(source) && Files.exists(recordedPath, NOFOLLOW_LINKS)) {
-+                Files.delete(recordedPath);
-             }
-+        } catch (IOException e) {
-+            throw new StoreInitializationFailedException(String.format(
-+                    "Cannot move misplaced violation file '%s' to '%s'", entry.recordedName, entry.derivedName), e);
-+        }
-+    }
-+
-+    private void deleteResolvedFile(String recordedName, ResolvedPath resolved) throws IOException {
-+        if (!resolved.isUsable()) {
-+            return;
-+        }
-+        if (sameFile(resolved.realPath, storeFolderPath.resolve(STORED_RULES_FILE_NAME))) {
-+            throw new IOException("The index is not a deletable violation file");
-+        }
-+        Files.deleteIfExists(resolved.realPath);
-+        Path recordedPath = storeFolderPath.resolve(recordedName).normalize();
-+        if (!recordedPath.equals(resolved.realPath)) {
-+            Files.deleteIfExists(recordedPath);
-+        }
-+    }
-+
-+    private ResolvedPath resolvePath(String fileName) throws IOException {
-+        return resolvePath(storeFolderPath, fileName);
-+    }
-+
-+    private ResolvedPath resolvePath(Path folder, String fileName) throws IOException {
-+        if (fileName == null) {
-+            return ResolvedPath.broken(null, BrokenReason.MISSING);
-+        }
-+        Path recordedPath = folder.resolve(fileName).normalize();
-+        if (!Files.exists(recordedPath, NOFOLLOW_LINKS)) {
-+            return ResolvedPath.broken(fileName, BrokenReason.MISSING);
-+        }
-+        Path realPath = recordedPath.toRealPath();
-+        if (Files.isDirectory(realPath, NOFOLLOW_LINKS)) {
-+            return ResolvedPath.broken(fileName, BrokenReason.DIRECTORY);
-+        }
-+        if (!Files.isRegularFile(realPath, NOFOLLOW_LINKS)) {
-+            return ResolvedPath.broken(fileName, BrokenReason.NOT_REGULAR);
-+        }
-+        Path realFolder = folder.toRealPath();
-+        if (realPath.getParent() == null || !realPath.getParent().equals(realFolder)) {
-+            return ResolvedPath.broken(fileName, BrokenReason.OUTSIDE);
-+        }
-+        return ResolvedPath.usable(fileName, realPath);
-+    }
-+
-+    private boolean isDirectChild(Path path, Path folder) {
-+        return path.getParent() != null && path.getParent().equals(folder);
-+    }
-+
-+    private boolean sameFile(Path first, Path second) throws IOException {
-+        return Files.isSameFile(first, second);
-+    }
-+
-+    private void moveReplacing(Path source, Path destination) throws IOException {
-+        try {
-+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-+        } catch (IOException e) {
-+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING);
-+        }
-+    }
-+
-+    private void deleteQuietly(Path path) {
-+        try {
-+            Files.deleteIfExists(path);
-+        } catch (IOException ignored) {
-+            log.debug("Could not remove temporary violation file {}", path);
-+        }
-+    }
-+
-+    private static class FileSyncedProperties {
-+        private final File propertiesFile;
-+        private final Properties loadedProperties;
-+
-+        FileSyncedProperties(File file) {
-+            propertiesFile = file;
-+            loadedProperties = loadRulesFrom(file);
-+        }
-+
-+        void reload() {
-+            Properties reloaded = loadRulesFrom(propertiesFile);
-+            loadedProperties.clear();
-+            loadedProperties.putAll(reloaded);
-         }
- 
-         private Properties loadRulesFrom(File file) {
-@@ -262,28 +838,215 @@ public final class TextFileBasedViolationStore implements ViolationStore {
-             return loadedProperties.getProperty(ensureUnixLineBreaks(propertyName));
-         }
- 
--        synchronized String putIfAbsent(String key, String value) {
-+        Set<String> keys() {
-+            Set<String> result = new HashSet<>();
-+            for (Object key : loadedProperties.keySet()) {
-+                result.add((String) key);
-+            }
-+            return result;
-+        }
-+
-+        synchronized void putIfAbsent(String key, String value) {
-             String normalizedKey = ensureUnixLineBreaks(key);
--            String existing = loadedProperties.getProperty(normalizedKey);
--            if (existing != null) {
--                return existing;
-+            if (loadedProperties.getProperty(normalizedKey) == null) {
-+                loadedProperties.setProperty(normalizedKey, ensureUnixLineBreaks(value));
-+                sync();
-             }
--            loadedProperties.setProperty(normalizedKey, ensureUnixLineBreaks(value));
--            syncFileSystem();
--            return null;
-         }
- 
--        private void syncFileSystem() {
--            try (FileOutputStream outputStream = new FileOutputStream(propertiesFile)) {
--                loadedProperties.store(outputStream, "");
-+        void setWithoutSync(String key, String value) {
-+            loadedProperties.setProperty(ensureUnixLineBreaks(key), ensureUnixLineBreaks(value));
-+        }
-+
-+        void removeWithoutSync(String key) {
-+            loadedProperties.remove(ensureUnixLineBreaks(key));
-+        }
-+
-+        synchronized void remove(String key) {
-+            loadedProperties.remove(ensureUnixLineBreaks(key));
-+            sync();
-+        }
-+
-+        synchronized void sync() {
-+            try {
-+                Properties snapshot = new Properties();
-+                snapshot.putAll(loadedProperties);
-+                Path temporary = Files.createTempFile(propertiesFile.toPath().getParent(), ".archunit-index-", ".tmp");
-+                try {
-+                    try (java.io.FileOutputStream outputStream = new java.io.FileOutputStream(temporary.toFile())) {
-+                        snapshot.store(outputStream, "");
-+                    }
-+                    try {
-+                        Files.move(temporary, propertiesFile.toPath(), StandardCopyOption.ATOMIC_MOVE,
-+                                StandardCopyOption.REPLACE_EXISTING);
-+                    } catch (IOException e) {
-+                        Files.move(temporary, propertiesFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-+                    }
-+                } finally {
-+                    Files.deleteIfExists(temporary);
-+                }
-             } catch (IOException e) {
-                 throw new StoreUpdateFailedException(e);
-             }
-         }
-     }
- 
-+    private enum IntegrityMode { IGNORE, REPAIR, FAIL }
-+
-+    private enum BrokenReason { MISSING, DIRECTORY, OUTSIDE, NOT_REGULAR }
-+
-+    private static final class ResolvedPath {
-+        private final String recordedName;
-+        private final Path realPath;
-+        private final BrokenReason brokenReason;
-+
-+        private ResolvedPath(String recordedName, Path realPath, BrokenReason brokenReason) {
-+            this.recordedName = recordedName;
-+            this.realPath = realPath;
-+            this.brokenReason = brokenReason;
-+        }
-+
-+        static ResolvedPath usable(String recordedName, Path realPath) {
-+            return new ResolvedPath(recordedName, realPath, null);
-+        }
-+
-+        static ResolvedPath broken(String recordedName, BrokenReason reason) {
-+            return new ResolvedPath(recordedName, null, reason);
-+        }
-+
-+        boolean isUsable() {
-+            return brokenReason == null;
-+        }
-+
-+        boolean isBroken() {
-+            return brokenReason != null;
-+        }
-+    }
-+
-+    private final class EntryAnalysis {
++    private static class Entry {
 +        private final String description;
-+        private final String recordedName;
++        private final String name;
 +        private final String derivedName;
-+        private final ResolvedPath resolved;
-+        private final boolean noViolations;
++        private final Path path;
++        private Path resolvedPath;
++        private boolean broken;
++        private boolean resolved;
 +        private boolean shared;
 +        private boolean misplaced;
 +        private boolean colliding;
 +        private boolean occupied;
 +
-+        private EntryAnalysis(String description, String recordedName, String derivedName,
-+                ResolvedPath resolved, boolean noViolations) {
++        Entry(String description, String name, String derivedName, File folder, File storedRulesFile) {
 +            this.description = description;
-+            this.recordedName = recordedName;
++            this.name = name;
 +            this.derivedName = derivedName;
-+            this.resolved = resolved;
-+            this.noViolations = noViolations;
++            this.path = folder.toPath().resolve(name);
++            inspectFile(folder, storedRulesFile);
+         }
+ 
+-        private File initializePropertiesFile(File file) {
++        private void inspectFile(File folder, File storedRulesFile) {
+             try {
+-                File directory = file.getParentFile();
+-
+-                // mkdirs() returns false both on failure and if another process concurrently
+-                // created the directory, so isDirectory() distinguishes the two
+-                if (!directory.mkdirs() && !directory.isDirectory()) {
+-                    return null;
++                if (!isDirectChildPath(path, folder.toPath())
++                        || sameFile(path, storedRulesFile.toPath())
++                        || !Files.isRegularFile(path)) {
++                    broken = true;
++                    return;
+                 }
+-
+-                if (!file.exists() && !file.createNewFile()) {
+-                    return null;
++                Path realPath = path.toRealPath();
++                if (!isRegularFileDirectlyIn(realPath, folder.toPath())) {
++                    broken = true;
++                    return;
+                 }
+-
+-                return file;
++                resolvedPath = realPath;
++                resolved = isOnlyLineBreaks(new String(Files.readAllBytes(realPath), UTF_8));
+             } catch (IOException e) {
+-                return null;
++                broken = true;
+             }
+         }
+ 
+-        private Properties loadRulesFrom(File file) {
+-            Properties result = new Properties();
+-            try (FileInputStream inputStream = new FileInputStream(file)) {
+-                result.load(inputStream);
+-            } catch (IOException e) {
+-                throw new StoreInitializationFailedException(e);
+-            }
+-            return result;
++        private static boolean isDirectChildPath(Path path, Path folder) {
++            return path.toAbsolutePath().normalize().getParent().equals(folder.toAbsolutePath().normalize());
+         }
+ 
+-        boolean containsKey(String propertyName) {
+-            return loadedProperties.containsKey(ensureUnixLineBreaks(propertyName));
++        private static boolean isOnlyLineBreaks(String value) {
++            return ONLY_LINE_BREAKS_PATTERN.matcher(value).matches();
 +        }
 +    }
 +
-+    private final class IntegrityAnalysis {
-+        private final List<EntryAnalysis> entries;
++    private static class IntegrityReport {
++        private final File folder;
++        private final List<Entry> entries;
 +        private final List<String> unownedFiles;
 +
-+        private IntegrityAnalysis(List<EntryAnalysis> entries, List<String> unownedFiles) {
++        IntegrityReport(File folder, List<Entry> entries, List<String> unownedFiles) {
++            this.folder = folder;
 +            this.entries = entries;
 +            this.unownedFiles = unownedFiles;
-+        }
-+
-+        private List<EntryAnalysis> entriesInRuleOrder() {
-+            List<EntryAnalysis> result = new ArrayList<>(entries);
-+            result.sort(Comparator.comparing(entry -> entry.description));
-+            return result;
-+        }
-+
-+        private boolean isClean() {
-+            return entries.stream().noneMatch(entry -> entry.resolved.isBroken() || entry.noViolations
-+                    || entry.shared || entry.misplaced || entry.colliding || entry.occupied)
-+                    && unownedFiles.isEmpty();
-+        }
-+
-+        private String report() {
-+            StringBuilder result = new StringBuilder("Violation store integrity check failed:");
-+            appendEntries(result, "broken", entry -> entry.resolved.isBroken());
-+            appendEntries(result, "resolved", entry -> entry.noViolations);
-+            appendEntries(result, "shared", entry -> entry.shared);
-+            appendFiles(result, "unowned", unownedFiles);
-+            appendEntries(result, "misplaced", entry -> entry.misplaced);
-+            appendEntries(result, "colliding", entry -> entry.colliding);
-+            appendEntries(result, "occupied", entry -> entry.occupied);
-+            return result.toString();
-+        }
-+
-+        private void appendEntries(StringBuilder result, String condition, EntryCondition predicate) {
-+            List<EntryAnalysis> matching = entries.stream().filter(predicate::matches)
-+                    .sorted(Comparator.comparing(entry -> entry.description))
-+                    .collect(toList());
-+            if (!matching.isEmpty()) {
-+                result.append('\n').append(condition).append(':');
-+                for (EntryAnalysis entry : matching) {
-+                    result.append("\n  ").append(entry.description).append(" -> ").append(entry.recordedName);
-+                    if (entry.derivedName != null && !entry.derivedName.equals(entry.recordedName)) {
-+                        result.append(" (derived ").append(entry.derivedName).append(')');
-+                    }
+         }
+ 
+-        String getProperty(String propertyName) {
+-            return loadedProperties.getProperty(ensureUnixLineBreaks(propertyName));
++        static IntegrityReport empty(File folder) {
++            return new IntegrityReport(folder, Collections.emptyList(), Collections.emptyList());
+         }
+ 
+-        synchronized String putIfAbsent(String key, String value) {
+-            String normalizedKey = ensureUnixLineBreaks(key);
+-            String existing = loadedProperties.getProperty(normalizedKey);
+-            if (existing != null) {
+-                return existing;
++        boolean hasProblems() {
++            if (!unownedFiles.isEmpty()) {
++                return true;
+             }
+-            loadedProperties.setProperty(normalizedKey, ensureUnixLineBreaks(value));
+-            syncFileSystem();
+-            return null;
++            for (Entry entry : entries) {
++                if (entry.broken || entry.resolved || entry.shared || entry.misplaced || entry.colliding || entry.occupied) {
++                    return true;
 +                }
 +            }
-+        }
-+
-+        private void appendFiles(StringBuilder result, String condition, List<String> files) {
-+            if (!files.isEmpty()) {
-+                result.append('\n').append(condition).append(':');
-+                for (String file : files) {
-+                    result.append("\n  ").append(file);
++            return false;
+         }
+ 
+-        private void syncFileSystem() {
+-            try (FileOutputStream outputStream = new FileOutputStream(propertiesFile)) {
+-                loadedProperties.store(outputStream, "");
+-            } catch (IOException e) {
+-                throw new StoreUpdateFailedException(e);
++        String asMessage() {
++            StringBuilder result = new StringBuilder("Violation store integrity check failed for ")
++                    .append(folder.getAbsolutePath()).append(":\n");
++            appendEntries(result, "broken", filter(entry -> entry.broken));
++            appendEntries(result, "resolved", filter(entry -> entry.resolved));
++            appendEntries(result, "shared", filter(entry -> entry.shared));
++            appendEntries(result, "misplaced", filter(entry -> entry.misplaced));
++            appendEntries(result, "colliding", filter(entry -> entry.colliding));
++            appendEntries(result, "occupied", filter(entry -> entry.occupied));
++            if (!unownedFiles.isEmpty()) {
++                result.append("unowned files:\n");
++                for (String file : unownedFiles) {
++                    result.append("  ").append(file).append('\n');
 +                }
 +            }
++            return result.toString().trim();
 +        }
-+    }
 +
-+    @FunctionalInterface
-+    private interface EntryCondition {
-+        boolean matches(EntryAnalysis entry);
-+    }
-+
-+    private static class RandomFileNameStrategy implements RuleViolationFileNameStrategy {
-+        @Override
-+        public String createRuleFileName(String ruleDescription) {
-+            return UUID.randomUUID().toString();
++        private List<Entry> filter(java.util.function.Predicate<Entry> predicate) {
++            return entries.stream().filter(predicate).sorted(ENTRY_COMPARATOR).collect(toList());
 +        }
-+    }
 +
-+    private static class DescriptionFileNameStrategy implements RuleViolationFileNameStrategy {
-+        @Override
-+        public String createRuleFileName(String ruleDescription) {
-+            String word = null;
-+            Matcher matcher = DESCRIPTION_WORD_PATTERN.matcher(ruleDescription);
-+            while (matcher.find()) {
-+                String candidate = matcher.group();
-+                if (candidate.length() >= 4 && candidate.length() <= 120) {
-+                    word = candidate;
-+                }
++        private static void appendEntries(StringBuilder result, String condition, List<Entry> entries) {
++            if (entries.isEmpty()) {
++                return;
 +            }
-+            if (word == null) {
-+                word = "rule";
-+            }
-+            return word + "-" + digest(ruleDescription);
-+        }
-+
-+        private String digest(String value) {
-+            try {
-+                byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(UTF_8));
-+                StringBuilder result = new StringBuilder();
-+                for (byte part : digest) {
-+                    result.append(String.format("%02x", part & 0xff));
-+                }
-+                return result.toString();
-+            } catch (NoSuchAlgorithmException e) {
-+                throw new AssertionError(e);
-+            }
-+        }
-+    }
-+
++            result.append(condition).append(" entries:\n");
++            for (Entry entry : entries) {
++                result.append("  ").append(entry.description).append(" -> ").append(entry.name).append('\n');
+             }
+         }
+     }
+ 
      /**
 -     * Allows to adjust the rule violation file names of {@link TextFileBasedViolationStore}
 +     * Allows to adjust the rule violation file names of {@link TextFileBasedViolationStore}.
       *
       * @see TextFileBasedViolationStore#TextFileBasedViolationStore(RuleViolationFileNameStrategy)
       */
-@@ -291,12 +1054,10 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+@@ -291,12 +929,10 @@ public final class TextFileBasedViolationStore implements ViolationStore {
      @PublicAPI(usage = INHERITANCE)
      public interface RuleViolationFileNameStrategy {
          /**
@@ -1130,191 +1053,72 @@ index fd2bcc5..ac55f75 100644
           */
          String createRuleFileName(String ruleDescription);
      }
-diff --git a/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreIntegrityTest.java b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreIntegrityTest.java
-new file mode 100644
-index 0000000..1c673f4
---- /dev/null
-+++ b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreIntegrityTest.java
-@@ -0,0 +1,182 @@
-+/*
-+ * Copyright 2014-2026 TNG Technology Consulting GmbH
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+package com.tngtech.archunit.library.freeze;
-+
-+import java.io.File;
-+import java.io.FileInputStream;
-+import java.io.FileOutputStream;
-+import java.io.IOException;
-+import java.nio.file.Files;
-+import java.nio.file.Path;
-+import java.util.LinkedList;
-+import java.util.Properties;
-+
-+import com.google.common.collect.ImmutableList;
-+import com.tngtech.archunit.lang.ArchRule;
-+import org.junit.jupiter.api.Test;
-+import org.junit.jupiter.api.io.TempDir;
-+
-+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
-+import static java.nio.charset.StandardCharsets.UTF_8;
-+import static java.util.Arrays.asList;
-+import static org.assertj.core.api.Assertions.assertThat;
-+import static org.assertj.core.api.Assertions.assertThatThrownBy;
-+
-+public class TextFileBasedViolationStoreIntegrityTest {
-+
-+    @TempDir
-+    Path temporaryFolder;
-+
+diff --git a/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreTest.java b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreTest.java
+index 202a786..7666453 100644
+--- a/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreTest.java
++++ b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreTest.java
+@@ -116,6 +116,64 @@ public class TextFileBasedViolationStoreTest {
+         assertThat(violations).as("stored violations").containsExactlyElementsOf(expected);
+     }
+ 
 +    @Test
-+    public void fail_does_not_create_an_absent_index_when_an_unowned_file_exists() throws IOException {
-+        File folder = temporaryFolder.resolve("store").toFile();
-+        assertThat(folder.mkdirs()).isTrue();
-+        Files.write(new File(folder, "unowned").toPath(), "content".getBytes(UTF_8));
++    public void preserves_carriage_returns_inside_violations() {
++        List<String> expected = ImmutableList.of("first with\rcarriage return", "second");
 +
-+        assertThatThrownBy(() -> newStore(null).initialize(propertiesOf(
-+                "default.path", folder.getAbsolutePath(),
-+                "default.allowStoreCreation", "true",
-+                "default.integrity", "fail")))
-+                .isInstanceOf(StoreInitializationFailedException.class)
-+                .hasMessageContaining("unowned")
-+                .hasMessageNotContaining("stored.rules");
-+        assertThat(new File(folder, "stored.rules")).doesNotExist();
++        store.save(defaultRule(), expected);
++
++        assertThat(store.getViolations(defaultRule())).containsExactlyElementsOf(expected);
 +    }
 +
 +    @Test
-+    public void repair_discards_an_entry_whose_file_contains_only_a_carriage_return() throws IOException {
-+        File folder = temporaryFolder.resolve("store").toFile();
-+        assertThat(folder.mkdirs()).isTrue();
-+        File index = new File(folder, "stored.rules");
-+        writeIndex(index, "rule", "empty");
-+        Files.write(new File(folder, "empty").toPath(), "\r".getBytes(UTF_8));
++    public void description_file_names_are_deterministic_and_keep_a_late_word() throws IOException {
++        Properties properties = defaultStoreProperties();
++        properties.setProperty("default.fileNames", "description");
++        TextFileBasedViolationStore descriptionStore = new TextFileBasedViolationStore();
++        descriptionStore.initialize(properties);
 +
-+        newStore(null).initialize(propertiesOf(
-+                "default.path", folder.getAbsolutePath(),
-+                "default.allowStoreUpdate", "true",
-+                "default.integrity", "repair"));
++        ArchRule first = rule("a description with a LateWord");
++        ArchRule second = rule("a different description with a LateWord");
++        descriptionStore.save(first, ImmutableList.of("first"));
++        descriptionStore.save(second, ImmutableList.of("second"));
 +
-+        assertThat(readIndex(index)).doesNotContainKey("rule");
-+        assertThat(new File(folder, "empty")).doesNotExist();
++        Properties stored = readProperties(new File(configuredFolder, "stored.rules"));
++        String firstName = stored.getProperty(first.getDescription());
++        String secondName = stored.getProperty(second.getDescription());
++        assertThat(firstName).contains("LateWord").matches("[A-Za-z0-9_-]{1,200}");
++        assertThat(secondName).contains("LateWord").matches("[A-Za-z0-9_-]{1,200}");
++        assertThat(firstName).isNotEqualTo(secondName);
 +    }
 +
 +    @Test
-+    public void repair_moves_a_misplaced_file_and_updates_the_index() throws IOException {
-+        File folder = temporaryFolder.resolve("store").toFile();
-+        assertThat(folder.mkdirs()).isTrue();
-+        File index = new File(folder, "stored.rules");
-+        writeIndex(index, "rule", "old");
-+        Files.write(new File(folder, "old").toPath(), "violation\n".getBytes(UTF_8));
++    public void repair_forgets_a_known_rule_when_no_violations_are_saved() {
++        Properties properties = defaultStoreProperties();
++        properties.setProperty("default.integrity", "repair");
++        TextFileBasedViolationStore repairStore = new TextFileBasedViolationStore();
++        repairStore.initialize(properties);
 +
-+        newStore(description -> description + "-derived").initialize(propertiesOf(
-+                "default.path", folder.getAbsolutePath(),
-+                "default.allowStoreUpdate", "true",
-+                "default.integrity", "repair"));
++        ArchRule rule = defaultRule();
++        repairStore.save(rule, ImmutableList.of("violation"));
++        repairStore.save(rule, ImmutableList.of());
 +
-+        assertThat(new File(folder, "old")).doesNotExist();
-+        assertThat(new File(folder, "rule-derived")).hasContent("violation\n");
-+        assertThat(readIndex(index).getProperty("rule")).isEqualTo("rule-derived");
++        assertThat(repairStore.contains(rule)).isFalse();
++        assertThat(configuredFolder.list()).containsExactly("stored.rules");
 +    }
 +
 +    @Test
-+    public void save_does_not_overwrite_an_existing_unowned_file() throws IOException {
-+        File folder = temporaryFolder.resolve("store").toFile();
-+        assertThat(folder.mkdirs()).isTrue();
-+        File occupied = new File(folder, "occupied");
-+        Files.write(occupied.toPath(), "original".getBytes(UTF_8));
-+        TextFileBasedViolationStore store = newStore(description -> "occupied");
-+        store.initialize(propertiesOf(
-+                "default.path", folder.getAbsolutePath(),
-+                "default.allowStoreCreation", "true"));
++    public void random_file_names_are_not_misplaced_during_integrity_checks() {
++        TextFileBasedViolationStore firstStore = new TextFileBasedViolationStore();
++        firstStore.initialize(defaultStoreProperties());
++        firstStore.save(defaultRule(), ImmutableList.of("violation"));
 +
-+        assertThatThrownBy(() -> store.save(rule("rule"), ImmutableList.of("new")))
-+                .isInstanceOf(StoreUpdateFailedException.class);
-+        assertThat(Files.readAllBytes(occupied.toPath())).isEqualTo("original".getBytes(UTF_8));
-+        assertThat(readIndex(new File(folder, "stored.rules"))).doesNotContainKey("rule");
++        Properties failProperties = defaultStoreProperties();
++        failProperties.setProperty("default.integrity", "fail");
++        TextFileBasedViolationStore secondStore = new TextFileBasedViolationStore();
++        secondStore.initialize(failProperties);
++
++        assertThat(secondStore.getViolations(defaultRule())).containsExactly("violation");
 +    }
 +
-+    @Test
-+    public void constructor_strategy_rejects_file_name_configuration() {
-+        TextFileBasedViolationStore store = new TextFileBasedViolationStore(description -> "file");
-+        assertThatThrownBy(() -> store.initialize(propertiesOf("default.fileNames", "random")))
-+                .isInstanceOf(StoreInitializationFailedException.class)
-+                .hasMessageContaining("default.fileNames");
-+    }
-+
-+    @Test
-+    public void description_names_are_deterministic_safe_and_keep_a_late_word() throws IOException {
-+        StringBuilder longDescription = new StringBuilder("first words ");
-+        for (int i = 0; i < 20; i++) {
-+            longDescription.append("longdescription ");
-+        }
-+        String description = longDescription.append("LateWordHere").toString();
-+        File firstFolder = temporaryFolder.resolve("first").toFile();
-+        File secondFolder = temporaryFolder.resolve("second").toFile();
-+        TextFileBasedViolationStore first = newStore(null);
-+        first.initialize(propertiesOf(
-+                "default.path", firstFolder.getAbsolutePath(),
-+                "default.allowStoreCreation", "true",
-+                "default.fileNames", "description"));
-+        first.save(rule(description), ImmutableList.of("violation"));
-+
-+        TextFileBasedViolationStore second = newStore(null);
-+        second.initialize(propertiesOf(
-+                "default.path", secondFolder.getAbsolutePath(),
-+                "default.allowStoreCreation", "true",
-+                "default.fileNames", "description"));
-+        second.save(rule(description), ImmutableList.of("violation"));
-+
-+        String firstName = readIndex(new File(firstFolder, "stored.rules")).getProperty(description);
-+        String secondName = readIndex(new File(secondFolder, "stored.rules")).getProperty(description);
-+        assertThat(firstName).isEqualTo(secondName)
-+                .contains("LateWordHere")
-+                .matches("[A-Za-z0-9_-]{1,200}")
-+                .isNotEqualTo("stored.rules");
-+    }
-+
-+    private TextFileBasedViolationStore newStore(TextFileBasedViolationStore.RuleViolationFileNameStrategy strategy) {
-+        return strategy == null ? new TextFileBasedViolationStore() : new TextFileBasedViolationStore(strategy);
-+    }
-+
-+    private void writeIndex(File index, String key, String value) throws IOException {
-+        Properties properties = new Properties();
-+        properties.setProperty(key, value);
-+        try (FileOutputStream output = new FileOutputStream(index)) {
-+            properties.store(output, "");
-+        }
-+    }
-+
-+    private Properties readIndex(File index) throws IOException {
-+        Properties properties = new Properties();
-+        try (FileInputStream input = new FileInputStream(index)) {
-+            properties.load(input);
-+        }
-+        return properties;
-+    }
-+
-+    private Properties propertiesOf(String... keyValuePairs) {
-+        Properties result = new Properties();
-+        LinkedList<String> keyValues = new LinkedList<>(asList(keyValuePairs));
-+        while (!keyValues.isEmpty()) {
-+            result.setProperty(keyValues.poll(), keyValues.poll());
-+        }
-+        return result;
-+    }
-+
-+    private ArchRule rule(String description) {
-+        return classes().should().bePublic().as(description);
-+    }
-+}
+     private Properties readProperties(File file) throws IOException {
+         Properties properties = new Properties();
+         try (FileInputStream inputStream = new FileInputStream(file)) {
