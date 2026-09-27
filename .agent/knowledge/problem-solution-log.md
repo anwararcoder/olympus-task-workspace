@@ -1545,6 +1545,10 @@ mechanically executed against each round's OWN output (run the sweep over the di
 added, last — not over the inherited corpus, first), because the artifacts a round adds are
 precisely where its author's blind spots live.
 **Applies to:** All review-cycle process, any repository.
+**Seen in:** freeze-store-integrity v17 -> v18, 2026-09-27: the same six false-positive probes (legacy
+backslash-CR bytes, CRLF strategy input, inherited `Properties` defaults, symlinked store folder,
+non-public strategy class, CRLF/LF raw index keys) were requested in v5, v12 and v17 and were never
+added, so the last revision had to add all of them at once.
 
 ### A premise that BOUNDS your effort needs more scrutiny than one that expands it
 **Trigger:** A standing conclusion in the status log justifies NOT doing something — "the
@@ -2895,4 +2899,47 @@ of scope; add nothing.
 
 Append new entries below this line, newest last, using the entry format at the top of this file.
 Record the date and task in `Seen in`.
+
+### A "waits for the operation in progress" test must assert the waiter was still blocked
+**Trigger:** Auto-review T3/T4 High: a test holding a save mid-operation starts examiner threads,
+`join(2_000)`s them, releases the save and checks only the final state. A save that reads its input
+before taking the lock lets examiners finish early and still reaches the same final state.
+**Root cause:** `join(timeout)` asserts nothing; the test proved eventual consistency, not exclusion.
+**Solution:** After the bounded join and before releasing the held operation, capture
+`waited = waiters.stream().allMatch(Thread::isAlive)`; release; join; then assert `waited`. Capturing
+before and asserting after keeps a failing run from leaving threads hung. Sweep every sibling test of
+the same shape (here two repair-while-saving tests besides the named one).
+**Verification:** Reference-derived mutant that materializes the violations outside the lock failed
+exactly the three strengthened tests, each on the new assertion; the reference passed three repeated
+offline runs.
+**Applies to:** Any concurrency test claiming one operation waits for another.
+**Seen in:** freeze-store-integrity v17 -> v18, 2026-09-27.
+
+### A review regression that passes on base needs a feature behavior folded into the same leaf
+**Trigger:** Adding requested false-positive regressions whose core check already holds on the base
+repository (a constructor strategy receiving the original description, reading a legacy violation,
+initializing through a symlinked store folder).
+**Root cause:** The checked behavior is pre-existing, so a standalone leaf would pass without the
+solution and break fail-to-pass.
+**Solution:** Route each such leaf through something only the feature does in the same test: cover
+the configured-strategy path next to the constructor path, repair a broken sibling entry beside the
+legacy one, repair plus `fail` through the linked folder. Then confirm on the unsolved base that
+every new leaf fails.
+**Verification:** Unsolved new mode 0/143 passing; solved 143/143; the v17 passing candidate failed
+exactly the six new leaves, each for its intended reason.
+**Applies to:** Any regression added for a candidate-only defect in behavior the base already has.
+**Seen in:** freeze-store-integrity v18, 2026-09-27.
+
+### A Windows checkout turns stored patches into CRLF that `git apply` rejects
+**Trigger:** `git apply test-*.patch` fails ("patch does not apply") in a fresh clone although the
+platform applied the same patch.
+**Root cause:** `core.autocrlf=true` rewrites the tracked LF patch to CRLF in the working copy; the
+index copy is still LF (`git ls-files --eol` shows `i/lf w/crlf`).
+**Solution:** Apply `tr -d '\r'`'d copies, but only after confirming the patch holds no literal CR
+(count lone CR bytes first); clone verification checkouts with `core.autocrlf=false`; write
+regenerated patches back as LF.
+**Verification:** The LF form applied cleanly with `--whitespace=error`, and the platform copy
+matched it byte for byte after CR removal.
+**Applies to:** Every task worked on a Windows checkout.
+**Seen in:** freeze-store-integrity v18, 2026-09-27.
 
