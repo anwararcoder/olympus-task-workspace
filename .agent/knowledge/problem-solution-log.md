@@ -2943,3 +2943,22 @@ matched it byte for byte after CR removal.
 **Applies to:** Every task worked on a Windows checkout.
 **Seen in:** freeze-store-integrity v18, 2026-09-27.
 
+
+### Splitting a dense description sentence can drop a clause's scope; check each new sentence alone
+**Trigger:** Description Quality fails on "dense sentences" and a bot comment proposes a split
+rewrite, e.g. "Under `repair`, storing no violations forgets a known rule ... and stores nothing
+for an unknown rule" split so that "For an unknown rule, save nothing" becomes its own sentence.
+**Root cause:** The shared prefix ("Under `repair`, storing no violations") scoped every clause of
+the long sentence; once split, the standalone sentence reads as a general rule (any save of a new
+rule stores nothing), which contradicts ordinary behavior. The bot text also kept an `unless` that
+could attach to both the entry and the file, and used curly quotes and imperative voice.
+**Solution:** Fix rather than contest (a readability verdict is cheap to satisfy), but rewrite the
+proposal: repeat the scope in every split sentence ("Saving no violations for an unknown rule
+stores nothing"), attach each `unless` to exactly the noun the tests cover (checked against
+`forgettingARuleKeepsTheFileAnotherEntryStillRecords`: entry removed, shared file kept), keep the
+description's declarative voice, and type the text so it stays ASCII-only.
+**Verification:** Each new sentence was read alone against its test; description stays ASCII-only,
+LF, leak-free; only the description changed.
+**Applies to:** Any description edit that splits a sentence, especially one taken from a bot or
+reviewer comment.
+**Seen in:** freeze-store-integrity v18 Description Quality comment, 2026-09-28.
