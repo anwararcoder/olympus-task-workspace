@@ -131,6 +131,11 @@ rule wins. Update this digest when a log entry is promoted (see `.agent/rules/pr
 - Keep the fair difficulty carrier untouched; closing a real FP class is worth losing the only passer.
 - Verify a report targets this task and this revision before acting on it.
 
+- Before new rollouts after tightening tests, replay every saved agent patch in local Docker built
+  from the base commit. First confirm each platform failure reproduces, then measure what the new
+  cells do per run, and fix ambiguous wording that blocks many runs in the description. On Windows,
+  restore `test.sh`'s exec bit (`git update-index --chmod=+x`) before regenerating the patch.
+
 ## 7. Where to look (topic -> source)
 
 | Topic | Search |
