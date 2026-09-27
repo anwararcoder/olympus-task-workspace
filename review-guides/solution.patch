@@ -1,0 +1,1309 @@
+diff --git a/builtin/builtin.go b/builtin/builtin.go
+index 87e7361..7ef940e 100644
+--- a/builtin/builtin.go
++++ b/builtin/builtin.go
+@@ -1034,6 +1034,26 @@ var Builtins = []*Function{
+ 			new(func([]int) []any),
+ 		),
+ 	},
++	{
++		Name:      "capture",
++		Func:      Capture,
++		Validate: func(args []reflect.Type) (reflect.Type, error) {
++			if len(args) != 2 {
++				return anyType, fmt.Errorf("invalid number of arguments for capture (expected 2, got %d)", len(args))
++			}
++			return mapStringAny, nil
++		},
++	},
++	{
++		Name:      "captureAll",
++		Predicate: true,
++		Types:     types(new(func(string, string) []any)),
++	},
++	{
++		Name:      "replacePattern",
++		Predicate: true,
++		Types:     types(new(func(string, string, string) string)),
++	},
+ 	bitFunc("bitand", func(x, y int) (any, error) {
+ 		return x & y, nil
+ 	}),
+diff --git a/builtin/builtin_test.go b/builtin/builtin_test.go
+index 0d0dec3..8f8f1d4 100644
+--- a/builtin/builtin_test.go
++++ b/builtin/builtin_test.go
+@@ -215,10 +215,11 @@ func TestBuiltin_works_with_any(t *testing.T) {
+ 	config := map[string]struct {
+ 		arity int
+ 	}{
+-		"now":    {0},
+-		"get":    {2},
+-		"take":   {2},
+-		"sortBy": {2},
++		"now":     {0},
++		"get":     {2},
++		"take":    {2},
++		"sortBy":  {2},
++		"capture": {2},
+ 	}
+ 
+ 	for _, b := range builtin.Builtins {
+diff --git a/builtin/regex.go b/builtin/regex.go
+new file mode 100644
+index 0000000..f4e1d9c
+--- /dev/null
++++ b/builtin/regex.go
+@@ -0,0 +1,128 @@
++package builtin
++
++import (
++	"fmt"
++	"regexp"
++	"strconv"
++)
++
++// buildCaptureGroups builds a map[string]any from a regexp match.
++// If withMeta is true, it includes "0" (full match) and "_index" keys.
++// If withMeta is false, it only includes explicit capture groups (numbered 1..N, named by name).
++func buildCaptureGroups(re *regexp.Regexp, match []string, withMeta bool, matchIndex int) map[string]any {
++	result := make(map[string]any)
++	if withMeta {
++		result["0"] = match[0]
++		result["_index"] = matchIndex
++	}
++	names := re.SubexpNames()
++	for i := 1; i < len(match); i++ {
++		if i < len(names) && names[i] != "" {
++			result[names[i]] = match[i]
++		} else {
++			result[strconv.Itoa(i)] = match[i]
++		}
++	}
++	return result
++}
++
++// Capture extracts capture groups from the first match of pattern in text.
++// Returns nil if text is nil, nil if no match found, or a map[string]any of groups.
++func Capture(args ...any) (any, error) {
++	if len(args) != 2 {
++		return nil, fmt.Errorf("invalid number of arguments for capture (expected 2, got %d)", len(args))
++	}
++	if args[0] == nil {
++		return nil, nil
++	}
++	text, ok := args[0].(string)
++	if !ok {
++		return nil, fmt.Errorf("first argument to capture must be a string (got %T)", args[0])
++	}
++	pattern, ok := args[1].(string)
++	if !ok {
++		return nil, fmt.Errorf("second argument to capture must be a string (got %T)", args[1])
++	}
++	re, err := regexp.Compile(pattern)
++	if err != nil {
++		return nil, fmt.Errorf("invalid regex pattern: %v", err)
++	}
++	match := re.FindStringSubmatch(text)
++	if match == nil {
++		return nil, nil
++	}
++	return buildCaptureGroups(re, match, false, 0), nil
++}
++
++// CaptureConst is the runtime implementation for capture when the pattern was
++// compiled at compile time. args[0] = text, args[1] = *regexp.Regexp
++func CaptureConst(args ...any) (any, error) {
++	if args[0] == nil {
++		return nil, nil
++	}
++	text := args[0].(string)
++	re := args[1].(*regexp.Regexp)
++	match := re.FindStringSubmatch(text)
++	if match == nil {
++		return nil, nil
++	}
++	return buildCaptureGroups(re, match, false, 0), nil
++}
++
++// CaptureAll returns all matches of pattern in text as an array of maps.
++// Returns nil if text is nil, empty array if no matches found.
++func CaptureAll(args ...any) (any, error) {
++	if len(args) != 2 {
++		return nil, fmt.Errorf("invalid number of arguments for captureAll (expected 2, got %d)", len(args))
++	}
++	if args[0] == nil {
++		return nil, nil
++	}
++	text, ok := args[0].(string)
++	if !ok {
++		return nil, fmt.Errorf("first argument to captureAll must be a string (got %T)", args[0])
++	}
++	pattern, ok := args[1].(string)
++	if !ok {
++		return nil, fmt.Errorf("second argument to captureAll must be a string (got %T)", args[1])
++	}
++	re, err := regexp.Compile(pattern)
++	if err != nil {
++		return nil, fmt.Errorf("invalid regex pattern: %v", err)
++	}
++	matches := re.FindAllStringSubmatch(text, -1)
++	if matches == nil {
++		return []any{}, nil
++	}
++	result := make([]any, len(matches))
++	for i, match := range matches {
++		result[i] = buildCaptureGroups(re, match, false, i)
++	}
++	return result, nil
++}
++
++// BuildCaptureGroupsMeta builds capture groups with metadata (0 and _index).
++// This is used by the compiler for closure-based captureAll and replacePattern.
++func BuildCaptureGroupsMeta(re *regexp.Regexp, match []string, matchIndex int) map[string]any {
++	return buildCaptureGroups(re, match, true, matchIndex)
++}
++
++// ReplaceWithTemplateFn performs regex replacement supporting backreferences
++// like $1, ${1}, ${name}, and $$ for literal $.
++func ReplaceWithTemplateFn(text string, re *regexp.Regexp, template string, limit int) string {
++	if limit == 0 {
++		return text
++	}
++	count := 0
++	return re.ReplaceAllStringFunc(text, func(match string) string {
++		if limit >= 0 && count >= limit {
++			return match
++		}
++		count++
++		// Use Go's regexp Expand for backreference substitution
++		submatch := re.FindStringSubmatchIndex(match)
++		var dst []byte
++		dst = re.ExpandString(dst, template, match, submatch)
++		return string(dst)
++	})
++}
+diff --git a/builtin/regex_test.go b/builtin/regex_test.go
+new file mode 100644
+index 0000000..069f14e
+--- /dev/null
++++ b/builtin/regex_test.go
+@@ -0,0 +1,530 @@
++package builtin_test
++
++import (
++	"testing"
++
++	"github.com/expr-lang/expr"
++	"github.com/expr-lang/expr/internal/testify/assert"
++	"github.com/expr-lang/expr/internal/testify/require"
++)
++
++// ─── capture ────────────────────────────────────────────────────────────
++
++func TestCapture_basic(t *testing.T) {
++	tests := []struct {
++		name  string
++		input string
++		env   map[string]any
++		want  any
++	}{
++		{
++			name:  "unnamed groups",
++			input: `capture("hello world 42", "(\\w+)\\s+(\\w+)\\s+(\\d+)")`,
++			want: map[string]any{
++				"1": "hello",
++				"2": "world",
++				"3": "42",
++			},
++		},
++		{
++			name:  "named groups",
++			input: `capture("2024-01-15", "(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})")`,
++			want: map[string]any{
++				"year":  "2024",
++				"month": "01",
++				"day":   "15",
++			},
++		},
++		{
++			name:  "mixed named and unnamed groups",
++			input: `capture("John 30", "(?P<name>\\w+)\\s+(\\d+)")`,
++			want: map[string]any{
++				"name": "John",
++				"2":    "30",
++			},
++		},
++		{
++			name:  "no match returns nil",
++			input: `capture("hello", "\\d+")`,
++			want:  nil,
++		},
++		{
++			name:  "nil text returns nil",
++			input: `capture(nil_val, "\\d+")`,
++			env:   map[string]any{"nil_val": nil},
++			want:  nil,
++		},
++		{
++			name:  "first match only",
++			input: `capture("abc 123 def 456", "(\\d+)")`,
++			want:  map[string]any{"1": "123"},
++		},
++		{
++			name:  "no metadata keys in result",
++			input: `capture("hello 42", "(\\w+)\\s+(\\d+)")`,
++			want: map[string]any{
++				"1": "hello",
++				"2": "42",
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			env := tt.env
++			if env == nil {
++				env = map[string]any{}
++			}
++			program, err := expr.Compile(tt.input, expr.Env(env))
++			require.NoError(t, err)
++			out, err := expr.Run(program, env)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestCapture_dynamic_pattern(t *testing.T) {
++	env := map[string]any{
++		"text":    "hello 123",
++		"pattern": `(\w+)\s+(\d+)`,
++	}
++	program, err := expr.Compile(`capture(text, pattern)`, expr.Env(env))
++	require.NoError(t, err)
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	assert.Equal(t, map[string]any{"1": "hello", "2": "123"}, out)
++}
++
++func TestCapture_invalid_const_pattern(t *testing.T) {
++	_, err := expr.Compile(`capture("hello", "[invalid")`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "error parsing regexp")
++}
++
++func TestCapture_invalid_dynamic_pattern(t *testing.T) {
++	env := map[string]any{
++		"text":    "hello",
++		"pattern": "[invalid",
++	}
++	program, err := expr.Compile(`capture(text, pattern)`, expr.Env(env))
++	require.NoError(t, err)
++	_, err = expr.Run(program, env)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "invalid regex pattern")
++}
++
++// ─── captureAll ─────────────────────────────────────────────────────────
++
++func TestCaptureAll_basic(t *testing.T) {
++	tests := []struct {
++		name  string
++		input string
++		env   map[string]any
++		want  any
++	}{
++		{
++			name:  "multiple matches unnamed",
++			input: `captureAll("abc 123 def 456", "([a-z]+)\\s+(\\d+)")`,
++			want: []any{
++				map[string]any{"1": "abc", "2": "123"},
++				map[string]any{"1": "def", "2": "456"},
++			},
++		},
++		{
++			name:  "multiple matches named",
++			input: `captureAll("2024-01-15 2023-12-25", "(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})")`,
++			want: []any{
++				map[string]any{"year": "2024", "month": "01", "day": "15"},
++				map[string]any{"year": "2023", "month": "12", "day": "25"},
++			},
++		},
++		{
++			name:  "no match returns empty slice",
++			input: `captureAll("hello world", "\\d+")`,
++			want:  []any{},
++		},
++		{
++			name:  "nil text returns nil",
++			input: `captureAll(nil_val, "\\d+")`,
++			env:   map[string]any{"nil_val": nil},
++			want:  nil,
++		},
++		{
++			name:  "no metadata keys without closure",
++			input: `captureAll("a1 b2", "([a-z])(\\d)")`,
++			want: []any{
++				map[string]any{"1": "a", "2": "1"},
++				map[string]any{"1": "b", "2": "2"},
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			env := tt.env
++			if env == nil {
++				env = map[string]any{}
++			}
++			program, err := expr.Compile(tt.input, expr.Env(env))
++			require.NoError(t, err)
++			out, err := expr.Run(program, env)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestCaptureAll_with_closure(t *testing.T) {
++	tests := []struct {
++		name  string
++		input string
++		env   map[string]any
++		want  any
++	}{
++		{
++			name:  "transform with closure",
++			input: `captureAll("abc 123 def 456", "([a-z]+)\\s+(\\d+)", {#["1"] + "=" + #["2"]})`,
++			want:  []any{"abc=123", "def=456"},
++		},
++		{
++			name:  "closure has 0 key for full match",
++			input: `captureAll("abc 123 def 456", "([a-z]+)\\s+(\\d+)", {#["0"]})`,
++			want:  []any{"abc 123", "def 456"},
++		},
++		{
++			name:  "closure has _index key",
++			input: `captureAll("a1 b2 c3", "([a-z])(\\d)", {#["_index"]})`,
++			want:  []any{0, 1, 2},
++		},
++		{
++			name:  "nil text with closure returns nil",
++			input: `captureAll(nil_val, "\\d+", {#["0"]})`,
++			env:   map[string]any{"nil_val": nil},
++			want:  nil,
++		},
++		{
++			name:  "named groups in closure",
++			input: `captureAll("2024-01 2023-12", "(?P<y>\\d{4})-(?P<m>\\d{2})", {#["y"] + "/" + #["m"]})`,
++			want:  []any{"2024/01", "2023/12"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			env := tt.env
++			if env == nil {
++				env = map[string]any{}
++			}
++			program, err := expr.Compile(tt.input, expr.Env(env))
++			require.NoError(t, err)
++			out, err := expr.Run(program, env)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestCaptureAll_invalid_const_pattern(t *testing.T) {
++	_, err := expr.Compile(`captureAll("hello", "[invalid")`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "error parsing regexp")
++}
++
++func TestCaptureAll_invalid_dynamic_pattern(t *testing.T) {
++	env := map[string]any{
++		"text":    "hello",
++		"pattern": "[invalid",
++	}
++	program, err := expr.Compile(`captureAll(text, pattern)`, expr.Env(env))
++	require.NoError(t, err)
++	_, err = expr.Run(program, env)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "invalid regex pattern")
++}
++
++// ─── replacePattern ─────────────────────────────────────────────────────
++
++func TestReplacePattern_string_template(t *testing.T) {
++	tests := []struct {
++		name  string
++		input string
++		env   map[string]any
++		want  any
++	}{
++		{
++			name:  "basic replacement",
++			input: `replacePattern("hello world", "world", "Go")`,
++			want:  "hello Go",
++		},
++		{
++			name:  "back reference $1",
++			input: `replacePattern("foo bar", "(\\w+)", "[$1]")`,
++			want:  "[foo] [bar]",
++		},
++		{
++			name:  "back reference ${1}",
++			input: `replacePattern("foo bar", "(\\w+)", "[${1}]")`,
++			want:  "[foo] [bar]",
++		},
++		{
++			name:  "named back reference ${name}",
++			input: `replacePattern("2024-01-15", "(?P<y>\\d{4})-(?P<m>\\d{2})-(?P<d>\\d{2})", "${m}/${d}/${y}")`,
++			want:  "01/15/2024",
++		},
++		{
++			name:  "literal dollar $$",
++			input: `replacePattern("price 10", "(\\d+)", "$$${1}")`,
++			want:  "price $10",
++		},
++		{
++			name:  "with limit",
++			input: `replacePattern("a b c d", "\\w+", "x", 2)`,
++			want:  "x x c d",
++		},
++		{
++			name:  "no match returns original",
++			input: `replacePattern("hello", "\\d+", "x")`,
++			want:  "hello",
++		},
++		{
++			name:  "nil text returns nil",
++			input: `replacePattern(nil_val, "\\d+", "x")`,
++			env:   map[string]any{"nil_val": nil},
++			want:  nil,
++		},
++		{
++			name:  "limit 0 replaces nothing",
++			input: `replacePattern("a b c", "\\w+", "x", 0)`,
++			want:  "a b c",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			env := tt.env
++			if env == nil {
++				env = map[string]any{}
++			}
++			program, err := expr.Compile(tt.input, expr.Env(env))
++			require.NoError(t, err)
++			out, err := expr.Run(program, env)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestReplacePattern_with_closure(t *testing.T) {
++	tests := []struct {
++		name  string
++		input string
++		env   map[string]any
++		want  any
++	}{
++		{
++			name:  "closure replacement",
++			input: `replacePattern("hello world", "(\\w+)", {upper(#["0"])})`,
++			want:  "HELLO WORLD",
++		},
++		{
++			name:  "closure with groups",
++			input: `replacePattern("John:30 Jane:25", "(?P<name>\\w+):(?P<age>\\d+)", {#["name"] + " is " + #["age"]})`,
++			want:  "John is 30 Jane is 25",
++		},
++		{
++			name:  "closure has _index",
++			input: `replacePattern("a b c", "(\\w+)", {#["0"] + string(#["_index"])})`,
++			want:  "a0 b1 c2",
++		},
++		{
++			name:  "closure with limit",
++			input: `replacePattern("a b c d", "(\\w+)", {upper(#["0"])}, 2)`,
++			want:  "A B c d",
++		},
++		{
++			name:  "nil text with closure returns nil",
++			input: `replacePattern(nil_val, "(\\w+)", {upper(#["0"])})`,
++			env:   map[string]any{"nil_val": nil},
++			want:  nil,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			env := tt.env
++			if env == nil {
++				env = map[string]any{}
++			}
++			program, err := expr.Compile(tt.input, expr.Env(env))
++			require.NoError(t, err)
++			out, err := expr.Run(program, env)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestReplacePattern_invalid_const_pattern(t *testing.T) {
++	_, err := expr.Compile(`replacePattern("hello", "[invalid", "x")`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "error parsing regexp")
++}
++
++func TestReplacePattern_invalid_dynamic_pattern(t *testing.T) {
++	env := map[string]any{
++		"text":    "hello",
++		"pattern": "[invalid",
++	}
++	program, err := expr.Compile(`replacePattern(text, pattern, "x")`, expr.Env(env))
++	require.NoError(t, err)
++	_, err = expr.Run(program, env)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "invalid regex pattern")
++}
++
++func TestReplacePattern_closure_must_return_string(t *testing.T) {
++	_, err := expr.Compile(`replacePattern("hello", "(\\w+)", {42})`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "replacePattern closure must return a string")
++}
++
++func TestReplacePattern_dynamic_pattern_string(t *testing.T) {
++	env := map[string]any{
++		"text":    "abc 123 def",
++		"pattern": `\d+`,
++	}
++	program, err := expr.Compile(`replacePattern(text, pattern, "NUM")`, expr.Env(env))
++	require.NoError(t, err)
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	assert.Equal(t, "abc NUM def", out)
++}
++
++// ─── pipe operator ──────────────────────────────────────────────────────
++
++func TestCapture_pipe(t *testing.T) {
++	env := map[string]any{
++		"text": "hello 42",
++	}
++	program, err := expr.Compile(`text | capture("(\\w+)\\s+(\\d+)")`, expr.Env(env))
++	require.NoError(t, err)
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	assert.Equal(t, map[string]any{"1": "hello", "2": "42"}, out)
++}
++
++func TestCaptureAll_pipe(t *testing.T) {
++	env := map[string]any{
++		"text": "a1 b2",
++	}
++	program, err := expr.Compile(`text | captureAll("([a-z])(\\d)")`, expr.Env(env))
++	require.NoError(t, err)
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	assert.Equal(t, []any{
++		map[string]any{"1": "a", "2": "1"},
++		map[string]any{"1": "b", "2": "2"},
++	}, out)
++}
++
++func TestReplacePattern_pipe(t *testing.T) {
++	env := map[string]any{
++		"text": "hello world",
++	}
++	program, err := expr.Compile(`text | replacePattern("\\w+", "x")`, expr.Env(env))
++	require.NoError(t, err)
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	assert.Equal(t, "x x", out)
++}
++
++// ─── captureAll dynamic pattern with closure ───────────────────────────
++
++func TestCaptureAll_dynamic_pattern_with_closure(t *testing.T) {
++	env := map[string]any{
++		"text":    "a1 b2",
++		"pattern": `([a-z])(\d)`,
++	}
++	program, err := expr.Compile(`captureAll(text, pattern, {#["1"] + #["2"]})`, expr.Env(env))
++	require.NoError(t, err)
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	assert.Equal(t, []any{"a1", "b2"}, out)
++}
++
++// ─── replacePattern dynamic pattern with closure ───────────────────────
++
++func TestCapture_no_groups(t *testing.T) {
++	// Pattern with no capture groups should return empty map
++	program, err := expr.Compile(`capture("hello", "hello")`)
++	require.NoError(t, err)
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	assert.Equal(t, map[string]any{}, out)
++}
++
++func TestCapture_no_metadata(t *testing.T) {
++	// Verify capture result has NO "0" or "_index" keys
++	program, err := expr.Compile(`capture("abc 123", "(\\w+)\\s+(\\d+)")`)
++	require.NoError(t, err)
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	m := out.(map[string]any)
++	_, has0 := m["0"]
++	_, hasIndex := m["_index"]
++	assert.False(t, has0, "capture should not include '0' key")
++	assert.False(t, hasIndex, "capture should not include '_index' key")
++	assert.Equal(t, 2, len(m), "capture should only have group keys")
++}
++
++func TestCaptureAll_no_metadata(t *testing.T) {
++	// Verify captureAll without closure has NO "0" or "_index" keys
++	program, err := expr.Compile(`captureAll("a1 b2", "([a-z])(\\d)")`)
++	require.NoError(t, err)
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	arr := out.([]any)
++	for _, item := range arr {
++		m := item.(map[string]any)
++		_, has0 := m["0"]
++		_, hasIndex := m["_index"]
++		assert.False(t, has0, "captureAll without closure should not include '0' key")
++		assert.False(t, hasIndex, "captureAll without closure should not include '_index' key")
++		assert.Equal(t, 2, len(m), "captureAll without closure should only have group keys")
++	}
++}
++
++func TestCaptureAll_closure_has_metadata(t *testing.T) {
++	// Verify closure # map HAS "0" and "_index" keys
++	program, err := expr.Compile(`captureAll("a1 b2", "([a-z])(\\d)", {len(keys(#))})`)
++	require.NoError(t, err)
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	// 4 keys: "0", "_index", "1", "2"
++	assert.Equal(t, []any{4, 4}, out)
++}
++
++func TestCaptureAll_no_groups(t *testing.T) {
++	// Pattern with no capture groups should return array of empty maps
++	program, err := expr.Compile(`captureAll("hello world", "\\w+")`)
++	require.NoError(t, err)
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	assert.Equal(t, []any{
++		map[string]any{},
++		map[string]any{},
++	}, out)
++}
++
++func TestReplacePattern_dynamic_pattern_with_closure(t *testing.T) {
++	env := map[string]any{
++		"text":    "hello world",
++		"pattern": `(\w+)`,
++	}
++	program, err := expr.Compile(`replacePattern(text, pattern, {upper(#["0"])})`, expr.Env(env))
++	require.NoError(t, err)
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	assert.Equal(t, "HELLO WORLD", out)
++}
+diff --git a/builtin/utils.go b/builtin/utils.go
+index 262bb37..5bdfaea 100644
+--- a/builtin/utils.go
++++ b/builtin/utils.go
+@@ -9,13 +9,15 @@ import (
+ )
+ 
+ var (
+-	anyType      = reflect.TypeOf(new(any)).Elem()
+-	integerType  = reflect.TypeOf(0)
+-	floatType    = reflect.TypeOf(float64(0))
+-	arrayType    = reflect.TypeOf([]any{})
+-	mapType      = reflect.TypeOf(map[any]any{})
+-	timeType     = reflect.TypeOf(new(time.Time)).Elem()
+-	locationType = reflect.TypeOf(new(time.Location))
++	anyType        = reflect.TypeOf(new(any)).Elem()
++	integerType    = reflect.TypeOf(0)
++	floatType      = reflect.TypeOf(float64(0))
++	stringType     = reflect.TypeOf("")
++	arrayType      = reflect.TypeOf([]any{})
++	mapType        = reflect.TypeOf(map[any]any{})
++	mapStringAny   = reflect.TypeOf(map[string]any{})
++	timeType       = reflect.TypeOf(new(time.Time)).Elem()
++	locationType   = reflect.TypeOf(new(time.Location))
+ )
+ 
+ func kind(t reflect.Type) reflect.Kind {
+diff --git a/checker/checker.go b/checker/checker.go
+index 3620f20..a0249b4 100644
+--- a/checker/checker.go
++++ b/checker/checker.go
+@@ -932,6 +932,89 @@ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
+ 		}
+ 		return v.error(node.Arguments[1], "predicate should has two input and one output param")
+ 
++	case "capture":
++		if len(node.Arguments) != 2 {
++			return v.error(node, "invalid number of arguments for capture (expected 2, got %d)", len(node.Arguments))
++		}
++		_ = v.visit(node.Arguments[0])
++		_ = v.visit(node.Arguments[1])
++		// Validate regex pattern at compile time if it's a string literal
++		if s, ok := node.Arguments[1].(*ast.StringNode); ok {
++			if err := validateRegexpPattern(s.Value); err != nil {
++				return v.error(node.Arguments[1], "%v", err)
++			}
++		}
++		return v.config.NtCache.FromType(mapType)
++
++	case "captureAll":
++		if len(node.Arguments) < 2 || len(node.Arguments) > 3 {
++			return v.error(node, "invalid number of arguments for captureAll (expected 2 or 3, got %d)", len(node.Arguments))
++		}
++		_ = v.visit(node.Arguments[0])
++		_ = v.visit(node.Arguments[1])
++		// Validate regex pattern at compile time if it's a string literal
++		if s, ok := node.Arguments[1].(*ast.StringNode); ok {
++			if err := validateRegexpPattern(s.Value); err != nil {
++				return v.error(node.Arguments[1], "%v", err)
++			}
++		}
++		if len(node.Arguments) == 3 {
++			// Third argument is a closure/predicate - # binds to match groups map
++			collection := ArrayFromType(&v.config.NtCache, mapType)
++			v.begin(collection)
++			predicateNt := v.visit(node.Arguments[2])
++			v.end()
++			if predicateNt.IsFunc() && predicateNt.NumOut() == 1 &&
++				predicateNt.NumIn() == 1 && predicateNt.IsFirstArgUnknown(&v.config.NtCache) {
++				return predicateNt.Ref.MakeArrayOf(&v.config.NtCache)
++			}
++			return v.error(node.Arguments[2], "predicate should has one input and one output param")
++		}
++		return v.config.NtCache.FromType(arrayType)
++
++	case "replacePattern":
++		if len(node.Arguments) < 3 || len(node.Arguments) > 4 {
++			return v.error(node, "invalid number of arguments for replacePattern (expected 3 or 4, got %d)", len(node.Arguments))
++		}
++		_ = v.visit(node.Arguments[0])
++		_ = v.visit(node.Arguments[1])
++		// Validate regex pattern at compile time if it's a string literal
++		if s, ok := node.Arguments[1].(*ast.StringNode); ok {
++			if err := validateRegexpPattern(s.Value); err != nil {
++				return v.error(node.Arguments[1], "%v", err)
++			}
++		}
++		// Check third argument: could be a string expression or a predicate/closure
++		if _, ok := node.Arguments[2].(*ast.PredicateNode); ok {
++			// Closure mode: # binds to match groups map
++			collection := ArrayFromType(&v.config.NtCache, mapType)
++			v.begin(collection)
++			predicateNt := v.visit(node.Arguments[2])
++			v.end()
++			if predicateNt.IsFunc() && predicateNt.NumOut() == 1 &&
++				predicateNt.NumIn() == 1 && predicateNt.IsFirstArgUnknown(&v.config.NtCache) {
++				predicateOut := predicateNt.Out(&v.config.NtCache, 0)
++				if !predicateOut.IsString() && !predicateOut.IsUnknown(&v.config.NtCache) {
++					return v.error(node.Arguments[2], "replacePattern closure must return a string (got %s)", predicateOut.String())
++				}
++			}
++		} else {
++			// String replacement mode
++			thirdNt := v.visit(node.Arguments[2])
++			thirdNt = thirdNt.Deref(&v.config.NtCache)
++			if !thirdNt.IsString() && !thirdNt.IsUnknown(&v.config.NtCache) {
++				return v.error(node.Arguments[2], "third argument to replacePattern must be a string or closure (got %s)", thirdNt.String())
++			}
++		}
++		if len(node.Arguments) == 4 {
++			limitNt := v.visit(node.Arguments[3])
++			limitNt = limitNt.Deref(&v.config.NtCache)
++			if !limitNt.IsInteger && !limitNt.IsUnknown(&v.config.NtCache) {
++				return v.error(node.Arguments[3], "fourth argument to replacePattern must be an integer (got %s)", limitNt.String())
++			}
++		}
++		return v.config.NtCache.FromType(stringType)
++
+ 	}
+ 
+ 	if id, ok := builtin.Index[node.Name]; ok {
+@@ -945,6 +1028,11 @@ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
+ 	return v.error(node, "unknown builtin %v", node.Name)
+ }
+ 
++func validateRegexpPattern(pattern string) error {
++	_, err := regexp.Compile(pattern)
++	return err
++}
++
+ func (v *Checker) begin(collectionNature Nature, vars ...varScope) {
+ 	v.predicateScopes = append(v.predicateScopes, predicateScope{
+ 		collection: collectionNature,
+diff --git a/compiler/compiler.go b/compiler/compiler.go
+index f66cf9e..517b96c 100644
+--- a/compiler/compiler.go
++++ b/compiler/compiler.go
+@@ -1145,6 +1145,331 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
+ 		c.emit(OpEnd)
+ 		return
+ 
++	case "capture":
++		c.compile(node.Arguments[0])
++		c.derefInNeeded(node.Arguments[0])
++		if str, ok := node.Arguments[1].(*ast.StringNode); ok {
++			re := regexp.MustCompile(str.Value)
++			c.emit(OpPush, c.addConstant(re))
++			c.emitFunction(&builtin.Function{Name: "captureConst", Func: builtin.CaptureConst}, 2)
++		} else {
++			c.compile(node.Arguments[1])
++			c.derefInNeeded(node.Arguments[1])
++			c.emitFunction(&builtin.Function{Name: "capture", Func: builtin.Capture}, 2)
++		}
++		return
++
++	case "captureAll":
++		c.compile(node.Arguments[0])
++		c.derefInNeeded(node.Arguments[0])
++		if str, ok := node.Arguments[1].(*ast.StringNode); ok {
++			re := regexp.MustCompile(str.Value)
++			if len(node.Arguments) == 2 {
++				// No closure: just call captureAll with pre-compiled regex
++				c.emit(OpPush, c.addConstant(re))
++				fn := &builtin.Function{Name: "captureAllConst", Func: func(args ...any) (any, error) {
++					if args[0] == nil {
++						return nil, nil
++					}
++					text := args[0].(string)
++					re := args[1].(*regexp.Regexp)
++					matches := re.FindAllStringSubmatch(text, -1)
++					if matches == nil {
++						return []any{}, nil
++					}
++					result := make([]any, len(matches))
++					for i, match := range matches {
++						result[i] = builtin.BuildCaptureGroupsMeta(re, match, i)
++					}
++					// Strip metadata keys from the result maps for non-closure mode
++					for i, item := range result {
++						m := item.(map[string]any)
++						stripped := make(map[string]any, len(m)-2)
++						for k, v := range m {
++							if k != "0" && k != "_index" {
++								stripped[k] = v
++							}
++						}
++						result[i] = stripped
++					}
++					return result, nil
++				}}
++				c.emitFunction(fn, 2)
++			} else {
++				// With closure: find all matches with meta, iterate with closure
++				// Push a function that returns the matches array with metadata
++				c.emit(OpPush, c.addConstant(re))
++				fn := &builtin.Function{Name: "captureAllMatchesMeta", Func: func(args ...any) (any, error) {
++					if args[0] == nil {
++						return nil, nil
++					}
++					text := args[0].(string)
++					re := args[1].(*regexp.Regexp)
++					matches := re.FindAllStringSubmatch(text, -1)
++					if matches == nil {
++						return []any{}, nil
++					}
++					result := make([]any, len(matches))
++					for i, match := range matches {
++						result[i] = builtin.BuildCaptureGroupsMeta(re, match, i)
++					}
++					return result, nil
++				}}
++				c.emitFunction(fn, 2)
++				// Now we have []any on the stack (array of match maps with meta)
++				// Check for nil (text was nil)
++				nilCheck := c.emit(OpJumpIfNotNil, placeholder)
++				// If nil, just leave nil on stack
++				end := c.emit(OpJump, placeholder)
++				c.patchJump(nilCheck)
++				// Iterate like map() builtin
++				c.emit(OpBegin)
++				c.emitLoop(func() {
++					c.compile(node.Arguments[2])
++				})
++				c.emit(OpGetLen)
++				c.emit(OpEnd)
++				c.emit(OpArray)
++				c.patchJump(end)
++			}
++		} else {
++			// Dynamic pattern
++			c.compile(node.Arguments[1])
++			c.derefInNeeded(node.Arguments[1])
++			if len(node.Arguments) == 2 {
++				c.emitFunction(&builtin.Function{Name: "captureAll", Func: builtin.CaptureAll}, 2)
++			} else {
++				// Dynamic pattern with closure
++				fn := &builtin.Function{Name: "captureAllMatchesMetaDyn", Func: func(args ...any) (any, error) {
++					if args[0] == nil {
++						return nil, nil
++					}
++					text := args[0].(string)
++					pattern := args[1].(string)
++					re, err := regexp.Compile(pattern)
++					if err != nil {
++						return nil, fmt.Errorf("invalid regex pattern: %v", err)
++					}
++					matches := re.FindAllStringSubmatch(text, -1)
++					if matches == nil {
++						return []any{}, nil
++					}
++					result := make([]any, len(matches))
++					for i, match := range matches {
++						result[i] = builtin.BuildCaptureGroupsMeta(re, match, i)
++					}
++					return result, nil
++				}}
++				c.emitFunction(fn, 2)
++				nilCheck := c.emit(OpJumpIfNotNil, placeholder)
++				end := c.emit(OpJump, placeholder)
++				c.patchJump(nilCheck)
++				c.emit(OpBegin)
++				c.emitLoop(func() {
++					c.compile(node.Arguments[2])
++				})
++				c.emit(OpGetLen)
++				c.emit(OpEnd)
++				c.emit(OpArray)
++				c.patchJump(end)
++			}
++		}
++		return
++
++	case "replacePattern":
++		c.compile(node.Arguments[0])
++		c.derefInNeeded(node.Arguments[0])
++
++		_, isClosure := node.Arguments[2].(*ast.PredicateNode)
++
++		if str, ok := node.Arguments[1].(*ast.StringNode); ok {
++			re := regexp.MustCompile(str.Value)
++
++			if !isClosure {
++				// String template replacement
++				c.emit(OpPush, c.addConstant(re))
++				c.compile(node.Arguments[2])
++				c.derefInNeeded(node.Arguments[2])
++				if len(node.Arguments) == 4 {
++					c.compile(node.Arguments[3])
++					c.derefInNeeded(node.Arguments[3])
++				} else {
++					c.emitPush(-1) // no limit
++				}
++				fn := &builtin.Function{Name: "replacePatternConst", Func: func(args ...any) (any, error) {
++					if args[0] == nil {
++						return nil, nil
++					}
++					text := args[0].(string)
++					re := args[1].(*regexp.Regexp)
++					tmpl := args[2].(string)
++					limit := args[3].(int)
++					return builtin.ReplaceWithTemplateFn(text, re, tmpl, limit), nil
++				}}
++				c.emitFunction(fn, 4)
++			} else {
++				// Closure replacement with const regex
++				// First, get matches with metadata
++				c.emit(OpPush, c.addConstant(re))
++				fnMatches := &builtin.Function{Name: "replacePatternMatchesMeta", Func: func(args ...any) (any, error) {
++					if args[0] == nil {
++						return nil, nil
++					}
++					text := args[0].(string)
++					re := args[1].(*regexp.Regexp)
++					matches := re.FindAllStringSubmatch(text, -1)
++					if matches == nil {
++						return []any{}, nil
++					}
++					result := make([]any, len(matches))
++					for i, match := range matches {
++						result[i] = builtin.BuildCaptureGroupsMeta(re, match, i)
++					}
++					return result, nil
++				}}
++				c.emitFunction(fnMatches, 2)
++				// Stack: matches_array_or_nil
++				// Check nil
++				nilCheck := c.emit(OpJumpIfNotNil, placeholder)
++				end := c.emit(OpJump, placeholder)
++				c.patchJump(nilCheck)
++				// Iterate: apply closure to each match, collect replacement strings
++				c.emit(OpBegin)
++				c.emitLoop(func() {
++					c.compile(node.Arguments[2])
++				})
++				c.emit(OpGetLen)
++				c.emit(OpEnd)
++				c.emit(OpArray)
++				// Stack: [replacement_strings...]
++				// Now we need: text, regex, replacements, limit → final string
++				// We stored text in arguments[0] but it's already consumed.
++				// We need to recompile text and regex.
++				// Actually, we need a different approach. Let me use variables.
++
++				// Let me restructure: store text in a variable, then do the work
++				// This approach is too complex. Let me use a different strategy.
++				// I'll use OpRegexpReplace which takes the original text, regex, replacements array, and limit.
++				c.compile(node.Arguments[0])
++				c.derefInNeeded(node.Arguments[0])
++				c.emit(OpPush, c.addConstant(re))
++				if len(node.Arguments) == 4 {
++					c.compile(node.Arguments[3])
++					c.derefInNeeded(node.Arguments[3])
++				} else {
++					c.emitPush(-1)
++				}
++				c.emit(OpRegexpReplace)
++				c.patchJump(end)
++			}
++		} else {
++			// Dynamic pattern
++			if !isClosure {
++				c.compile(node.Arguments[1])
++				c.derefInNeeded(node.Arguments[1])
++				c.compile(node.Arguments[2])
++				c.derefInNeeded(node.Arguments[2])
++				if len(node.Arguments) == 4 {
++					c.compile(node.Arguments[3])
++					c.derefInNeeded(node.Arguments[3])
++				} else {
++					c.emitPush(-1)
++				}
++				c.emitFunction(&builtin.Function{Name: "replacePattern", Func: func(args ...any) (any, error) {
++					if args[0] == nil {
++						return nil, nil
++					}
++					text := args[0].(string)
++					pattern := args[1].(string)
++					tmpl := args[2].(string)
++					limit := args[3].(int)
++					re, err := regexp.Compile(pattern)
++					if err != nil {
++						return nil, fmt.Errorf("invalid regex pattern: %v", err)
++					}
++					return builtin.ReplaceWithTemplateFn(text, re, tmpl, limit), nil
++				}}, 4)
++			} else {
++				// Dynamic pattern with closure
++				c.compile(node.Arguments[1])
++				c.derefInNeeded(node.Arguments[1])
++				fnMatches := &builtin.Function{Name: "replacePatternMatchesMetaDyn", Func: func(args ...any) (any, error) {
++					if args[0] == nil {
++						return nil, nil
++					}
++					text := args[0].(string)
++					pattern := args[1].(string)
++					re, err := regexp.Compile(pattern)
++					if err != nil {
++						return nil, fmt.Errorf("invalid regex pattern: %v", err)
++					}
++					matches := re.FindAllStringSubmatch(text, -1)
++					if matches == nil {
++						return []any{}, nil
++					}
++					result := make([]any, len(matches))
++					for i, match := range matches {
++						result[i] = builtin.BuildCaptureGroupsMeta(re, match, i)
++					}
++					return result, nil
++				}}
++				c.emitFunction(fnMatches, 2)
++				nilCheck := c.emit(OpJumpIfNotNil, placeholder)
++				end := c.emit(OpJump, placeholder)
++				c.patchJump(nilCheck)
++				c.emit(OpBegin)
++				c.emitLoop(func() {
++					c.compile(node.Arguments[2])
++				})
++				c.emit(OpGetLen)
++				c.emit(OpEnd)
++				c.emit(OpArray)
++				// Stack: [replacement_strings...]
++				// Now call a function with: replacements, text, pattern, limit
++				c.compile(node.Arguments[0])
++				c.derefInNeeded(node.Arguments[0])
++				c.compile(node.Arguments[1])
++				c.derefInNeeded(node.Arguments[1])
++				if len(node.Arguments) == 4 {
++					c.compile(node.Arguments[3])
++					c.derefInNeeded(node.Arguments[3])
++				} else {
++					c.emitPush(-1)
++				}
++				fnReplace := &builtin.Function{Name: "replacePatternClosureDyn", Func: func(args ...any) (any, error) {
++					replacements := args[0].([]any)
++					text := args[1].(string)
++					pattern := args[2].(string)
++					limit := args[3].(int)
++					re, err := regexp.Compile(pattern)
++					if err != nil {
++						return nil, fmt.Errorf("invalid regex pattern: %v", err)
++					}
++					count := 0
++					idx := 0
++					result := re.ReplaceAllStringFunc(text, func(match string) string {
++						if limit >= 0 && count >= limit {
++							return match
++						}
++						count++
++						if idx < len(replacements) {
++							s, ok := replacements[idx].(string)
++							if !ok {
++								panic(fmt.Sprintf("replacePattern closure must return a string (got %T)", replacements[idx]))
++							}
++							idx++
++							return s
++						}
++						return match
++					})
++					return result, nil
++				}}
++				c.emitFunction(fnReplace, 4)
++				c.patchJump(end)
++			}
++		}
++		return
++
+ 	}
+ 
+ 	if id, ok := builtin.Index[node.Name]; ok {
+diff --git a/parser/parser.go b/parser/parser.go
+index 9e24a71..c4da08c 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -29,21 +29,23 @@ const optional arg = 1 << 7
+ var predicates = map[string]struct {
+ 	args []arg
+ }{
+-	"all":           {[]arg{expr, predicate}},
+-	"none":          {[]arg{expr, predicate}},
+-	"any":           {[]arg{expr, predicate}},
+-	"one":           {[]arg{expr, predicate}},
+-	"filter":        {[]arg{expr, predicate}},
+-	"map":           {[]arg{expr, predicate}},
+-	"count":         {[]arg{expr, predicate | optional}},
+-	"sum":           {[]arg{expr, predicate | optional}},
+-	"find":          {[]arg{expr, predicate}},
+-	"findIndex":     {[]arg{expr, predicate}},
+-	"findLast":      {[]arg{expr, predicate}},
+-	"findLastIndex": {[]arg{expr, predicate}},
+-	"groupBy":       {[]arg{expr, predicate}},
+-	"sortBy":        {[]arg{expr, predicate, expr | optional}},
+-	"reduce":        {[]arg{expr, predicate, expr | optional}},
++	"all":            {[]arg{expr, predicate}},
++	"none":           {[]arg{expr, predicate}},
++	"any":            {[]arg{expr, predicate}},
++	"one":            {[]arg{expr, predicate}},
++	"filter":         {[]arg{expr, predicate}},
++	"map":            {[]arg{expr, predicate}},
++	"count":          {[]arg{expr, predicate | optional}},
++	"sum":            {[]arg{expr, predicate | optional}},
++	"find":           {[]arg{expr, predicate}},
++	"findIndex":      {[]arg{expr, predicate}},
++	"findLast":       {[]arg{expr, predicate}},
++	"findLastIndex":  {[]arg{expr, predicate}},
++	"groupBy":        {[]arg{expr, predicate}},
++	"sortBy":         {[]arg{expr, predicate, expr | optional}},
++	"reduce":         {[]arg{expr, predicate, expr | optional}},
++	"captureAll":     {[]arg{expr, expr, predicate | optional}},
++	"replacePattern": {[]arg{expr, expr, expr | predicate, expr | optional}},
+ }
+ 
+ // Parser is a reusable parser. The zero value is ready for use.
+@@ -598,6 +600,14 @@ func (p *Parser) parseCall(token Token, arguments []Node, checkOverrides bool) N
+ 			}
+ 			var node Node
+ 			switch {
++			case arg&expr == expr && arg&predicate == predicate:
++				// Both expr and predicate are acceptable.
++				// If we see a '{' bracket, parse as predicate (closure).
++				if p.current.Is(Bracket, "{") {
++					node = p.parsePredicate()
++				} else {
++					node = p.parseExpression(0)
++				}
+ 			case arg&expr == expr:
+ 				node = p.parseExpression(0)
+ 			case arg&predicate == predicate:
+diff --git a/vm/opcodes.go b/vm/opcodes.go
+index 5fca0fa..204cfa5 100644
+--- a/vm/opcodes.go
++++ b/vm/opcodes.go
+@@ -86,5 +86,6 @@ const (
+ 	OpBegin
+ 	OpAnd
+ 	OpOr
++	OpRegexpReplace // Replaces matches using replacement strings from the stack
+ 	OpEnd // This opcode must be at the end of this list.
+ )
+diff --git a/vm/program.go b/vm/program.go
+index 7eb96bd..98f0565 100644
+--- a/vm/program.go
++++ b/vm/program.go
+@@ -381,6 +381,9 @@ func (program *Program) DisassembleWriter(w io.Writer) {
+ 		case OpOr:
+ 			code("OpOr")
+ 
++		case OpRegexpReplace:
++			code("OpRegexpReplace")
++
+ 		case OpEnd:
+ 			code("OpEnd")
+ 
+diff --git a/vm/vm.go b/vm/vm.go
+index ba3b538..e0d44e0 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -638,6 +638,31 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 			b := vm.pop()
+ 			vm.push(a.(bool) || b.(bool))
+ 
++		case OpRegexpReplace:
++			// Stack (top to bottom): limit, regex, text, replacements_array
++			limit := vm.pop().(int)
++			re := vm.pop().(*regexp.Regexp)
++			text := vm.pop().(string)
++			replacements := vm.pop().([]any)
++			count := 0
++			idx := 0
++			result := re.ReplaceAllStringFunc(text, func(match string) string {
++				if limit >= 0 && count >= limit {
++					return match
++				}
++				count++
++				if idx < len(replacements) {
++					s, ok := replacements[idx].(string)
++					if !ok {
++						panic(fmt.Sprintf("replacePattern closure must return a string (got %T)", replacements[idx]))
++					}
++					idx++
++					return s
++				}
++				return match
++			})
++			vm.push(result)
++
+ 		case OpEnd:
+ 			vm.Scopes = vm.Scopes[:len(vm.Scopes)-1]
+ 			if len(vm.Scopes) > 0 {
