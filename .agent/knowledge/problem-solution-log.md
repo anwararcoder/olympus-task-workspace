@@ -1638,6 +1638,7 @@ published anywhere a reviewer could falsify them.
 **Trigger:** An agent evaluation returns 0/N, and several near-miss runs fail the SAME small leaf-cluster while passing everything else. Reading the failure bodies shows they emitted the IDENTICAL wrong output for that cluster.
 **Generic rule:** Identical wrong output across independent runs is a fingerprint: they all read one description clause the same wrong way, so that clause is the exact calibration lever (this sharpens "loosen from singleton failure SETS" — the identical-bytes cluster IS the singleton set). Diagnose from the failure bodies, not guesses: parse each run's result artifact into per-run failed-leaf SETS, find the cluster shared by the near-misses, and read the actual got-vs-want. The fix is usually that the clause explained what the construct MEANS but not what it looks like: the runs understood the intent and produced a plausible-but-wrong SHAPE. State the observable shape — where the value physically lands in the output, its exact position/nesting/form — as one description-only, word-budget-neutral clause; do NOT re-explain the semantics or reveal the algorithm. This removes exactly one trap for everyone equally (the near-misses clear it; runs that never reached that leaf get no help with what actually blocked them), moving the rate up by roughly the near-miss cohort size without lowering real difficulty. Re-measure before any further change.
 **Applies to:** Any challenge being difficulty-calibrated from agent-run artifacts.
+**Seen in:** freeze-store-integrity v18 calibration, 2026-09-28: two 0/10 batches; five blockers each showed one identical wrong outcome in every failing run (strategy given a normalized description, `InvalidPathException` on a NUL entry name, hard-linked entries discarded as `{}`, symlinked store folder rejected, target of an entry's link reported unowned); each traced to a clause the prose never stated. Also decisive in jte-transactional-jsp-batch v1 (identical wrong include path). **Promoted to:** `lessons-digest.md` section 6, `rules/zero-pass-remediation.md`.
 
 ### Verify a gate report targets the challenge under review before acting on it
 **Trigger:** A platform-gate / review report is delivered alongside a specific challenge, but its quoted symbols, file names, or prose do not match that challenge's artifacts (it references another challenge, or the pre-fix form of an already-changed clause).
@@ -2942,6 +2943,7 @@ regenerated patches back as LF.
 matched it byte for byte after CR removal.
 **Applies to:** Every task worked on a Windows checkout.
 **Seen in:** freeze-store-integrity v18, 2026-09-27.
+**Refinement (2026-09-28):** `git archive` applies the same `core.autocrlf` conversion, so saved agent patches extracted from history for replay fail with "patch does not apply" at their first hunk. Extract with `git -c core.autocrlf=false archive <rev> <path>` (the committed blobs are LF) and confirm zero CR bytes before replaying.
 
 
 ### Splitting a dense description sentence can drop a clause's scope; check each new sentence alone
@@ -2962,3 +2964,19 @@ LF, leak-free; only the description changed.
 **Applies to:** Any description edit that splits a sentence, especially one taken from a bot or
 reviewer comment.
 **Seen in:** freeze-store-integrity v18 Description Quality comment, 2026-09-28.
+
+### A rejection keyed to a write effect lets atomic writers skip it
+**Trigger:** 16 of 20 runs failed one save-guard test at the same assertion ("Expecting code to raise a throwable"). The prose said storing "never writes over the index, whatever name leads to it ... Such a save is rejected".
+**Root cause:** A per-alias probe replay (six runs, both batches) showed every failure on the hard-linked index: the save was not rejected, yet the index bytes were unchanged, because these candidates write through a temporary file and a rename, which detaches the hard-linked name instead of writing over the index. The prose tied rejection to the write effect, which an atomic writer never produces; the test requires rejection by name.
+**Solution:** State the trigger as the recorded name ("storing is rejected when that name leads to the index under any spelling or through a symbolic or hard link"), not as an effect of the write. When a hidden test is one assertion over several fixtures, split the fixtures in a scratch probe copy of the test before diagnosing; the reported line alone cannot tell which fixture fails. Scope every calibration clause to the exact path the tests exercise (here "when a rule is stored", not every call of the strategy) so the clause adds no untested promise a false-positive judge could probe.
+**Verification:** Probe replay in the task image built from the pristine base; reference passes all three aliases; four extra scratch probes on the new clauses' untested corners (chained links for ownership and storing, dot-dot and chained-link index spellings) pass on the reference and on the nearest candidate. Calibration effect: **Status:** unverified until the next batch.
+**Applies to:** Any description that promises "never writes X" while tests require rejection; any guard a temp-file-and-rename writer can satisfy without rejecting.
+**Seen in:** freeze-store-integrity v18 calibration, 2026-09-28.
+
+### "Records" and "leads to" diverge once links are involved
+**Trigger:** Runs reported the target of an entry's symbolic link as an unowned file, and refused or replaced a linked file on save, while tests expected the link's target to be the entry's own file.
+**Root cause:** The prose defined ownership and the save guard by the name an entry "records". Read literally, a link's target is recorded by no entry, so the failing runs followed the words; the reference and tests follow the link.
+**Solution:** Define ownership and save targets by the file an entry's name "leads to", naming which link kinds count (the reference followed symbolic links for ownership and used file identity, hard links included, for sharing and the index guard). Match the prose to each mechanism separately so no clause promises more than the reference does.
+**Verification:** Clause checked against the reference code paths and the save/unowned/link tests; counterfactual replay of the nearest candidate (its one unstated-behavior defect fixed) passed 143/143 new and 42/42 base.
+**Applies to:** Filesystem stores, caches, registries, and any contract where entries point at resources through indirection.
+**Seen in:** freeze-store-integrity v18 calibration, 2026-09-28.

@@ -33,6 +33,12 @@ Choose exactly one primary class before editing:
 Do not use passing probability from censored runs. Do not call many independent failures "one
 blocker" merely because they produce the same final zero-pass verdict.
 
+Before classifying, read each frequent blocker's failure bodies across runs. One identical wrong
+outcome in every failing run marks a clause the description never stated or states ambiguously (a
+discoverability defect, class 2), even when several such clauses coexist; a spread of different
+outcomes marks real difficulty. Clarify only the first kind, and replay the nearest run with only that
+fix to prove it passes before spending a batch.
+
 ## Nearest-Agent Selection Rules
 
 Only for class 2, choose the nearest-solving agent using this priority:

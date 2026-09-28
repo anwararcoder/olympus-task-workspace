@@ -128,6 +128,10 @@ rule wins. Update this digest when a log entry is promoted (see `.agent/rules/pr
   one class: harness, one discoverability blocker, breadth, golden defect, rejected seam.
 - Over-solve from a saturated mechanism is not fixable with more fair tests; cap tuning at about two
   rounds, then pivot.
+- Zero pass: read the failure bodies, not only the names. A test whose failing runs all show one
+  identical wrong outcome is a clause the prose never stated or states ambiguously; state that outcome,
+  scoped to exactly what the test exercises, and leave already-stated traps alone. Replay the nearest
+  run with only that fix to confirm it turns fully green before choosing the lever.
 - Keep the fair difficulty carrier untouched; closing a real FP class is worth losing the only passer.
 - Verify a report targets this task and this revision before acting on it.
 
