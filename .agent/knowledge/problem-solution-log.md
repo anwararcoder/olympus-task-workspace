@@ -3047,6 +3047,7 @@ reviewer comment.
 **Verification:** Both new tests pass on the reference (147/147, base 42/42, unsolved 0/147) and fail on a mutant whose identity follows dangling links. Replaying the ten saved runs from the latest batch changed no run's result except one that already had 11 failures, and every other failure matched the platform's exactly.
 **Applies to:** Any reviewer finding that asserts a library or OS behaviour (path canonicalization, file identity, encoding, locale) from reading code.
 **Seen in:** freeze-store-integrity v20 Solution & Code review, 2026-09-29.
+**Refinement (2026-09-29):** The next review found the real defect behind the same helper: two spellings of one absent name (`gone`, `./gone`) do canonicalize to one path, so they were shared instead of broken. Fix: identical names stay shared even when absent, but different spellings are merged only when they reach an existing file. Reproduce every variant of a finding, not only the reviewer's example: the dangling-link example was false while a plain-spelling variant was true. Verified: reference base 42/42 and 148/148, old reference fails exactly the new test, unsolved 0/148, all 11 saved runs pass the new test and no run changed except for known timing noise.
 
 ### After a batch, route each identical-outcome cluster to its clause, verify the clause against the reference, and never touch the tests
 **Trigger:** An 11-run batch at 0 passes: one save-safety test failed in 11 of 11 runs, two others in 5 of 10 each, every failure identical within its cluster (a new rule's save accepted; `fail` rejecting a folder without an index instead of examining it; a backslash before a carriage return dropped by an invented escape).
@@ -3055,3 +3056,15 @@ reviewer comment.
 **Verification:** Tests and solution unchanged; reference base 42/42, new 147/147, unsolved 0/147; probes on the reference: a new rule taking a name only recorded by another entry is rejected, `fail` on an empty folder without an index accepts and creates it, and a violation with a carriage return is written in the base format. **Status:** pass-rate effect unverified until the next batch.
 **Applies to:** Batch diagnosis where most runs fail the same few tests the same way.
 **Seen in:** freeze-store-integrity v20 batch, 2026-09-29.
+**Refinement (2026-09-29):** Two more fixes of the same kind, both verified. (1) Three runs deleted an empty file under a nested name because the prose never said which condition wins when an entry is both broken and would be resolved; added "An entry that is not broken is resolved...", matching the reference's order. (2) One test compared index bytes where its sentence promised only that the entry stays, so an implementation that rewrites identical entries failed or passed depending on the timestamp second. It now asserts the recorded entry instead: the failed-delete mutant still fails exactly this test, the reference is 148/148 and base 42/42, unsolved 0/148, and no replayed run lost a test (run 4 lost only that timing failure). Rule: before tightening prose, sweep the suite for byte or timing assertions that go beyond their sentence.
+
+### A reviewer's requested fix can break the repository's own baseline; scope the sentence instead
+**Trigger:** Solution Quality FAIL: the reference normalizes `
+` in rule-description keys on save and lookup, so saving CRLF- and LF-described rules merges them, against the sentence "Entries whose rule descriptions differ only in their line breaks are still separate entries." The reviewer asked for verbatim keys.
+**Root cause:** The normalization is the base code's deliberate cross-platform behaviour (upstream commit "fix line ending problems in FreezingArchRule"), pinned by a baseline test. The sentence had been written for keys already in the index but read as covering every save.
+**Solution:** Apply the reviewer's fix as a mutant and run the baseline first. Verbatim keys failed two baseline cases (a rule frozen with one line-break style is not found when checked with the other), so the code stays. Scope the sentence to what is true: entries already in the index stay separate, while storing or reading a rule looks its description up with `
+` counting as `
+`. Do not add a test pinning either key form: Test Quality already ruled that unfair.
+**Verification:** Reference unchanged (base 42/42, new 148/148); the verbatim-key variant is base 40/42 and new 148/148; test and solution patches byte-identical to the previously verified versions, so every agent replay is unchanged by construction.
+**Applies to:** Any reviewer fix that changes behaviour the base repository already has.
+**Seen in:** freeze-store-integrity v20 Solution Quality, 2026-09-29.
