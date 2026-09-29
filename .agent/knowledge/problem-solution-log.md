@@ -3047,3 +3047,11 @@ reviewer comment.
 **Verification:** Both new tests pass on the reference (147/147, base 42/42, unsolved 0/147) and fail on a mutant whose identity follows dangling links. Replaying the ten saved runs from the latest batch changed no run's result except one that already had 11 failures, and every other failure matched the platform's exactly.
 **Applies to:** Any reviewer finding that asserts a library or OS behaviour (path canonicalization, file identity, encoding, locale) from reading code.
 **Seen in:** freeze-store-integrity v20 Solution & Code review, 2026-09-29.
+
+### After a batch, route each identical-outcome cluster to its clause, verify the clause against the reference, and never touch the tests
+**Trigger:** An 11-run batch at 0 passes: one save-safety test failed in 11 of 11 runs, two others in 5 of 10 each, every failure identical within its cluster (a new rule's save accepted; `fail` rejecting a folder without an index instead of examining it; a backslash before a carriage return dropped by an invented escape).
+**Root cause:** Each cluster traced to wording: a rejection keyed to "the rule's own entry" (read as not applying to rules without one), two rejection sentences read as "`fail` never examines a folder without an index", and a carriage-return rule that never said the file format stays as it is.
+**Solution:** Read one or two failing runs' code per cluster to name the misreading, then state the tested outcome in one clause, reusing terms the description already defines (the save rejection now mirrors the `occupied` definition). Probe every behaviour a new clause implies that no test pins yet. Refuse test loosening and replays of finished runs: probes showed those runs overwrite another rule's frozen violations, which an FP review flags.
+**Verification:** Tests and solution unchanged; reference base 42/42, new 147/147, unsolved 0/147; probes on the reference: a new rule taking a name only recorded by another entry is rejected, `fail` on an empty folder without an index accepts and creates it, and a violation with a carriage return is written in the base format. **Status:** pass-rate effect unverified until the next batch.
+**Applies to:** Batch diagnosis where most runs fail the same few tests the same way.
+**Seen in:** freeze-store-integrity v20 batch, 2026-09-29.
