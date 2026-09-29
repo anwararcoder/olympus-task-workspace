@@ -3068,3 +3068,11 @@ reviewer comment.
 **Verification:** Reference unchanged (base 42/42, new 148/148); the verbatim-key variant is base 40/42 and new 148/148; test and solution patches byte-identical to the previously verified versions, so every agent replay is unchanged by construction.
 **Applies to:** Any reviewer fix that changes behaviour the base repository already has.
 **Seen in:** freeze-store-integrity v20 Solution Quality, 2026-09-29.
+
+### Predict an FP panel by probing each passer against the reference on clauses no test pins
+**Trigger:** A batch had 4 of 10 passes and the user asked, before the FP review, which passes would survive it.
+**Root cause:** Pass rate and the evaluator's PASS_LEGITIMATE label say nothing about behaviour the hidden suite does not pin. Here the hidden non-public strategy class sat in the store's own package, so plain `getConstructor().newInstance()` passed; a user's class in its own package fails with IllegalAccessException. The reference uses `ReflectionUtils.newInstanceOf`, which calls setAccessible.
+**Solution:** Read each passer in full next to the reference and list every difference. Turn each one into a probe asserting the reference's result, then run it in four states: reference, base, and each candidate. Count a probe as FP evidence only when the reference passes, the candidate fails, and a description clause or the base's own behaviour grounds it. A same-package fixture hides reflective access checks, so put visibility fixtures in a foreign package. Weigh a probe down when an earlier adjudicator overruled its class (here: alternate spellings of an absent recorded name, which the suite itself treats literally).
+**Verification:** Reference 10/10 probes. Base agreed with the reference on every pre-existing behaviour (CRLF-ended violation files, index key form, raw-key lookup). All four passers failed the foreign-package strategy and the outside-file forget probes. Only run 8 dropped the base's CRLF normalization when reading violation files (`first`), and FreezingArchRule would then report every frozen violation as new.
+**Applies to:** Any FP-review prediction or pre-panel self-check.
+**Seen in:** freeze-store-integrity v20 batch, 2026-09-29.
