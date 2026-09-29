@@ -3076,3 +3076,12 @@ reviewer comment.
 **Verification:** Reference 10/10 probes. Base agreed with the reference on every pre-existing behaviour (CRLF-ended violation files, index key form, raw-key lookup). All four passers failed the foreign-package strategy and the outside-file forget probes. Only run 8 dropped the base's CRLF normalization when reading violation files (`first`), and FreezingArchRule would then report every frozen violation as new.
 **Applies to:** Any FP-review prediction or pre-panel self-check.
 **Seen in:** freeze-store-integrity v20 batch, 2026-09-29.
+
+### Close a confirmed FP with a test that spares the upheld passes
+**Trigger:** The FP panel confirmed two of four passes as false positives (#6 high confidence, #7 medium) and upheld two, and the user asked to make the false positives fail without touching the description.
+**Root cause:** Repair's write-back of a moved entry was never tested with a CRLF key. Run 4 (#6) and run 3 (#7) both normalize the key in `put()`, so moving the misplaced entry "two
+lines" adds an LF entry and leaves the CRLF one pointing at the moved-away file. The panel's own discriminator for #7 (an entry naming the index is not broken) also fails both upheld passes, so it was the wrong lever.
+**Solution:** Map each upheld discriminator onto all passers with the saved patches before writing a test. Pick the discriminator that fails exactly the confirmed FPs and is grounded in an existing clause (here "Entries already in the index whose rule descriptions differ only in their line breaks are still separate entries" and "moves a misplaced entry's file to its derived name"). Keep it independent of unstated choices: a constant naming strategy, so the derived name is the same whether the strategy gets the raw or normalized key, a key-agnostic "exactly one entry records the derived name" assertion, and a follow-up `fail` initialization.
+**Verification:** Reference base 42/42 and new 149/149; the unsolved base fails all 149; the upheld passes #9 and #2 stay 149/149; the confirmed FPs #7 and #6 fail exactly the new test. The patch round-trips from a clean checkout, and the description, solution and Dockerfile are unchanged.
+**Applies to:** Any FP-closure round where several passes exist and only some are confirmed false.
+**Seen in:** freeze-store-integrity v20 FP check, 2026-09-30.
