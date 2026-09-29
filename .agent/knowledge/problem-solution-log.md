@@ -3039,3 +3039,11 @@ reviewer comment.
 **Platform re-check (2026-09-29):** the sanity item now reports OK, citing the guard ("filesystem and permission nuances are handled conservatively (e.g., assumptions for setpriv)").
 **Applies to:** Any hidden test that needs an OS-level privilege change or another external binary the base image may not ship.
 **Seen in:** freeze-store-integrity v20 prechecks, 2026-09-29.
+
+### A reviewer's code-reading claim about a JDK path API can be false; reproduce it before changing the solution
+**Trigger:** Solution & Code 1/3 with two High findings: a helper was said to treat an absent name and a different dangling symlink to it as one file (because `getCanonicalFile` supposedly follows the dangling link), making them shared instead of broken, and making a free derived name collide with a dangling-link derived name aimed at it.
+**Root cause:** The finding came from reading the code, not running it. On the task's JDK (25, the only one in the image), `File.getCanonicalFile()` of a dangling link returns the link's own path, so the two names are never equal; the reference already produces the reviewer's expected outcome for both cases.
+**Solution:** Turn each reviewer failing case into a test and run it on the unchanged reference (absolute and relative link targets) before touching code. If it passes, keep the solution, confirm the premise with a direct probe of the API on the task's JDK, and still add the tests so the combination the reviewer called untested is pinned; prove they discriminate with a mutant that implements the reviewer's described defect. Answer the review with the probe output and the test names.
+**Verification:** Both new tests pass on the reference (147/147, base 42/42, unsolved 0/147) and fail on a mutant whose identity follows dangling links. Replaying the ten saved runs from the latest batch changed no run's result except one that already had 11 failures, and every other failure matched the platform's exactly.
+**Applies to:** Any reviewer finding that asserts a library or OS behaviour (path canonicalization, file identity, encoding, locale) from reading code.
+**Seen in:** freeze-store-integrity v20 Solution & Code review, 2026-09-29.
