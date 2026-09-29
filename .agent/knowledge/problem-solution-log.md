@@ -303,6 +303,7 @@ Never redesign the challenge, alter difficulty, or mark a behavioral failure unf
 
 **Applies to:** Every agent-run, verifier, and environment review across all challenge types.
 
+**Refinement (2026-09-28, freeze-store-integrity):** A wrapper's synthetic "base tests were missing from the JUnit XML (exit code 0)" failure was labelled a verifier blocker, and the evaluator claimed the hidden patch renamed the baseline test. Check the claim against the test patch first (it never touched that file), then replay the candidate's production diff with its test-file hunks stripped: the original test ran and failed ("No rule stored with description 'default rule'"), so the missing node hid a real behavior change the agent had made its own test match. Contest such labels with that replay, not with a new infrastructure story.
 ### Reconcile conflicting evaluator verdicts by behavioral fingerprint
 
 **Trigger:** Separate evaluators assign different categories such as verifier defect, environment blocker, fairness mismatch, or candidate mistake to runs that fail the same leaves with the same output or use the same underlying mechanism.
@@ -2963,6 +2964,7 @@ description's declarative voice, and type the text so it stays ASCII-only.
 LF, leak-free; only the description changed.
 **Applies to:** Any description edit that splits a sentence, especially one taken from a bot or
 reviewer comment.
+**Recurrence (2026-09-28):** The kept sentence "Saving no violations for an unknown rule stores nothing." still dropped the `Under repair` prefix; in the next 15-run batch 5 runs changed the default empty-save behavior and renamed the existing baseline test to match. Repeat the mode, not only the subject, in every split sentence. Fix not yet applied.
 **Seen in:** freeze-store-integrity v18 Description Quality comment, 2026-09-28.
 
 ### A rejection keyed to a write effect lets atomic writers skip it

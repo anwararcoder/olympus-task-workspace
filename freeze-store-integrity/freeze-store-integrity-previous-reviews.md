@@ -123,3 +123,50 @@ S4: Reduce the comment-heavy implementation narration to short explanations of g
 Other notes:
 
 Fix all the issues in this revision
+
+---
+
+## v17 — tg 1239 — revision_requested — 2026-09-27 21:00
+
+Quality score: 5
+
+Problem Description - (2/3) Minor
+P4: Qualify whole-word retention with “when such a word exists.” Punctuation-only and non-ASCII descriptions cannot satisfy the unconditional requirement. Shorten the dense classification paragraph without changing its behavioral contract.
+
+Tests - (1/3) Weak
+T3/T4: The sole current passing implementation fails six independent public-behavior probes; the reference passes all six. Add regressions covering:
+- Legacy backslash–CR contents: independently seed an existing violation file. The passing implementation removes a literal backslash; candidate-written round trips conceal this corruption.
+- Original callback input: verify that custom naming strategies receive the original CRLF-bearing description, not a normalized replacement.
+- Inherited configuration: supply default.fileNames through Properties defaults and verify rejection when a constructor strategy is also supplied.
+- Symlinked store directories: exercise initialization, saving and reading through a directory alias. This works at the pinned baseline but the passing implementation rejects it.
+- Strategy-class visibility: cover a non-public implementation with the required public no-argument constructor. The passing implementation imposes an additional, unstated public-class restriction.
+- Distinct raw index keys: repair a broken CRLF-bearing key beside a healthy LF-bearing key. The passing implementation removes the healthy mapping and leaves the broken one.
+T5: Two overlong-word tests still require lowercase controllers. A deterministic uppercase variant preserves the qualifying word and satisfies the remaining naming requirements, yet fails exactly these two assertions. Remove the redundant case-sensitive checks or make them case-insensitive.
+T1/T6: Trim remaining comments that merely narrate fixture contents or expected behavior.
+
+Solution & Code - (3/3) Clean
+
+Other notes:
+
+This is your last revision
+
+---
+
+## v19 — tg 1239 — revision_requested — 2026-09-28 20:22
+
+Quality score: 3
+
+Problem Description - (1/3) Weak
+P4: The naming rule now requires retaining a word of “4+” characters while limiting the entire filename to 200 characters. A description whose only word is longer than 200 characters makes that contract impossible. V19 also removes v17’s clarification that a correctly named entry is not “occupied,” and leaves the report order of misplaced, colliding, and occupied entries unspecified.
+
+Tests - (1/3) Weak
+T3/T4: The earlier public-behavior gaps remain: independently seeded backslash–CR content, the original CRLF description passed to a custom strategy, inherited Properties configuration, symlinked store directories, non-public strategy classes with public constructors, and distinct raw CRLF/LF index keys. The long late-word test still checks length and stability without checking that it retains the word. The baseline now runs only TextFileBasedViolationStoreTest, dropping the adjacent concurrency and FreezingArchRule classes that v17 included.
+
+T1/T6: test.sh no longer stages the report or produces a diagnostic JUnit report when Gradle fails before XML generation. It can leave an older report at OUTPUT_PATH.
+
+Solution & Code - (1/3) Weak
+S1/S2: V19 restores defects that v17 had addressed. FileSyncedProperties.apply() normalizes raw keys before removal, so repairing a CRLF-keyed entry can remove a distinct LF-keyed entry. reloadFromFileSystem() clears and repopulates shared properties while containsKey() and getProperty() read without the same lock. The fail-mode scan occurs outside the shared index lock. Repair silently skips a required move or deletion when the filesystem operation fails; an empty save can likewise remove a mapping after deletion fails. S4: Long explanatory Javadocs and test section-divider comments have also returned.
+
+Other notes:
+
+The lowercase-only controllers assertions from the v17 review are resolved. The six coverage gaps remain. The clarified prompt, broader baseline, staged JUnit handling, and several reference-code protections were removed or regressed in v19.
