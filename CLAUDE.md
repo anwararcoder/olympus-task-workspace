@@ -28,3 +28,10 @@ When a lesson proves decisive twice, promote it into `lessons-digest.md` and the
 rule, and tell the user.
 
 Never copy log or digest content into the five deliverables.
+
+## Humanize every description edit (mandatory)
+
+Whenever you create or modify a task description (`*-description.md`), run the `humanizer` skill
+(`.claude/skills/humanizer/`) on the changed prose in file mode before finishing, including edits made
+through scripts. It changes wording only: keep every tested clause, config key, exact value and
+precedence rule, and let `.agent/rules/description-writing.md` win where the two conflict.

@@ -18,7 +18,9 @@ description: Guidelines for writing problem descriptions that are clear yet chal
 
 Official platform requirements (P1-P7, see `olympus-platform.md` section 3):
 
-- Write it like a maintainer's issue: natural prose, full sentences.
+- Write it like a maintainer's issue: natural prose, full sentences. After every edit, run the
+  `humanizer` skill (`.claude/skills/humanizer/`) on the changed prose; it may reword, never drop or
+  change a tested clause.
 - Open with the ask so the first line stands on its own without the title. No motivation and no
   "what the repo currently lacks" preamble.
 - No bulleted requirement lists, no headings, no code snippets doing the describing.
