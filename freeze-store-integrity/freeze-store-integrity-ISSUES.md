@@ -4,69 +4,45 @@ Verdict
 FAIL
 Summary
 
-Robust integrity-maintenance implementation, but it merges CRLF and LF rule descriptions during normal saves despite the explicit separate-entry contract.
+The patch adds a large test harness but leaves TextFileBasedViolationStore—and therefore every requested runtime behavior—unchanged.
 
 Scores
 
 
 Solution Comprehensiveness
 1/3 — Not Met
-The patch implements the new naming modes, integrity classification/repair/fail flow, ownership checks, and in-process locking in a generally thorough way, including the specified raw-description call into strategies and line-break-only violation detection. However, it does not uphold the explicit requirement that entries whose descriptions differ only by line breaks remain separate when they are created through the store API. FileSyncedProperties#getProperty and #putIfAbsent normalize every description with ensureUnixLineBreaks (TextFileBasedViolationStore.java base lines 263-278, retained by the patch), while the patched ensureRuleFileName consults getProperty before allocating a name. Consequently, saving a rule described as "first\r\nsecond" and then one described as "first\nsecond" reuses one normalized index key and one file, rather than producing two entries.
+The patch changes no production file at all. In particular, TextFileBasedViolationStore remains unchanged: its initialization only reads allowStoreCreation, allowStoreUpdate, and path, then loads/creates stored.rules (archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java:104-114). It has no handling for default.integrity or default.fileNames. Thus an index containing `a rule=gone` initialized with default.integrity=repair remains unchanged, contradicting the promised repair behavior that discards broken entries. The other promised behaviors are likewise absent: the default strategy is still a UUID lambda (lines 91-92), configured naming strategies are not loaded, and save directly assigns a strategy result and writes it without the required path/index/ownership validation (lines 157-181).
 
 
 Code Quality
-3/3 — Fully Met
-The touched production code is in scope (the store plus focused naming/integrity helpers), and the documentation source and generated user-guide HTML are kept in sync. The implementation follows the existing package, exception, logging, and reflection conventions; configured Spotless only removes unused imports, and the new declarations/imports are used. The synchronization is consistently based on the existing per-canonical-index cache, and there is no grader-oriented content, debug output, or unrelated churn in the solution patch.
+1/3 — Not Met
+Rather than implement the store, the change adds a 3,633-line one-off test class, dedicated Gradle compilation/execution tasks, and a 173-line root test-reporting script. This is substantial test-harness/build churn while leaving the public production implementation untouched. The archunit module already applies its normal release and JUnit conventions (archunit/build.gradle:1-4) and ends with its established test setup (lines 152-155); maintainers should not accept bespoke tasks and a root launcher as a substitute for the requested implementation.
 
 Issues
 
 high
 Comprehensiveness
-Saving CRLF- and LF-described rules merges entries that must remain distinct
+No integrity or filename-maintenance implementation was added
 
-Keep index keys and lookup keys verbatim for TextFileBasedViolationStore operations instead of applying ensureUnixLineBreaks to rule descriptions. The description-only built-in strategy can still normalize CRLF when deriving its filename, but that must not collapse the two index entries. As written, save("first\r\nsecond", ...) stores under "first\nsecond"; a subsequent save("first\nsecond", ...) finds that same entry and overwrites its file. This also bypasses the new-rule ownership/collision path that should apply to the second, distinct entry.
+Implement the requested behavior in TextFileBasedViolationStore, not only tests. Parse and validate default.integrity and default.fileNames; classify entries and folder files; perform repair/fail actions under safe synchronization; and validate all save targets before modifying either the index or files. For a concrete failing case, with stored.rules containing `a rule=gone` and default.integrity=repair, initialization must remove the entry, but the unchanged initialization path merely loads the index and leaves it present.
 
-Evidence: The description explicitly states: "Entries whose rule descriptions differ only in their line breaks are still separate entries." TextFileBasedViolationStore.java base lines 263-278 show containsKey, getProperty, and putIfAbsent applying ensureUnixLineBreaks; the patch retains those methods and makes ensureRuleFileName call getProperty before creating an entry.
+Evidence: Problem description: “`repair` discards broken entries.” Existing production code at archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java:104-114 only reads creation/update/path properties and obtains the index; lines 157-181 save using an unchecked strategy filename. No production file is touched by the solution patch.
+
+high
+Code Quality
+Large bespoke test harness is out of scope without the corresponding product change
+
+Remove the one-off freezeStoreMaintenanceTest/freezeStoreBaselineTest wiring and root test.sh launcher from the implementation patch, or keep ordinary focused regression tests only after adding the actual production code. The submitted changes add task-specific infrastructure and thousands of test lines but do not alter runtime behavior, so they add maintenance burden without delivering the feature.
+
+Evidence: The solution patch appends dedicated task wiring after archunit/build.gradle:155, adds archunit/src/test/java/com/tngtech/archunit/library/freeze/FreezeStoreMaintenance_e448f3_Test.java (3,633 lines), and adds test.sh (173 lines). The existing module already uses standard conventions at archunit/build.gradle:1-4 and has its established test finalization at lines 152-155.
 
 Feedback
 
-This is a substantial and otherwise well-structured implementation. The new helpers cover the difficult filesystem cases—symlink and hard-link sharing, containment, unowned files, collision/occupancy checks, empty-file detection, reporting order, and repair-only mutations—while the store-level monitor prevents another in-process store from inspecting an in-flight save. The patch is scoped to production behavior and corresponding user documentation, with the generated HTML updated consistently.
+The submission is test infrastructure only. The actual public store remains exactly as it was: initialization does not inspect integrity mode or the folder, filename configuration is unsupported, and saving retains the old unchecked filename/write path. Consequently the required repair, fail, naming, ownership, link-safety, and save/forget semantics have no executable implementation.
 
-There is one important gap in the handling of rule descriptions. The integrity scan preserves raw keys from an existing properties file, which is why the maintenance test for separately indexed CRLF/LF keys can pass, but normal store saves still normalize those keys before lookup and insertion. That means the public store cannot actually maintain two such entries as distinct rules. Separate filename normalization for the built-in description mode from index-key identity so the stated entry-separation guarantee holds end to end.
+Please place the implementation in TextFileBasedViolationStore (with any narrowly necessary supporting classes) and add focused regression tests through the repository's standard test setup. In particular, make classification and repair atomic with saves, validate index and rule-file paths before touching them, and ensure fail mode reports without mutating state. The bespoke build tasks and root reporting script should not be used to stand in for product code.
 
-Completed in 437.6s
+Completed in 245.9s
 
-Hide raw output
-{
-  "completed": true,
-  "evaluation": {
-    "code_quality": {
-      "level": "Fully Met",
-      "max_score": 3,
-      "reasoning": "The touched production code is in scope (the store plus focused naming/integrity helpers), and the documentation source and generated user-guide HTML are kept in sync. The implementation follows the existing package, exception, logging, and reflection conventions; configured Spotless only removes unused imports, and the new declarations/imports are used. The synchronization is consistently based on the existing per-canonical-index cache, and there is no grader-oriented content, debug output, or unrelated churn in the solution patch.",
-      "score": 3
-    },
-    "issues": [
-      {
-        "criterion": "comprehensiveness",
-        "detail": "Keep index keys and lookup keys verbatim for TextFileBasedViolationStore operations instead of applying ensureUnixLineBreaks to rule descriptions. The description-only built-in strategy can still normalize CRLF when deriving its filename, but that must not collapse the two index entries. As written, save(\"first\\r\\nsecond\", ...) stores under \"first\\nsecond\"; a subsequent save(\"first\\nsecond\", ...) finds that same entry and overwrites its file. This also bypasses the new-rule ownership/collision path that should apply to the second, distinct entry.",
-        "evidence": "The description explicitly states: \"Entries whose rule descriptions differ only in their line breaks are still separate entries.\" TextFileBasedViolationStore.java base lines 263-278 show containsKey, getProperty, and putIfAbsent applying ensureUnixLineBreaks; the patch retains those methods and makes ensureRuleFileName call getProperty before creating an entry.",
-        "severity": "high",
-        "title": "Saving CRLF- and LF-described rules merges entries that must remain distinct"
-      }
-    ],
-    "overall_feedback": "This is a substantial and otherwise well-structured implementation. The new helpers cover the difficult filesystem cases—symlink and hard-link sharing, containment, unowned files, collision/occupancy checks, empty-file detection, reporting order, and repair-only mutations—while the store-level monitor prevents another in-process store from inspecting an in-flight save. The patch is scoped to production behavior and corresponding user documentation, with the generated HTML updated consistently.\n\nThere is one important gap in the handling of rule descriptions. The integrity scan preserves raw keys from an existing properties file, which is why the maintenance test for separately indexed CRLF/LF keys can pass, but normal store saves still normalize those keys before lookup and insertion. That means the public store cannot actually maintain two such entries as distinct rules. Separate filename normalization for the built-in description mode from index-key identity so the stated entry-separation guarantee holds end to end.",
-    "solution_comprehensiveness": {
-      "level": "Not Met",
-      "max_score": 3,
-      "reasoning": "The patch implements the new naming modes, integrity classification/repair/fail flow, ownership checks, and in-process locking in a generally thorough way, including the specified raw-description call into strategies and line-break-only violation detection. However, it does not uphold the explicit requirement that entries whose descriptions differ only by line breaks remain separate when they are created through the store API. FileSyncedProperties#getProperty and #putIfAbsent normalize every description with ensureUnixLineBreaks (TextFileBasedViolationStore.java base lines 263-278, retained by the patch), while the patched ensureRuleFileName consults getProperty before allocating a name. Consequently, saving a rule described as \"first\\r\\nsecond\" and then one described as \"first\\nsecond\" reuses one normalized index key and one file, rather than producing two entries.",
-      "score": 1
-    },
-    "summary": "Robust integrity-maintenance implementation, but it merges CRLF and LF rule descriptions during normal saves despite the explicit separate-entry contract.",
-    "verdict": "FAIL"
-  },
-  "executionTimeSeconds": 437.579406,
-  "summary": "Robust integrity-maintenance implementation, but it merges CRLF and LF rule descriptions during normal saves despite the explicit separate-entry contract.",
-  "verdict": "FAIL"
-}
+Show raw output
 Close

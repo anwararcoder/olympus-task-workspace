@@ -3085,3 +3085,11 @@ lines" adds an LF entry and leaves the CRLF one pointing at the moved-away file.
 **Verification:** Reference base 42/42 and new 149/149; the unsolved base fails all 149; the upheld passes #9 and #2 stay 149/149; the confirmed FPs #7 and #6 fail exactly the new test. The patch round-trips from a clean checkout, and the description, solution and Dockerfile are unchanged.
 **Applies to:** Any FP-closure round where several passes exist and only some are confirmed false.
 **Seen in:** freeze-store-integrity v20 FP check, 2026-09-30.
+
+### Solution Quality graded the test patch: check which file sits in the solution field
+**Trigger:** Right after a test-only change was uploaded, Solution Quality failed 1/3 and 1/3. It said "the patch changes no production file", listed a 3,633-line test class, a build.gradle task and a 173-line test.sh as the "solution patch", and asked to remove the test harness.
+**Root cause:** The platform's solution field held the new test patch. The report's line counts match only the new test patch's hunks (3,633 and 173), while the local solution patch touches only production code and docs and was byte-identical to the verified version.
+**Solution:** Before editing anything, list the files each local patch touches and match the report's file names and line counts to one of them. If they match the test patch, fix the upload rather than the code: put the solution patch back into the solution field, keep the test patch in the test field, and rerun only the stale checks.
+**Verification:** `grep "^diff --git"` over both local patches: the solution touches four production Java files plus two docs files; the test patch touches build.gradle, the hidden test class and test.sh. Hunk headers `+1,3633` and `+1,173` exist only in the test patch.
+**Applies to:** Any quality check whose findings describe files the reviewed artifact should not contain.
+**Seen in:** freeze-store-integrity v20 Solution Quality after the FP-closure test, 2026-09-30.
