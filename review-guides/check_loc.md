@@ -7,6 +7,8 @@
 
 Before reviewing anything else, count the **lines of code changed** in `solution.patch`.
 
+
+
 ## How to count
 
 - Count all meaningful changed lines — added (`+`), deleted (`-`), and modified lines (excluding `+++`/`---` file header lines)
