@@ -1,0 +1,413 @@
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassWriter.java b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+index 0a6b7a9..a291e40 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassWriter.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+@@ -44,6 +44,10 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
+ import org.jetbrains.java.decompiler.struct.gen.generics.GenericsChecker;
+ import org.jetbrains.java.decompiler.util.*;
+ import org.jetbrains.java.decompiler.util.collections.VBStyleCollection;
++import org.jetbrains.java.decompiler.util.token.ClassTextToken;
++import org.jetbrains.java.decompiler.util.token.FieldTextToken;
++import org.jetbrains.java.decompiler.util.token.MethodTextToken;
++import org.jetbrains.java.decompiler.util.token.TextToken;
+ 
+ import java.io.IOException;
+ import java.util.*;
+@@ -59,6 +63,29 @@ public class ClassWriter implements StatementWriter {
+   ));
+   private final PoolInterceptor interceptor;
+   private final IFabricJavadocProvider javadocProvider;
++  private final Set<ClassNode> processedNodes = Collections.newSetFromMap(new IdentityHashMap<>());
++  private final Map<ClassNode, Boolean> processorResults = new IdentityHashMap<>();
++  private Set<GeneratedMember> retainedGeneratedMembers = Collections.emptySet();
++
++  private enum GeneratedMemberType {
++    CLASS,
++    FIELD,
++    METHOD
++  }
++
++  private record GeneratedMember(GeneratedMemberType type, String className, String name, String descriptor) {
++    private static GeneratedMember classMember(String className) {
++      return new GeneratedMember(GeneratedMemberType.CLASS, className, null, null);
++    }
++
++    private static GeneratedMember field(String className, String name, String descriptor) {
++      return new GeneratedMember(GeneratedMemberType.FIELD, className, name, descriptor);
++    }
++
++    private static GeneratedMember method(String className, String name, String descriptor) {
++      return new GeneratedMember(GeneratedMemberType.METHOD, className, name, descriptor);
++    }
++  }
+ 
+   public ClassWriter() {
+     interceptor = DecompilerContext.getPoolInterceptor();
+@@ -371,12 +398,22 @@ public class ClassWriter implements StatementWriter {
+   }
+ 
+   public void writeClass(ClassNode node, TextBuffer buffer, int indent) {
++    if (node.type == ClassNode.Type.ROOT &&
++      DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++      writeClassReferenceAware(node, buffer, indent);
++    }
++    else {
++      writeClassInternal(node, buffer, indent);
++    }
++  }
++
++  private void writeClassInternal(ClassNode node, TextBuffer buffer, int indent) {
+     ClassNode outerNode = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+     DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
+ 
+     try {
+       // last minute processing
+-      boolean ok = invokeProcessors(buffer, node);
++      boolean ok = processNode(buffer, node);
+ 
+       if (!ok) {
+         return;
+@@ -452,8 +489,7 @@ public class ClassWriter implements StatementWriter {
+         }
+ 
+         for (StructField fd : nonEnumFields) {
+-          boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-            wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
++          boolean hide = shouldHideField(fd, wrapper);
+           if (hide) continue;
+ 
+           if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
+@@ -479,9 +515,7 @@ public class ClassWriter implements StatementWriter {
+         StructMethod mt = methods.get(i);
+         boolean hide;
+         if (methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
+-          hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-                 mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
+-                 wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
++          hide = shouldHideMethod(node, mt, wrapper);
+         } else {
+           hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
+                  (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
+@@ -506,8 +540,7 @@ public class ClassWriter implements StatementWriter {
+           boolean hide;
+           if (methodToDecompile.isEmpty()) {
+             boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
+-            hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-                   wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
++            hide = shouldHideMemberClass(inner, isSynthetic, wrapper);
+           } else {
+             hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+           }
+@@ -517,7 +550,7 @@ public class ClassWriter implements StatementWriter {
+             buffer.appendLineSeparator();
+           }
+           TextBuffer clsBuffer = new TextBuffer();
+-          writeClass(inner, clsBuffer, indent + 1);
++          writeClassInternal(inner, clsBuffer, indent + 1);
+           haveContent.run();
+           buffer.append(clsBuffer);
+         }
+@@ -540,6 +573,278 @@ public class ClassWriter implements StatementWriter {
+     DecompilerContext.getLogger().endWriteClass();
+   }
+ 
++  private boolean processNode(TextBuffer buffer, ClassNode node) {
++    Boolean result = processorResults.get(node);
++    if (result != null) {
++      return result;
++    }
++
++    processedNodes.add(node);
++    result = invokeProcessors(buffer, node);
++    processorResults.put(node, result);
++    return result;
++  }
++
++  private void writeClassReferenceAware(ClassNode node, TextBuffer buffer, int indent) {
++    retainedGeneratedMembers = Collections.emptySet();
++
++    TextBuffer current = new TextBuffer(ClassesProcessor.AVERAGE_CLASS_SIZE);
++    writeClassInternal(node, current, indent);
++    String currentText = current.convertToStringAndAllowDataDiscard();
++
++    Set<GeneratedMember> candidates = collectOmittedGeneratedMembers(node);
++    if (candidates.isEmpty()) {
++      buffer.append(current);
++      return;
++    }
++
++    Set<GeneratedMember> retained = new HashSet<>();
++    while (true) {
++      Set<GeneratedMember> references = findReferencedGeneratedMembers(current, currentText, candidates);
++      boolean changed = retained.addAll(references);
++      changed |= retainEnclosingGeneratedClasses(retained, candidates, node);
++
++      if (!changed) {
++        break;
++      }
++
++      retainedGeneratedMembers = retained;
++      current = new TextBuffer(ClassesProcessor.AVERAGE_CLASS_SIZE);
++      writeClassInternal(node, current, indent);
++      currentText = current.convertToStringAndAllowDataDiscard();
++    }
++
++    retainedGeneratedMembers = retained;
++    buffer.append(current);
++  }
++
++  private Set<GeneratedMember> collectOmittedGeneratedMembers(ClassNode root) {
++    Set<GeneratedMember> result = new LinkedHashSet<>();
++    collectOmittedGeneratedMembers(root, result);
++    return result;
++  }
++
++  private void collectOmittedGeneratedMembers(ClassNode node, Set<GeneratedMember> result) {
++    ClassWrapper wrapper = node.getWrapper();
++    if (wrapper == null) {
++      return;
++    }
++
++    String methodToDecompile = getMethodToDecompile();
++    if (methodToDecompile.isEmpty()) {
++      for (StructField fd : node.classStruct.getFields()) {
++        if (fd.isSynthetic() && shouldHideField(fd, wrapper)) {
++          result.add(GeneratedMember.field(node.classStruct.qualifiedName, fd.getName(), fd.getDescriptor()));
++        }
++      }
++    }
++
++    boolean methodRemovalActive = methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER);
++    if (methodRemovalActive) {
++      for (StructMethod mt : node.classStruct.getMethods()) {
++        if (isGeneratedMethod(mt) && shouldHideMethod(node, mt, wrapper)) {
++          result.add(GeneratedMember.method(node.classStruct.qualifiedName, mt.getName(), mt.getDescriptor()));
++        }
++      }
++    }
++
++    for (ClassNode inner : node.nested) {
++      if (methodToDecompile.isEmpty() && inner.type == ClassNode.Type.MEMBER) {
++        StructClass innerCl = inner.classStruct;
++        boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
++        if (isSynthetic && shouldHideMemberClass(inner, isSynthetic, wrapper)) {
++          result.add(GeneratedMember.classMember(innerCl.qualifiedName));
++        }
++      }
++
++      collectOmittedGeneratedMembers(inner, result);
++    }
++  }
++
++  private Set<GeneratedMember> findReferencedGeneratedMembers(TextBuffer buffer,
++                                                               String text,
++                                                               Set<GeneratedMember> candidates) {
++    boolean[] code = codePositions(text);
++    Set<GeneratedMember> result = new HashSet<>();
++
++    for (TextToken token : buffer.getTokens()) {
++      if (token.isDeclaration() || !isCodeToken(code, token)) {
++        continue;
++      }
++
++      GeneratedMember member = referencedMember(token);
++      if (member != null && candidates.contains(member)) {
++        result.add(member);
++      }
++    }
++
++    return result;
++  }
++
++  private static boolean isCodeToken(boolean[] code, TextToken token) {
++    int start = token.getStart();
++    int end = start + token.getLength();
++    return start >= 0 && end <= code.length && start < end && code[start] && code[end - 1];
++  }
++
++  private static GeneratedMember referencedMember(TextToken token) {
++    if (token instanceof ClassTextToken classToken) {
++      return GeneratedMember.classMember(normalizeClassName(classToken.qualifiedName));
++    }
++    if (token instanceof FieldTextToken fieldToken) {
++      return GeneratedMember.field(normalizeClassName(fieldToken.className), fieldToken.name, fieldToken.descriptor.descriptorString);
++    }
++    if (token instanceof MethodTextToken methodToken) {
++      return GeneratedMember.method(normalizeClassName(methodToken.className), methodToken.name, methodToken.descriptor.toString());
++    }
++    return null;
++  }
++
++  private static String normalizeClassName(String name) {
++    return name == null ? null : name.replace('.', '/');
++  }
++
++  private boolean retainEnclosingGeneratedClasses(Set<GeneratedMember> retained,
++                                                  Set<GeneratedMember> candidates,
++                                                  ClassNode root) {
++    Map<String, ClassNode> nodes = new HashMap<>();
++    collectClassNodes(root, nodes);
++
++    boolean changed = false;
++    for (GeneratedMember member : new ArrayList<>(retained)) {
++      ClassNode node = nodes.get(member.className());
++      while (node != null) {
++        node = node.parent;
++        if (node == null || node.type != ClassNode.Type.MEMBER) {
++          continue;
++        }
++
++        GeneratedMember enclosing = GeneratedMember.classMember(node.classStruct.qualifiedName);
++        if (candidates.contains(enclosing)) {
++          changed |= retained.add(enclosing);
++        }
++      }
++    }
++    return changed;
++  }
++
++  private static void collectClassNodes(ClassNode node, Map<String, ClassNode> result) {
++    result.put(node.classStruct.qualifiedName, node);
++    for (ClassNode inner : node.nested) {
++      collectClassNodes(inner, result);
++    }
++  }
++
++  private static boolean[] codePositions(String text) {
++    boolean[] code = new boolean[text.length()];
++    final int normal = 0;
++    final int lineComment = 1;
++    final int blockComment = 2;
++    final int string = 3;
++    final int character = 4;
++    final int textBlock = 5;
++    int state = normal;
++
++    for (int i = 0; i < text.length(); i++) {
++      char current = text.charAt(i);
++      switch (state) {
++        case normal:
++          if (current == '/' && i + 1 < text.length() && text.charAt(i + 1) == '/') {
++            state = lineComment;
++            i++;
++          }
++          else if (current == '/' && i + 1 < text.length() && text.charAt(i + 1) == '*') {
++            state = blockComment;
++            i++;
++          }
++          else if (current == '"' && i + 2 < text.length() && text.charAt(i + 1) == '"' && text.charAt(i + 2) == '"') {
++            state = textBlock;
++            i += 2;
++          }
++          else if (current == '"') {
++            state = string;
++          }
++          else if (current == '\'') {
++            state = character;
++          }
++          else {
++            code[i] = true;
++          }
++          break;
++        case lineComment:
++          if (current == '\n' || current == '\r') {
++            state = normal;
++          }
++          break;
++        case blockComment:
++          if (current == '*' && i + 1 < text.length() && text.charAt(i + 1) == '/') {
++            state = normal;
++            i++;
++          }
++          break;
++        case string:
++          if (current == '\\') {
++            i++;
++          }
++          else if (current == '"') {
++            state = normal;
++          }
++          break;
++        case character:
++          if (current == '\\') {
++            i++;
++          }
++          else if (current == '\'') {
++            state = normal;
++          }
++          break;
++        case textBlock:
++          if (current == '"' && i + 2 < text.length() && text.charAt(i + 1) == '"' && text.charAt(i + 2) == '"') {
++            state = normal;
++            i += 2;
++          }
++          else if (current == '\\') {
++            i++;
++          }
++          break;
++      }
++    }
++
++    return code;
++  }
++
++  private String getMethodToDecompile() {
++    Object value = DecompilerContext.getProperty(IFernflowerPreferences.METHOD_TO_DECOMPILE);
++    return value == null ? "" : value.toString();
++  }
++
++  private boolean shouldHideField(StructField fd, ClassWrapper wrapper) {
++    boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++      wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
++    return hide && !retainedGeneratedMembers.contains(GeneratedMember.field(wrapper.getClassStruct().qualifiedName, fd.getName(), fd.getDescriptor()));
++  }
++
++  private boolean shouldHideMethod(ClassNode node, StructMethod mt, ClassWrapper wrapper) {
++    boolean hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++      mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
++      wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
++
++    if (hide && isGeneratedMethod(mt) && retainedGeneratedMembers.contains(GeneratedMember.method(wrapper.getClassStruct().qualifiedName, mt.getName(), mt.getDescriptor()))) {
++      return false;
++    }
++    return hide;
++  }
++
++  private boolean shouldHideMemberClass(ClassNode inner, boolean isSynthetic, ClassWrapper wrapper) {
++    boolean hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++      wrapper.getHiddenMembers().contains(inner.classStruct.qualifiedName);
++    return hide && !retainedGeneratedMembers.contains(GeneratedMember.classMember(inner.classStruct.qualifiedName));
++  }
++
++  private static boolean isGeneratedMethod(StructMethod mt) {
++    return mt.isSynthetic() || mt.hasModifier(CodeConstants.ACC_BRIDGE);
++  }
++
+   public static void packageInfoToJava(StructClass cl, TextBuffer buffer) {
+     appendAnnotations(buffer, 0, cl, -1);
+ 
+diff --git a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+index 5353261..c6efd41 100644
+--- a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
++++ b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+@@ -21,6 +21,12 @@ public interface IFernflowerPreferences {
+   @Type(DecompilerOption.Type.BOOLEAN)
+   String REMOVE_SYNTHETIC = "remove-synthetic";
+ 
++  @Name("Reference-Aware Synthetic Retention")
++  @Description("Retains omitted generated members that are referenced by the emitted Java in their output file.")
++  @ShortName("ras")
++  @Type(DecompilerOption.Type.BOOLEAN)
++  String REFERENCE_AWARE_SYNTHETIC_RETENTION = "reference-aware-synthetic-retention";
++
+   @Name("Decompile Inner Classes")
+   @Description("Process inner classes and add them to the decompiled output.")
+   @ShortName("din")
+@@ -425,6 +431,7 @@ public interface IFernflowerPreferences {
+ 
+     defaults.put(REMOVE_BRIDGE, "1");
+     defaults.put(REMOVE_SYNTHETIC, "1");
++    defaults.put(REFERENCE_AWARE_SYNTHETIC_RETENTION, "0");
+     defaults.put(DECOMPILE_INNER, "1");
+     defaults.put(DECOMPILE_CLASS_1_4, "1");
+     defaults.put(DECOMPILE_ASSERTIONS, "1");

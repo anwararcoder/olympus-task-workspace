@@ -1,0 +1,1267 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..26d22bc5
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,196 @@
++#!/bin/bash
++set -uo pipefail
++
++INVOKE_DIR="$PWD"
++cd "$(dirname "$0")"
++
++OUTPUT_PATH=""
++MODE=""
++
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --output_path)
++            OUTPUT_PATH="$2"
++            shift 2
++            ;;
++        base|new)
++            MODE="$1"
++            shift
++            ;;
++        *)
++            echo "Usage: $0 --output_path <path> {base|new}"
++            exit 1
++            ;;
++    esac
++done
++
++if [[ -n "$OUTPUT_PATH" && "$OUTPUT_PATH" != /* ]]; then
++    OUTPUT_PATH="$INVOKE_DIR/$OUTPUT_PATH"
++fi
++
++if [[ -z "$MODE" ]]; then
++    echo "Usage: $0 --output_path <path> {base|new}"
++    exit 1
++fi
++
++FOCUS_TEST="SeedableLazy_6c7a1b_Test"
++FOCUS_CLASS="org.immutables.fixture.seedlazy_4f2c9d.SeedableLazy_6c7a1b_Test"
++SOURCE_DIR="value-fixture/seedlazy-tests/org/immutables/fixture/seedlazy_4f2c9d"
++STAGED_DIR="value-fixture/test/org/immutables/fixture/seedlazy_4f2c9d"
++NEGATIVE_DIR="value-fixture/seedlazy-negative/seedlazy_negative"
++REPORTS="value-fixture/target/surefire-reports"
++TMP="${TMPDIR:-/tmp}/immutables-seedable-lazy-mvn-tmp"
++NEGATIVE_LOG="$TMP/negative-compilation.log"
++NEGATIVE_CLASSES="$TMP/negative-classes"
++mkdir -p "$TMP"
++export MAVEN_OPTS="-Xmx950m -XX:MaxMetaspaceSize=384m -Djava.io.tmpdir=$TMP"
++MVN="mvn -B -ntp -o -DforkCount=1 -DreuseForks=true -DfailIfNoTests=false"
++LOG="$TMP/maven-$MODE.log"
++NEGATIVE_FAILURE=0
++
++cleanup() {
++    rm -rf "$STAGED_DIR"
++}
++trap cleanup EXIT
++
++xml_escape() {
++    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
++}
++
++run_mvn() {
++    $MVN "$@" 2>&1 | tee "$LOG"
++    return "${PIPESTATUS[0]}"
++}
++
++write_xml() {
++    local fallback="${1:-0}"
++    [[ -z "$OUTPUT_PATH" ]] && return 0
++    : > "$OUTPUT_PATH"
++    echo '<testsuites>' >> "$OUTPUT_PATH"
++    FOUND=0
++    for xml in "$REPORTS"/TEST-*.xml; do
++        if [[ -e "$xml" ]]; then
++            FOUND=1
++            grep -v '<?xml' "$xml" >> "$OUTPUT_PATH"
++        fi
++    done
++    if [[ "$FOUND" -eq 0 && "$fallback" -ne 0 ]]; then
++        case "$MODE" in
++            base)
++                FALLBACK_CLASS="org.immutables.fixture.ValuesTest"
++                FALLBACK_TEST="plainAttributes"
++                ;;
++            new)
++                FALLBACK_CLASS="$FOCUS_CLASS"
++                FALLBACK_TEST="omittedSeedIsColdAndSuccessfulFallbackIsConcurrentAndMemoized"
++                ;;
++        esac
++        cat >> "$OUTPUT_PATH" <<XML
++<testsuite name="$MODE" tests="1" failures="1" errors="0" skipped="0">
++  <testcase name="$FALLBACK_TEST" classname="$FALLBACK_CLASS">
++    <failure message="Maven failed before Surefire reports were produced">
++XML
++        if [[ -f "$LOG" ]]; then
++            tail -n 200 "$LOG" | xml_escape >> "$OUTPUT_PATH"
++        else
++            echo "Maven failed before Surefire reports were produced." >> "$OUTPUT_PATH"
++        fi
++        cat >> "$OUTPUT_PATH" <<XML
++    </failure>
++  </testcase>
++</testsuite>
++XML
++    fi
++    if [[ "$NEGATIVE_FAILURE" -ne 0 ]]; then
++        cat >> "$OUTPUT_PATH" <<XML
++<testsuite name="seedable-lazy-invalid-configurations" tests="1" failures="1" errors="0" skipped="0">
++  <testcase name="invalidConfigurationsAreRejected" classname="$FOCUS_CLASS">
++    <failure message="An invalid seedable-lazy configuration was not diagnosed">
++XML
++        tail -n 200 "$NEGATIVE_LOG" | xml_escape >> "$OUTPUT_PATH"
++        cat >> "$OUTPUT_PATH" <<XML
++    </failure>
++  </testcase>
++</testsuite>
++XML
++    fi
++    echo '</testsuites>' >> "$OUTPUT_PATH"
++}
++
++run_negative_checks() {
++    local processor_jars=()
++    local processor_jar
++    mapfile -t processor_jars < <(
++        find value/target -maxdepth 1 -type f -name 'value-*.jar' \
++            ! -name '*-annotations.jar' ! -name '*-sources.jar' \
++            ! -name '*-javadoc.jar' ! -name '*-tests.jar' | sort
++    )
++    if [[ "${#processor_jars[@]}" -ne 1 ]]; then
++        echo "Expected exactly one built value processor JAR, found ${#processor_jars[@]}" >> "$NEGATIVE_LOG"
++        return 1
++    fi
++    processor_jar="${processor_jars[0]}"
++    local source
++    local source_log="$TMP/negative-source.log"
++    : > "$NEGATIVE_LOG"
++    rm -rf "$NEGATIVE_CLASSES"
++    mkdir -p "$NEGATIVE_CLASSES"
++    for source in "$NEGATIVE_DIR"/*.java; do
++        echo "Checking $source" >> "$NEGATIVE_LOG"
++        : > "$source_log"
++        if javac --release 8 -proc:only \
++            -cp "$processor_jar" \
++            -processorpath "$processor_jar" \
++            -d "$NEGATIVE_CLASSES" \
++            "$source" > "$source_log" 2>&1; then
++            cat "$source_log" >> "$NEGATIVE_LOG"
++            echo "Expected annotation processing to reject $source" >> "$NEGATIVE_LOG"
++            return 1
++        fi
++        cat "$source_log" >> "$NEGATIVE_LOG"
++        case "$(basename "$source")" in
++            LazyAbstract.java|LazyFinal.java|LazyDerived.java)
++                EXPECTED_MARKERS=("@Value.Lazy")
++                ;;
++            *)
++                EXPECTED_MARKERS=("@Value.Lazy" "@Value.Default")
++                ;;
++        esac
++        for expected in "${EXPECTED_MARKERS[@]}"; do
++            if ! grep -F "$expected" "$source_log" >/dev/null; then
++                echo "Expected diagnostic marker: $expected" >> "$NEGATIVE_LOG"
++                return 1
++            fi
++        done
++    done
++}
++
++rm -rf "$STAGED_DIR" "$REPORTS"
++if [[ "$MODE" == "new" ]]; then
++    mkdir -p "$(dirname "$STAGED_DIR")"
++    cp -R "$SOURCE_DIR" "$STAGED_DIR"
++fi
++
++if ! run_mvn -pl value-fixture -am clean install -DskipTests -Dmaven.test.skip=true; then
++    write_xml 1
++    exit 1
++fi
++
++rm -rf "$REPORTS"
++
++RC=0
++case "$MODE" in
++    base)
++        run_mvn -pl value-fixture test -Dtest="!$FOCUS_TEST" || RC=$?
++        ;;
++    new)
++        run_mvn -pl value-fixture test -Dtest="$FOCUS_TEST" || RC=$?
++        if [[ "$RC" -eq 0 ]] && ! run_negative_checks; then
++            NEGATIVE_FAILURE=1
++            RC=1
++        fi
++        ;;
++esac
++
++write_xml "$RC"
++exit "$RC"
+diff --git a/value-fixture/seedlazy-negative/seedlazy_negative/Interned.java b/value-fixture/seedlazy-negative/seedlazy_negative/Interned.java
+new file mode 100644
+index 00000000..7e1aa05d
+--- /dev/null
++++ b/value-fixture/seedlazy-negative/seedlazy_negative/Interned.java
+@@ -0,0 +1,12 @@
++package seedlazy_negative;
++
++import org.immutables.value.Value;
++
++@Value.Immutable(intern = true)
++abstract class Interned {
++  @Value.Lazy
++  @Value.Default
++  int value() {
++    return 1;
++  }
++}
+diff --git a/value-fixture/seedlazy-negative/seedlazy_negative/LazyAbstract.java b/value-fixture/seedlazy-negative/seedlazy_negative/LazyAbstract.java
+new file mode 100644
+index 00000000..8dcc6149
+--- /dev/null
++++ b/value-fixture/seedlazy-negative/seedlazy_negative/LazyAbstract.java
+@@ -0,0 +1,9 @@
++package seedlazy_negative;
++
++import org.immutables.value.Value;
++
++@Value.Immutable
++abstract class LazyAbstract {
++  @Value.Lazy
++  abstract int value();
++}
+diff --git a/value-fixture/seedlazy-negative/seedlazy_negative/LazyDerived.java b/value-fixture/seedlazy-negative/seedlazy_negative/LazyDerived.java
+new file mode 100644
+index 00000000..400c5998
+--- /dev/null
++++ b/value-fixture/seedlazy-negative/seedlazy_negative/LazyDerived.java
+@@ -0,0 +1,12 @@
++package seedlazy_negative;
++
++import org.immutables.value.Value;
++
++@Value.Immutable
++abstract class LazyDerived {
++  @Value.Lazy
++  @Value.Derived
++  int value() {
++    return 1;
++  }
++}
+diff --git a/value-fixture/seedlazy-negative/seedlazy_negative/LazyFinal.java b/value-fixture/seedlazy-negative/seedlazy_negative/LazyFinal.java
+new file mode 100644
+index 00000000..757afbd6
+--- /dev/null
++++ b/value-fixture/seedlazy-negative/seedlazy_negative/LazyFinal.java
+@@ -0,0 +1,11 @@
++package seedlazy_negative;
++
++import org.immutables.value.Value;
++
++@Value.Immutable
++abstract class LazyFinal {
++  @Value.Lazy
++  final int value() {
++    return 1;
++  }
++}
+diff --git a/value-fixture/seedlazy-negative/seedlazy_negative/NoBuilder.java b/value-fixture/seedlazy-negative/seedlazy_negative/NoBuilder.java
+new file mode 100644
+index 00000000..24876da3
+--- /dev/null
++++ b/value-fixture/seedlazy-negative/seedlazy_negative/NoBuilder.java
+@@ -0,0 +1,12 @@
++package seedlazy_negative;
++
++import org.immutables.value.Value;
++
++@Value.Immutable(builder = false)
++abstract class NoBuilder {
++  @Value.Lazy
++  @Value.Default
++  int value() {
++    return 1;
++  }
++}
+diff --git a/value-fixture/seedlazy-negative/seedlazy_negative/NoWithers.java b/value-fixture/seedlazy-negative/seedlazy_negative/NoWithers.java
+new file mode 100644
+index 00000000..fbd11b87
+--- /dev/null
++++ b/value-fixture/seedlazy-negative/seedlazy_negative/NoWithers.java
+@@ -0,0 +1,12 @@
++package seedlazy_negative;
++
++import org.immutables.value.Value;
++
++@Value.Immutable(copy = false)
++abstract class NoWithers {
++  @Value.Lazy
++  @Value.Default
++  int value() {
++    return 1;
++  }
++}
+diff --git a/value-fixture/seedlazy-tests/org/immutables/fixture/seedlazy_4f2c9d/SeedableLazyModels.java b/value-fixture/seedlazy-tests/org/immutables/fixture/seedlazy_4f2c9d/SeedableLazyModels.java
+new file mode 100644
+index 00000000..4b6a89f8
+--- /dev/null
++++ b/value-fixture/seedlazy-tests/org/immutables/fixture/seedlazy_4f2c9d/SeedableLazyModels.java
+@@ -0,0 +1,265 @@
++/*
++   Copyright 2026 Immutables Authors and Contributors
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++ */
++package org.immutables.fixture.seedlazy_4f2c9d;
++
++import java.io.IOException;
++import java.io.Serializable;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.OptionalInt;
++import java.util.concurrent.atomic.AtomicInteger;
++import javax.annotation.Nullable;
++import org.immutables.gson.Gson;
++import org.immutables.serial.Serial;
++import org.immutables.value.Value;
++
++@Value.Immutable
++@Value.Style(toBuilder = "toBuilder", clearBuilder = true)
++abstract class SeedableLazyModel implements Serializable {
++  private static final long serialVersionUID = 1L;
++
++  abstract int input();
++
++  abstract AtomicInteger scalarCalls();
++
++  abstract AtomicInteger checkedCalls();
++
++  abstract AtomicInteger errorCalls();
++
++  abstract AtomicInteger otherCalls();
++
++  @Value.Lazy
++  @Value.Default
++  int scalar() {
++    return input() * 100 + scalarCalls().incrementAndGet();
++  }
++
++  @Value.Lazy
++  @Value.Default
++  boolean enabled() {
++    otherCalls().incrementAndGet();
++    return true;
++  }
++
++  @Value.Lazy
++  @Value.Default
++  @Nullable
++  String nullable() {
++    otherCalls().incrementAndGet();
++    return "fallback";
++  }
++
++  @Value.Lazy
++  @Value.Default
++  Optional<String> optional() {
++    otherCalls().incrementAndGet();
++    return Optional.of("fallback");
++  }
++
++  @Value.Lazy
++  @Value.Default
++  List<String> tags() {
++    otherCalls().incrementAndGet();
++    return Collections.singletonList("fallback");
++  }
++
++  @Value.Lazy
++  @Value.Default
++  Map<String, Integer> index() {
++    otherCalls().incrementAndGet();
++    return Collections.singletonMap("fallback", input());
++  }
++
++  @Value.Lazy
++  @Value.Default
++  @Nullable
++  List<String> nullableTags() {
++    otherCalls().incrementAndGet();
++    return Collections.singletonList("fallback");
++  }
++
++  @Value.Lazy
++  @Value.Default
++  @Nullable
++  Map<String, Integer> nullableIndex() {
++    otherCalls().incrementAndGet();
++    return Collections.singletonMap("fallback", input());
++  }
++
++  @Value.Lazy
++  @Value.Default
++  int[] numbers() {
++    otherCalls().incrementAndGet();
++    return new int[] {input()};
++  }
++
++  @Value.Lazy
++  @Value.Default
++  String checked() throws IOException {
++    checkedCalls().incrementAndGet();
++    throw new IOException("checked fallback");
++  }
++
++  @Value.Lazy
++  @Value.Default
++  String errorProne() {
++    errorCalls().incrementAndGet();
++    throw new AssertionError("error fallback");
++  }
++}
++
++@Value.Immutable
++@Value.Modifiable
++abstract class SeedableLazyModifiableModel {
++  abstract int input();
++
++  abstract AtomicInteger scalarCalls();
++
++  abstract AtomicInteger checkedCalls();
++
++  @Value.Lazy
++  @Value.Default
++  int scalar() {
++    return input() * 10 + scalarCalls().incrementAndGet();
++  }
++
++  @Value.Lazy
++  @Value.Default
++  Optional<String> optional() {
++    scalarCalls().incrementAndGet();
++    return Optional.of("fallback");
++  }
++
++  @Value.Lazy
++  @Value.Default
++  List<String> tags() {
++    scalarCalls().incrementAndGet();
++    return Collections.singletonList("fallback");
++  }
++
++  @Value.Lazy
++  @Value.Default
++  @Nullable
++  List<String> nullableTags() {
++    scalarCalls().incrementAndGet();
++    return Collections.singletonList("fallback");
++  }
++
++  @Value.Lazy
++  @Value.Default
++  @Nullable
++  Map<String, Integer> nullableIndex() {
++    scalarCalls().incrementAndGet();
++    return Collections.singletonMap("fallback", input());
++  }
++
++  @Value.Lazy
++  @Value.Default
++  String checked() throws IOException {
++    checkedCalls().incrementAndGet();
++    throw new IOException("modifiable fallback");
++  }
++}
++
++@Value.Immutable
++abstract class SeedableLazySpecializedOptionalModel {
++  abstract AtomicInteger calls();
++
++  @Value.Lazy
++  @Value.Default
++  OptionalInt number() {
++    calls().incrementAndGet();
++    return OptionalInt.of(42);
++  }
++}
++
++@Value.Immutable
++@Value.Modifiable
++abstract class SeedableLazyExternalModel {
++  abstract int input();
++
++  abstract AtomicInteger hybridReads();
++
++  @Value.Lazy
++  @Value.Default
++  String expensive() throws IOException {
++    hybridReads().incrementAndGet();
++    throw new IOException("external getter must not be read during transfer");
++  }
++}
++
++@Value.Immutable
++@Value.Modifiable
++@Value.Style(from = "")
++abstract class SeedableLazyNoFromModel {
++  abstract int input();
++
++  abstract AtomicInteger hybridReads();
++
++  @Value.Lazy
++  @Value.Default
++  String expensive() {
++    hybridReads().incrementAndGet();
++    return "fallback-" + input();
++  }
++}
++
++@Value.Immutable
++abstract class SeedableLazyMultipleModel {
++  abstract AtomicInteger firstCalls();
++
++  abstract AtomicInteger secondCalls();
++
++  @Value.Lazy
++  @Value.Default
++  int first() {
++    return firstCalls().incrementAndGet();
++  }
++
++  @Value.Lazy
++  @Value.Default
++  int second() {
++    return secondCalls().incrementAndGet();
++  }
++}
++
++@Serial.Structural
++@Value.Immutable
++abstract class SeedableLazyStructuralModel {
++  abstract AtomicInteger calls();
++
++  @Value.Lazy
++  @Value.Default
++  int value() {
++    return calls().incrementAndGet();
++  }
++}
++
++@Gson.TypeAdapters
++@Value.Immutable
++abstract class SeedableLazyMarshaledModel {
++  abstract String name();
++
++  abstract AtomicInteger calls();
++
++  @Value.Lazy
++  @Value.Default
++  int value() {
++    return calls().incrementAndGet();
++  }
++}
+diff --git a/value-fixture/seedlazy-tests/org/immutables/fixture/seedlazy_4f2c9d/SeedableLazy_6c7a1b_Test.java b/value-fixture/seedlazy-tests/org/immutables/fixture/seedlazy_4f2c9d/SeedableLazy_6c7a1b_Test.java
+new file mode 100644
+index 00000000..9e814f39
+--- /dev/null
++++ b/value-fixture/seedlazy-tests/org/immutables/fixture/seedlazy_4f2c9d/SeedableLazy_6c7a1b_Test.java
+@@ -0,0 +1,684 @@
++/*
++   Copyright 2026 Immutables Authors and Contributors
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++ */
++package org.immutables.fixture.seedlazy_4f2c9d;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.ObjectInputStream;
++import java.io.ObjectOutputStream;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.OptionalInt;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.immutables.fixture.marshal.Marshaling;
++import org.junit.jupiter.api.Test;
++
++import static org.immutables.check.Checkers.check;
++import static org.junit.jupiter.api.Assertions.assertArrayEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++public class SeedableLazy_6c7a1b_Test {
++  private static ImmutableSeedableLazyModel.Builder builder(
++      int input,
++      AtomicInteger scalarCalls,
++      AtomicInteger checkedCalls,
++      AtomicInteger errorCalls,
++      AtomicInteger otherCalls) {
++    return ImmutableSeedableLazyModel.builder()
++        .input(input)
++        .scalarCalls(scalarCalls)
++        .checkedCalls(checkedCalls)
++        .errorCalls(errorCalls)
++        .otherCalls(otherCalls);
++  }
++
++  private static ImmutableSeedableLazyModel.Builder builder(
++      int input,
++      AtomicInteger scalarCalls) {
++    return builder(
++        input,
++        scalarCalls,
++        new AtomicInteger(),
++        new AtomicInteger(),
++        new AtomicInteger());
++  }
++
++  @Test
++  public void omittedSeedIsColdAndSuccessfulFallbackIsConcurrentAndMemoized()
++      throws Exception {
++    AtomicInteger calls = new AtomicInteger();
++    final ImmutableSeedableLazyModel value = builder(7, calls).build();
++    check(calls.get()).is(0);
++
++    int workers = 16;
++    ExecutorService executor = Executors.newFixedThreadPool(workers);
++    CountDownLatch ready = new CountDownLatch(workers);
++    CountDownLatch start = new CountDownLatch(1);
++    Future<?>[] futures = new Future<?>[workers];
++    int fallback;
++    try {
++      for (int i = 0; i < workers; i++) {
++        futures[i] = executor.submit(() -> {
++          ready.countDown();
++          start.await();
++          return value.scalar();
++        });
++      }
++      assertTrue(ready.await(30, TimeUnit.SECONDS));
++      start.countDown();
++      fallback = (Integer) futures[0].get(30, TimeUnit.SECONDS);
++      for (Future<?> future : futures) {
++        check((Integer) future.get(30, TimeUnit.SECONDS)).is(fallback);
++      }
++    } finally {
++      executor.shutdownNow();
++    }
++
++    check(value.scalar()).is(fallback);
++    check(calls.get()).is(1);
++  }
++
++  @Test
++  public void specializedOptionalInitializerRunsOnceAndMemoizes() {
++    AtomicInteger calls = new AtomicInteger();
++    ImmutableSeedableLazySpecializedOptionalModel value =
++        ImmutableSeedableLazySpecializedOptionalModel.builder().calls(calls).build();
++    check(calls.get()).is(0);
++
++    OptionalInt fallback = value.number();
++    assertTrue(fallback.isPresent());
++    check(calls.get()).is(1);
++    check(value.number()).is(fallback);
++    check(calls.get()).is(1);
++  }
++
++  @Test
++  public void falseyNullableAndEmptySeedsBypassEveryFallbackAndClearRestoresCold()
++      throws Exception {
++    AtomicInteger scalarCalls = new AtomicInteger();
++    AtomicInteger checkedCalls = new AtomicInteger();
++    AtomicInteger errorCalls = new AtomicInteger();
++    AtomicInteger otherCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel.Builder source = builder(
++        1, scalarCalls, checkedCalls, errorCalls, otherCalls)
++        .scalar(0)
++        .enabled(false)
++        .nullable(null)
++        .optional(Optional.empty())
++        .addAllTags(Collections.emptyList())
++        .putAllIndex(Collections.emptyMap())
++        .nullableTags((Iterable<String>) null)
++        .nullableIndex((Map<String, Integer>) null)
++        .numbers()
++        .checked("seeded-checked")
++        .errorProne("seeded-error");
++
++    SeedableLazyModel seeded = source.build();
++    check(seeded.scalar()).is(0);
++    assertFalse(seeded.enabled());
++    check(seeded.nullable()).isNull();
++    check(seeded.optional()).is(Optional.empty());
++    check(seeded.tags()).isEmpty();
++    check(seeded.index()).is(Collections.emptyMap());
++    check(seeded.nullableTags()).isNull();
++    check(seeded.nullableIndex()).isNull();
++    check(seeded.numbers()).isEmpty();
++    check(seeded.checked()).is("seeded-checked");
++    check(seeded.errorProne()).is("seeded-error");
++    check(scalarCalls.get()).is(0);
++    check(checkedCalls.get()).is(0);
++    check(errorCalls.get()).is(0);
++    check(otherCalls.get()).is(0);
++
++    AtomicInteger directSetterCalls = new AtomicInteger();
++    SeedableLazyModel directContainerSeeds = builder(
++        1, new AtomicInteger(), new AtomicInteger(), new AtomicInteger(), directSetterCalls)
++        .tags(Collections.emptyList())
++        .index(Collections.emptyMap())
++        .build();
++    check(directContainerSeeds.tags()).isEmpty();
++    check(directContainerSeeds.index()).is(Collections.emptyMap());
++    check(directSetterCalls.get()).is(0);
++
++    SeedableLazyModel singleMutations = builder(
++        1, scalarCalls, checkedCalls, errorCalls, otherCalls)
++        .addTags("one")
++        .putIndex("one", 1)
++        .build();
++    check(singleMutations.tags()).is(Arrays.asList("one"));
++    check(singleMutations.index()).is(Collections.singletonMap("one", 1));
++    check(otherCalls.get()).is(0);
++
++    ImmutableSeedableLazyModel cold = source.clear()
++        .input(2)
++        .scalarCalls(scalarCalls)
++        .checkedCalls(checkedCalls)
++        .errorCalls(errorCalls)
++        .otherCalls(otherCalls)
++        .build();
++    check(scalarCalls.get()).is(0);
++    int coldFallback = cold.scalar();
++    check(scalarCalls.get()).is(1);
++    check(cold.scalar()).is(coldFallback);
++    check(scalarCalls.get()).is(1);
++  }
++
++  @Test
++  public void checkedExceptionAndErrorAreRetriedWithoutMemoizingFailures() throws Exception {
++    assertArrayEquals(
++        SeedableLazyModel.class
++            .getDeclaredMethod("checked")
++            .getExceptionTypes(),
++        ImmutableSeedableLazyModel.class
++            .getDeclaredMethod("checked")
++            .getExceptionTypes());
++    assertArrayEquals(
++        SeedableLazyModifiableModel.class
++            .getDeclaredMethod("checked")
++            .getExceptionTypes(),
++        ModifiableSeedableLazyModifiableModel.class
++            .getDeclaredMethod("checked")
++            .getExceptionTypes());
++
++    AtomicInteger checkedCalls = new AtomicInteger();
++    AtomicInteger errorCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel value = builder(
++        1, new AtomicInteger(), checkedCalls, errorCalls, new AtomicInteger()).build();
++
++    assertThrows(Exception.class, value::checked);
++    assertThrows(Exception.class, value::checked);
++    check(checkedCalls.get()).is(2);
++
++    assertThrows(Error.class, value::errorProne);
++    assertThrows(Error.class, value::errorProne);
++    check(errorCalls.get()).is(2);
++  }
++
++  @Test
++  public void withersPreserveExplicitOriginAndResetOnlyComputedFallbacks() {
++    AtomicInteger scalarCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel cold = builder(2, scalarCalls).build();
++    ImmutableSeedableLazyModel coldCopy = cold.withInput(3);
++    check(scalarCalls.get()).is(0);
++    int coldFallback = coldCopy.scalar();
++    check(scalarCalls.get()).is(1);
++    check(coldCopy.scalar()).is(coldFallback);
++    check(scalarCalls.get()).is(1);
++
++    ImmutableSeedableLazyModel computed = builder(4, scalarCalls).build();
++    int computedFallback = computed.scalar();
++    check(computed.withInput(4)).same(computed);
++    ImmutableSeedableLazyModel recomputed = computed.withInput(5);
++    check(scalarCalls.get()).is(2);
++    recomputed.scalar();
++    check(scalarCalls.get()).is(3);
++
++    ImmutableSeedableLazyModel explicit = computed.withScalar(computedFallback);
++    check(explicit).not().same(computed);
++    check(explicit.withScalar(computedFallback)).same(explicit);
++    check(explicit.withInput(6).scalar()).is(computedFallback);
++    check(scalarCalls.get()).is(3);
++
++    AtomicInteger otherCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel collectionComputed = builder(
++        1, new AtomicInteger(), new AtomicInteger(), new AtomicInteger(), otherCalls).build();
++    List<String> collectionFallback = collectionComputed.tags();
++    ImmutableSeedableLazyModel collectionExplicit =
++        collectionComputed.withTags(collectionFallback);
++    check(collectionExplicit.withInput(9).tags()).is(collectionFallback);
++    check(otherCalls.get()).is(1);
++
++    AtomicInteger arrayCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel arrayComputed = builder(
++        2, new AtomicInteger(), new AtomicInteger(), new AtomicInteger(), arrayCalls).build();
++    int[] arrayFallback = arrayComputed.numbers();
++    check(arrayCalls.get()).is(1);
++    ImmutableSeedableLazyModel arrayExplicit = arrayComputed.withNumbers(arrayFallback);
++    check(arrayExplicit).not().same(arrayComputed);
++    ImmutableSeedableLazyModel arrayCopy = arrayExplicit.withInput(3);
++    assertArrayEquals(arrayFallback, arrayCopy.numbers());
++    check(arrayCalls.get()).is(1);
++
++    ImmutableSeedableLazyModel nullableExplicit = collectionComputed
++        .withNullableTags((Iterable<String>) null)
++        .withNullableIndex((Map<String, Integer>) null);
++    check(nullableExplicit.withInput(9).nullableTags()).isNull();
++    check(nullableExplicit.withInput(9).nullableIndex()).isNull();
++    check(otherCalls.get()).is(1);
++  }
++
++  @Test
++  public void generatedBuildersTransferOnlyKnownExplicitOrigin() {
++    AtomicInteger calls = new AtomicInteger();
++    ImmutableSeedableLazyModel cold = builder(1, calls).build();
++
++    ImmutableSeedableLazyModel targetSeedSurvives = builder(2, calls)
++        .scalar(99)
++        .from(cold)
++        .build();
++    check(targetSeedSurvives.scalar()).is(99);
++    check(calls.get()).is(0);
++
++    ImmutableSeedableLazyModel coldRoundTrip = cold.toBuilder().input(3).build();
++    check(calls.get()).is(0);
++    int coldFallback = coldRoundTrip.scalar();
++    check(calls.get()).is(1);
++    check(coldRoundTrip.scalar()).is(coldFallback);
++    check(calls.get()).is(1);
++
++    ImmutableSeedableLazyModel computed = builder(4, calls).build();
++    computed.scalar();
++    ImmutableSeedableLazyModel computedRoundTrip = computed.toBuilder().input(5).build();
++    check(calls.get()).is(2);
++    int recomputedFallback = computedRoundTrip.scalar();
++    check(calls.get()).is(3);
++    check(computedRoundTrip.scalar()).is(recomputedFallback);
++    check(calls.get()).is(3);
++
++    ImmutableSeedableLazyModel explicit = computed.withScalar(77).withTags("a", "b");
++    ImmutableSeedableLazyModel copied = builder(6, calls).from(explicit).build();
++    check(copied.scalar()).is(77);
++    check(copied.tags()).is(Arrays.asList("a", "b"));
++    check(explicit.toBuilder().input(7).build().scalar()).is(77);
++    check(calls.get()).is(3);
++
++    AtomicInteger otherCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel nullableContainers = builder(
++        8, new AtomicInteger(), new AtomicInteger(), new AtomicInteger(), otherCalls)
++        .optional(Optional.empty())
++        .nullableTags((Iterable<String>) null)
++        .nullableIndex((Map<String, Integer>) null)
++        .build();
++    ImmutableSeedableLazyModel nullableFrom = builder(
++        9, new AtomicInteger(), new AtomicInteger(), new AtomicInteger(), otherCalls)
++        .from(nullableContainers)
++        .build();
++    ImmutableSeedableLazyModel nullableToBuilder =
++        nullableContainers.toBuilder().input(10).build();
++    check(nullableFrom.optional()).is(Optional.empty());
++    check(nullableToBuilder.optional()).is(Optional.empty());
++    check(nullableFrom.nullableTags()).isNull();
++    check(nullableFrom.nullableIndex()).isNull();
++    check(nullableToBuilder.nullableTags()).isNull();
++    check(nullableToBuilder.nullableIndex()).isNull();
++    check(otherCalls.get()).is(0);
++  }
++
++  @Test
++  public void externalFromAndCopyOfNeverProbeHybridGetter() {
++    AtomicInteger reads = new AtomicInteger();
++    SeedableLazyExternalModel external = new SeedableLazyExternalModel() {
++      @Override int input() {
++        return 8;
++      }
++
++      @Override AtomicInteger hybridReads() {
++        return reads;
++      }
++
++      @Override String expensive() {
++        reads.incrementAndGet();
++        throw new AssertionError("hybrid getter was forced");
++      }
++    };
++
++    ImmutableSeedableLazyExternalModel from =
++        ImmutableSeedableLazyExternalModel.builder().from(external).build();
++    ImmutableSeedableLazyExternalModel copy = ImmutableSeedableLazyExternalModel.copyOf(external);
++    check(reads.get()).is(0);
++    assertThrows(Exception.class, from::expensive);
++    assertThrows(Exception.class, copy::expensive);
++    check(reads.get()).is(2);
++
++    AtomicInteger noFromReads = new AtomicInteger();
++    SeedableLazyNoFromModel noFromExternal = new SeedableLazyNoFromModel() {
++      @Override int input() {
++        return 9;
++      }
++
++      @Override AtomicInteger hybridReads() {
++        return noFromReads;
++      }
++
++      @Override String expensive() {
++        noFromReads.incrementAndGet();
++        return "external";
++      }
++    };
++    ImmutableSeedableLazyNoFromModel noFromCopy =
++        ImmutableSeedableLazyNoFromModel.copyOf(noFromExternal);
++    check(noFromReads.get()).is(0);
++    noFromCopy.expensive();
++    check(noFromReads.get()).is(1);
++  }
++
++  @Test
++  public void copyOfWithDisabledFromDistinguishesGeneratedModifiableOrigin() {
++    AtomicInteger seededReads = new AtomicInteger();
++    ModifiableSeedableLazyNoFromModel seeded =
++        ModifiableSeedableLazyNoFromModel.create()
++            .setInput(13)
++            .setHybridReads(seededReads)
++            .setExpensive("seed");
++
++    ImmutableSeedableLazyNoFromModel seededCopy =
++        ImmutableSeedableLazyNoFromModel.copyOf(seeded);
++    check(seededReads.get()).is(0);
++    check(seededCopy.expensive()).is("seed");
++    check(seededCopy.withInput(14).expensive()).is("seed");
++    check(seededReads.get()).is(0);
++
++    AtomicInteger coldReads = new AtomicInteger();
++    ModifiableSeedableLazyNoFromModel cold =
++        ModifiableSeedableLazyNoFromModel.create()
++            .setInput(15)
++            .setHybridReads(coldReads);
++    ImmutableSeedableLazyNoFromModel coldCopy =
++        ImmutableSeedableLazyNoFromModel.copyOf(cold);
++    check(coldReads.get()).is(0);
++    check(coldCopy.expensive()).is("fallback-15");
++    check(coldReads.get()).is(1);
++  }
++
++  @Test
++  public void identityRenderingAndJavaSerializationStayCold() throws Exception {
++    AtomicInteger calls = new AtomicInteger();
++    AtomicInteger checkedCalls = new AtomicInteger();
++    AtomicInteger errorCalls = new AtomicInteger();
++    AtomicInteger otherCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel left =
++        builder(1, calls, checkedCalls, errorCalls, otherCalls).build();
++    ImmutableSeedableLazyModel right =
++        builder(1, calls, checkedCalls, errorCalls, otherCalls).build();
++    ImmutableSeedableLazyModel seededIdentity =
++        builder(1, calls, checkedCalls, errorCalls, otherCalls).scalar(99).build();
++
++    check(left).is(right);
++    check(left).is(seededIdentity);
++    check(left.hashCode()).is(seededIdentity.hashCode());
++    check(left.toString()).is(seededIdentity.toString());
++    check(calls.get()).is(0);
++
++    ImmutableSeedableLazyModel restored = roundTrip(left);
++    check(calls.get()).is(0);
++    check(restored.scalarCalls().get()).is(0);
++    int restoredFallback = restored.scalar();
++    check(restored.scalarCalls().get()).is(1);
++    check(restored.scalar()).is(restoredFallback);
++    check(restored.scalarCalls().get()).is(1);
++
++    ImmutableSeedableLazyModel explicit = builder(1, new AtomicInteger()).scalar(55).build();
++    ImmutableSeedableLazyModel explicitRestored = roundTrip(explicit);
++    check(explicitRestored.scalarCalls().get()).is(0);
++    explicitRestored.scalar();
++    check(explicitRestored.scalarCalls().get()).is(1);
++
++    AtomicInteger computedCalls = new AtomicInteger();
++    ImmutableSeedableLazyModel computed = builder(1, computedCalls).build();
++    computed.scalar();
++    ImmutableSeedableLazyModel computedRestored = roundTrip(computed);
++    check(computedRestored.scalarCalls().get()).is(1);
++    computedRestored.scalar();
++    check(computedRestored.scalarCalls().get()).is(2);
++
++    AtomicInteger structuralColdCalls = new AtomicInteger();
++    ImmutableSeedableLazyStructuralModel structuralCold =
++        ImmutableSeedableLazyStructuralModel.builder().calls(structuralColdCalls).build();
++    ImmutableSeedableLazyStructuralModel structuralColdRestored = roundTrip(structuralCold);
++    check(structuralColdCalls.get()).is(0);
++    check(structuralColdRestored.calls().get()).is(0);
++    int structuralColdFallback = structuralColdRestored.value();
++    check(structuralColdRestored.calls().get()).is(1);
++    check(structuralColdRestored.value()).is(structuralColdFallback);
++    check(structuralColdRestored.calls().get()).is(1);
++
++    AtomicInteger structuralSeedCalls = new AtomicInteger();
++    ImmutableSeedableLazyStructuralModel structuralSeed =
++        ImmutableSeedableLazyStructuralModel.builder().calls(structuralSeedCalls).value(44).build();
++    ImmutableSeedableLazyStructuralModel structuralSeedRestored = roundTrip(structuralSeed);
++    check(structuralSeedCalls.get()).is(0);
++    check(structuralSeedRestored.calls().get()).is(0);
++    structuralSeedRestored.value();
++    check(structuralSeedRestored.calls().get()).is(1);
++
++    AtomicInteger marshaledCalls = new AtomicInteger();
++    ImmutableSeedableLazyMarshaledModel marshaledCold =
++        ImmutableSeedableLazyMarshaledModel.builder()
++            .name("cold")
++            .calls(marshaledCalls)
++            .build();
++    assertFalse(Marshaling.toJson(marshaledCold).contains("value"));
++    check(marshaledCalls.get()).is(0);
++    ImmutableSeedableLazyMarshaledModel marshaledSeed =
++        ImmutableSeedableLazyMarshaledModel.builder()
++            .name("seed")
++            .calls(marshaledCalls)
++            .value(44)
++            .build();
++    assertFalse(Marshaling.toJson(marshaledSeed).contains("value"));
++    check(marshaledCalls.get()).is(0);
++  }
++
++  @Test
++  public void modifiableFallbackSeedsUnsetClearAndConversionsRespectOrigin() throws Exception {
++    AtomicInteger calls = new AtomicInteger();
++    AtomicInteger checkedCalls = new AtomicInteger();
++    ModifiableSeedableLazyModifiableModel value = ModifiableSeedableLazyModifiableModel.create()
++        .setInput(2)
++        .setScalarCalls(calls)
++        .setCheckedCalls(checkedCalls);
++
++    assertThrows(Exception.class, value::checked);
++    assertThrows(Exception.class, value::checked);
++    assertFalse(value.checkedIsSet());
++    check(checkedCalls.get()).is(2);
++
++    value.scalar();
++    value.scalar();
++    assertFalse(value.scalarIsSet());
++    check(calls.get()).is(2);
++    value.setScalar(0)
++        .setOptional(Optional.empty())
++        .addAllTags(Collections.emptyList())
++        .setNullableTags(null)
++        .setNullableIndex(null)
++        .setChecked("safe");
++    assertTrue(value.scalarIsSet());
++    assertTrue(value.optionalIsSet());
++    assertTrue(value.tagsIsSet());
++    assertTrue(value.nullableTagsIsSet());
++    assertTrue(value.nullableIndexIsSet());
++    assertTrue(value.checkedIsSet());
++    check(value.scalar()).is(0);
++    check(value.optional()).is(Optional.empty());
++    check(value.tags()).isEmpty();
++    check(value.nullableTags()).isNull();
++    check(value.nullableIndex()).isNull();
++    check(value.checked()).is("safe");
++    check(calls.get()).is(2);
++    check(checkedCalls.get()).is(2);
++
++    ImmutableSeedableLazyModifiableModel immutable = value.toImmutable();
++    check(immutable.scalar()).is(0);
++    check(immutable.optional()).is(Optional.empty());
++    check(immutable.tags()).isEmpty();
++    check(immutable.nullableTags()).isNull();
++    check(immutable.nullableIndex()).isNull();
++    check(immutable.checked()).is("safe");
++
++    value.unsetScalar()
++        .unsetTags()
++        .unsetNullableTags()
++        .unsetNullableIndex()
++        .unsetChecked();
++    assertFalse(value.scalarIsSet());
++    assertFalse(value.nullableTagsIsSet());
++    assertFalse(value.nullableIndexIsSet());
++    value.scalar();
++    value.nullableTags();
++    value.nullableIndex();
++    check(calls.get()).is(5);
++    assertThrows(Exception.class, value::checked);
++    check(checkedCalls.get()).is(3);
++    value.setScalar(7).from(ImmutableSeedableLazyModifiableModel.builder()
++        .input(3)
++        .scalarCalls(calls)
++        .checkedCalls(checkedCalls)
++        .build());
++    check(value.scalar()).is(7);
++
++    ModifiableSeedableLazyModifiableModel copied = ModifiableSeedableLazyModifiableModel.create()
++        .setInput(1)
++        .setScalarCalls(calls)
++        .setCheckedCalls(checkedCalls)
++        .from(immutable);
++    check(copied.scalar()).is(0);
++    check(copied.optional()).is(Optional.empty());
++    check(copied.tags()).isEmpty();
++    check(copied.nullableTags()).isNull();
++    check(copied.nullableIndex()).isNull();
++    check(copied.checked()).is("safe");
++
++    ImmutableSeedableLazyModifiableModel roundTrip =
++        ImmutableSeedableLazyModifiableModel.builder()
++            .input(4)
++            .scalarCalls(calls)
++            .checkedCalls(checkedCalls)
++            .from(copied)
++            .build();
++    check(roundTrip.scalar()).is(0);
++    check(roundTrip.optional()).is(Optional.empty());
++    check(roundTrip.nullableTags()).isNull();
++    check(roundTrip.nullableIndex()).isNull();
++    check(roundTrip.checked()).is("safe");
++
++    ImmutableSeedableLazyModifiableModel factoryCopy =
++        ImmutableSeedableLazyModifiableModel.copyOf(copied);
++    check(factoryCopy.scalar()).is(0);
++    check(factoryCopy.optional()).is(Optional.empty());
++    check(factoryCopy.nullableTags()).isNull();
++    check(factoryCopy.nullableIndex()).isNull();
++    check(factoryCopy.checked()).is("safe");
++
++    copied.clear()
++        .setInput(5)
++        .setScalarCalls(calls)
++        .setCheckedCalls(checkedCalls);
++    assertFalse(copied.scalarIsSet());
++    int callsBeforeClearFallback = calls.get();
++    copied.scalar();
++    check(calls.get()).is(callsBeforeClearFallback + 1);
++
++    AtomicInteger conversionCalls = new AtomicInteger();
++    AtomicInteger conversionCheckedCalls = new AtomicInteger();
++    ModifiableSeedableLazyModifiableModel unseeded =
++        ModifiableSeedableLazyModifiableModel.create()
++            .setInput(6)
++            .setScalarCalls(conversionCalls)
++            .setCheckedCalls(conversionCheckedCalls);
++    ImmutableSeedableLazyModifiableModel coldConversion = unseeded.toImmutable();
++    check(conversionCalls.get()).is(0);
++    coldConversion.scalar();
++    check(conversionCalls.get()).is(1);
++
++    ModifiableSeedableLazyModifiableModel mergeTarget =
++        ModifiableSeedableLazyModifiableModel.create()
++            .setInput(7)
++            .setScalarCalls(conversionCalls)
++            .setCheckedCalls(conversionCheckedCalls)
++            .setScalar(70)
++            .from(unseeded);
++    check(mergeTarget.scalar()).is(70);
++    check(conversionCalls.get()).is(1);
++    unseeded.setScalar(80);
++    mergeTarget.from(unseeded);
++    check(mergeTarget.scalar()).is(80);
++    check(conversionCalls.get()).is(1);
++  }
++
++  @Test
++  public void multipleSeedableLazyAttributesRemainIndependent() {
++    AtomicInteger firstCalls = new AtomicInteger();
++    AtomicInteger secondCalls = new AtomicInteger();
++    ImmutableSeedableLazyMultipleModel value = ImmutableSeedableLazyMultipleModel.builder()
++        .firstCalls(firstCalls)
++        .secondCalls(secondCalls)
++        .first(0)
++        .build();
++
++    check(value.first()).is(0);
++    check(firstCalls.get()).is(0);
++    check(secondCalls.get()).is(0);
++    int secondFallback = value.second();
++    check(value.second()).is(secondFallback);
++    check(secondCalls.get()).is(1);
++  }
++
++  @Test
++  public void specializedEmptyOptionalIsAnExplicitSeed() {
++    AtomicInteger calls = new AtomicInteger();
++    ImmutableSeedableLazySpecializedOptionalModel seeded =
++        ImmutableSeedableLazySpecializedOptionalModel.builder()
++            .calls(calls)
++            .number(OptionalInt.empty())
++            .build();
++    check(seeded.number()).is(OptionalInt.empty());
++    check(calls.get()).is(0);
++    check(seeded.withNumber(OptionalInt.empty())).same(seeded);
++  }
++
++  @Test
++  public void modifiableFromExternalLeavesHybridColdWithoutReadingIt() throws Exception {
++    AtomicInteger reads = new AtomicInteger();
++    SeedableLazyExternalModel external = new SeedableLazyExternalModel() {
++      @Override int input() { return 12; }
++      @Override AtomicInteger hybridReads() { return reads; }
++      @Override String expensive() {
++        reads.incrementAndGet();
++        throw new AssertionError("external hybrid getter was forced");
++      }
++    };
++
++    ModifiableSeedableLazyExternalModel copied =
++        ModifiableSeedableLazyExternalModel.create().from(external);
++    check(reads.get()).is(0);
++    assertFalse(copied.expensiveIsSet());
++    assertThrows(Exception.class, copied::expensive);
++    check(reads.get()).is(1);
++  }
++
++  @SuppressWarnings("unchecked")
++  private static <T> T roundTrip(T value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
++      output.writeObject(value);
++    }
++    try (ObjectInputStream input = new ObjectInputStream(
++        new ByteArrayInputStream(bytes.toByteArray()))) {
++      return (T) input.readObject();
++    }
++  }
++}

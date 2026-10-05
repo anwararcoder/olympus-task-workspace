@@ -1,0 +1,531 @@
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassWriter.java b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+index 0a6b7a9..666f4ac 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassWriter.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+@@ -44,12 +44,18 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
+ import org.jetbrains.java.decompiler.struct.gen.generics.GenericsChecker;
+ import org.jetbrains.java.decompiler.util.*;
+ import org.jetbrains.java.decompiler.util.collections.VBStyleCollection;
++import org.jetbrains.java.decompiler.util.token.ClassTextToken;
++import org.jetbrains.java.decompiler.util.token.FieldTextToken;
++import org.jetbrains.java.decompiler.util.token.MethodTextToken;
++import org.jetbrains.java.decompiler.util.token.TextToken;
+ 
+ import java.io.IOException;
+ import java.util.*;
+ import java.util.stream.Collectors;
+ 
+ public class ClassWriter implements StatementWriter {
++  private static final Key<ReferenceAwareSyntheticRetention> REFERENCE_AWARE_RETENTION = Key.of("REFERENCE_AWARE_SYNTHETIC_RETENTION");
++
+   private static final Set<String> ERROR_DUMP_STOP_POINTS = new HashSet<>(Arrays.asList(
+     "Fernflower.decompileContext",
+     "MethodProcessor.codeToJava",
+@@ -59,10 +65,12 @@ public class ClassWriter implements StatementWriter {
+   ));
+   private final PoolInterceptor interceptor;
+   private final IFabricJavadocProvider javadocProvider;
++  private ReferenceAwareSyntheticRetention referenceAwareRetention;
+ 
+   public ClassWriter() {
+     interceptor = DecompilerContext.getPoolInterceptor();
+     javadocProvider = (IFabricJavadocProvider) DecompilerContext.getProperty(IFabricJavadocProvider.PROPERTY_NAME);
++    referenceAwareRetention = DecompilerContext.getContextProperty(REFERENCE_AWARE_RETENTION);
+   }
+ 
+   public boolean endsWithSemicolon(Exprent expr) {
+@@ -370,13 +378,150 @@ public class ClassWriter implements StatementWriter {
+     importCollector.writeImports(buffer, true);
+   }
+ 
++  @Override
+   public void writeClass(ClassNode node, TextBuffer buffer, int indent) {
++    if (node.type == ClassNode.Type.ROOT && referenceAwareRetention == null &&
++      DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++      writeReferenceAwareClass(node, buffer, indent);
++    } else {
++      writeClassInternal(node, buffer, indent);
++    }
++  }
++
++  private void writeReferenceAwareClass(ClassNode node, TextBuffer buffer, int indent) {
++    ReferenceAwareSyntheticRetention previous = DecompilerContext.getContextProperty(REFERENCE_AWARE_RETENTION);
++    ReferenceAwareSyntheticRetention retention = new ReferenceAwareSyntheticRetention(node);
++    referenceAwareRetention = retention;
++    DecompilerContext.setProperty(REFERENCE_AWARE_RETENTION, retention);
++
++    try {
++      boolean changed;
++      do {
++        TextBuffer candidate = new TextBuffer(ClassesProcessor.AVERAGE_CLASS_SIZE);
++        changed = false;
++
++        resetAnnotationState(node);
++        writeClassInternal(node, candidate, indent);
++        candidate.reformat();
++        retention.findOmittedCandidates(candidate);
++
++        for (MemberKey member : referencesToOmittedMembers(candidate)) {
++          if (retention.retained.add(member)) {
++            changed = true;
++          }
++        }
++      } while (changed);
++
++      resetAnnotationState(node);
++      writeClassInternal(node, buffer, indent);
++    } finally {
++      referenceAwareRetention = previous;
++      DecompilerContext.setProperty(REFERENCE_AWARE_RETENTION, previous);
++    }
++  }
++
++  private Set<MemberKey> referencesToOmittedMembers(TextBuffer buffer) {
++    Set<MemberKey> references = new HashSet<>();
++
++    for (TextToken token : buffer.getTokens()) {
++      if (token.isDeclaration()) {
++        continue;
++      }
++
++      MemberKey member = memberFromToken(token);
++
++      if (member != null && referenceAwareRetention.isOmittedCandidate(member)) {
++        references.add(member);
++      }
++    }
++
++    return references;
++  }
++
++  private static MemberKey memberFromToken(TextToken token) {
++    if (token instanceof FieldTextToken field) {
++      return MemberKey.field(field.className, field.name, field.descriptor.descriptorString);
++    } else if (token instanceof MethodTextToken method) {
++      return MemberKey.method(method.className, method.name, method.descriptor.toString());
++    } else if (token instanceof ClassTextToken clazz) {
++      return MemberKey.clazz(clazz.qualifiedName);
++    }
++
++    return null;
++  }
++
++  private static void resetAnnotationState(ClassNode node) {
++    if (node.type != ClassNode.Type.LAMBDA) {
++      resetAnnotationState(node.classStruct);
++      for (StructField field : node.classStruct.getFields()) {
++        resetAnnotationState(field);
++      }
++      for (StructMethod method : node.classStruct.getMethods()) {
++        resetAnnotationState(method);
++      }
++      List<StructRecordComponent> components = node.classStruct.getRecordComponents();
++      if (components != null) {
++        for (StructRecordComponent component : components) {
++          resetAnnotationState(component);
++        }
++      }
++    }
++
++    for (ClassNode inner : node.nested) {
++      resetAnnotationState(inner);
++    }
++  }
++
++  private static void resetAnnotationState(StructMember member) {
++    for (Key<?> key : ANNOTATION_ATTRIBUTES) {
++      StructAnnotationAttribute attribute = member.getAttribute((Key<StructAnnotationAttribute>)key);
++      if (attribute != null) {
++        for (AnnotationExprent annotation : attribute.getAnnotations()) {
++          resetAnnotationState(annotation);
++        }
++      }
++    }
++
++    for (Key<?> key : TYPE_ANNOTATION_ATTRIBUTES) {
++      StructTypeAnnotationAttribute attribute = member.getAttribute((Key<StructTypeAnnotationAttribute>)key);
++      if (attribute != null) {
++        for (TypeAnnotation annotation : attribute.getAnnotations()) {
++          resetAnnotationState(annotation.getAnnotation());
++        }
++      }
++    }
++
++    for (Key<?> key : PARAMETER_ANNOTATION_ATTRIBUTES) {
++      StructAnnotationParameterAttribute attribute = member.getAttribute((Key<StructAnnotationParameterAttribute>)key);
++      if (attribute != null) {
++        for (List<AnnotationExprent> annotations : attribute.getParamAnnotations()) {
++          for (AnnotationExprent annotation : annotations) {
++            resetAnnotationState(annotation);
++          }
++        }
++      }
++    }
++  }
++
++  private static void resetAnnotationState(AnnotationExprent annotation) {
++    annotation.setDidWriteAlready(false);
++    for (Exprent exprent : annotation.getAllExprents(true)) {
++      if (exprent instanceof AnnotationExprent nested) {
++        nested.setDidWriteAlready(false);
++      }
++    }
++  }
++
++  private void writeClassInternal(ClassNode node, TextBuffer buffer, int indent) {
+     ClassNode outerNode = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+     DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
+ 
+     try {
+       // last minute processing
+-      boolean ok = invokeProcessors(buffer, node);
++      boolean ok = true;
++      if (referenceAwareRetention == null || referenceAwareRetention.processedNodes.add(node)) {
++        ok = invokeProcessors(buffer, node);
++      }
+ 
+       if (!ok) {
+         return;
+@@ -452,8 +597,10 @@ public class ClassWriter implements StatementWriter {
+         }
+ 
+         for (StructField fd : nonEnumFields) {
+-          boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-            wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
++          boolean hide = isFieldHidden(fd, wrapper);
++          if (hide && isRetained(MemberKey.field(cl.qualifiedName, fd.getName(), fd.getDescriptor()))) {
++            hide = false;
++          }
+           if (hide) continue;
+ 
+           if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
+@@ -479,13 +626,14 @@ public class ClassWriter implements StatementWriter {
+         StructMethod mt = methods.get(i);
+         boolean hide;
+         if (methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
+-          hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-                 mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
+-                 wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
++          hide = isMethodHidden(mt, wrapper);
+         } else {
+           hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
+                  (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
+         }
++        if (hide && isRetained(MemberKey.method(cl.qualifiedName, mt.getName(), mt.getDescriptor()))) {
++          hide = false;
++        }
+         if (hide) continue;
+ 
+         TextBuffer methodBuffer = new TextBuffer();
+@@ -505,19 +653,20 @@ public class ClassWriter implements StatementWriter {
+           StructClass innerCl = inner.classStruct;
+           boolean hide;
+           if (methodToDecompile.isEmpty()) {
+-            boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
+-            hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-                   wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
++            hide = isMemberClassHidden(inner, wrapper);
+           } else {
+             hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+           }
++          if (hide && isRetained(MemberKey.clazz(innerCl.qualifiedName))) {
++            hide = false;
++          }
+           if (hide) continue;
+ 
+           if (hasContent.get()) {
+             buffer.appendLineSeparator();
+           }
+           TextBuffer clsBuffer = new TextBuffer();
+-          writeClass(inner, clsBuffer, indent + 1);
++          writeClassInternal(inner, clsBuffer, indent + 1);
+           haveContent.run();
+           buffer.append(clsBuffer);
+         }
+@@ -540,6 +689,27 @@ public class ClassWriter implements StatementWriter {
+     DecompilerContext.getLogger().endWriteClass();
+   }
+ 
++  private boolean isRetained(MemberKey member) {
++    return referenceAwareRetention != null && referenceAwareRetention.retained.contains(member);
++  }
++
++  private static boolean isFieldHidden(StructField field, ClassWrapper wrapper) {
++    return field.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++      wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(field.getName(), field.getDescriptor()));
++  }
++
++  private static boolean isMethodHidden(StructMethod method, ClassWrapper wrapper) {
++    return method.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++      method.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
++      wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
++  }
++
++  private static boolean isMemberClassHidden(ClassNode inner, ClassWrapper wrapper) {
++    boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || inner.classStruct.isSynthetic();
++    return isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++      wrapper.getHiddenMembers().contains(inner.classStruct.qualifiedName);
++  }
++
+   public static void packageInfoToJava(StructClass cl, TextBuffer buffer) {
+     appendAnnotations(buffer, 0, cl, -1);
+ 
+@@ -1345,12 +1515,13 @@ public class ClassWriter implements StatementWriter {
+         if (root != null && methodWrapper.decompileError == null) { // check for existence
+           try {
+             // Avoid generating imports for ObjectMethods during root.toJava(...)
+-            if (RecordHelper.isHiddenRecordMethod(cl, mt, root)) {
++            if (RecordHelper.isHiddenRecordMethod(cl, mt, root) && !isRetained(MemberKey.method(cl.qualifiedName, mt.getName(), mt.getDescriptor()))) {
+               hideMethod = true;
+             } else {
+               TextBuffer code = root.toJava(indent + 1);
+               code.addBytecodeMapping(root.getDummyExit().bytecode);
+-              hideMethod = code.length() == 0 && (clInit || dInit || hideConstructor(node, init, throwsExceptions, paramCount, flags, mt));
++              hideMethod = code.length() == 0 && (clInit || dInit || hideConstructor(node, init, throwsExceptions, paramCount, flags, mt)) &&
++                !isRetained(MemberKey.method(cl.qualifiedName, mt.getName(), mt.getDescriptor()));
+               buffer.append(code, cl.qualifiedName, InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
+             }
+           }
+@@ -2051,4 +2222,85 @@ public class ClassWriter implements StatementWriter {
+       }
+     }
+   }
++
++  private final class ReferenceAwareSyntheticRetention {
++    private final Set<MemberKey> potential = new HashSet<>();
++    private final Set<MemberKey> candidates = new HashSet<>();
++    private final Set<MemberKey> retained = new HashSet<>();
++    private final Set<ClassNode> processedNodes = Collections.newSetFromMap(new IdentityHashMap<>());
++    private boolean candidatesDetermined;
++
++    private ReferenceAwareSyntheticRetention(ClassNode root) {
++      collectPotentialMembers(root);
++    }
++
++    private boolean isOmittedCandidate(MemberKey member) {
++      return candidates.contains(member) && !retained.contains(member);
++    }
++
++    private void findOmittedCandidates(TextBuffer buffer) {
++      if (candidatesDetermined) {
++        return;
++      }
++
++      Set<MemberKey> declared = new HashSet<>();
++      for (TextToken token : buffer.getTokens()) {
++        if (token.isDeclaration()) {
++          MemberKey member = memberFromToken(token);
++          if (member != null) {
++            declared.add(member);
++          }
++        }
++      }
++
++      candidates.addAll(potential);
++      candidates.removeAll(declared);
++      candidatesDetermined = true;
++    }
++
++    private void collectPotentialMembers(ClassNode node) {
++      // Lambda nodes reuse their enclosing class's StructClass and wrapper. They are
++      // representation nodes, not declarations in their own right.
++      if (node.type != ClassNode.Type.LAMBDA) {
++        for (StructField field : node.classStruct.getFields()) {
++          if (field.isSynthetic()) {
++            potential.add(MemberKey.field(node.classStruct.qualifiedName, field.getName(), field.getDescriptor()));
++          }
++        }
++
++        for (StructMethod method : node.classStruct.getMethods()) {
++          if (method.isSynthetic() || method.hasModifier(CodeConstants.ACC_BRIDGE)) {
++            potential.add(MemberKey.method(node.classStruct.qualifiedName, method.getName(), method.getDescriptor()));
++          }
++        }
++
++        for (ClassNode inner : node.nested) {
++          if (inner.type == ClassNode.Type.MEMBER &&
++            ((inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || inner.classStruct.isSynthetic())) {
++            potential.add(MemberKey.clazz(inner.classStruct.qualifiedName));
++          }
++        }
++      }
++
++      for (ClassNode inner : node.nested) {
++        collectPotentialMembers(inner);
++      }
++    }
++  }
++
++  private record MemberKey(Kind kind, String className, String name, String descriptor) {
++    private enum Kind { FIELD, METHOD, CLASS }
++
++    private static MemberKey field(String className, String name, String descriptor) {
++      return new MemberKey(Kind.FIELD, className, name, descriptor);
++    }
++
++    private static MemberKey method(String className, String name, String descriptor) {
++      return new MemberKey(Kind.METHOD, className, name, descriptor);
++    }
++
++    private static MemberKey clazz(String className) {
++      return new MemberKey(Kind.CLASS, className, null, null);
++    }
++  }
+ }
+diff --git a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+index 5353261..88430e8 100644
+--- a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
++++ b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+@@ -21,6 +21,12 @@ public interface IFernflowerPreferences {
+   @Type(DecompilerOption.Type.BOOLEAN)
+   String REMOVE_SYNTHETIC = "remove-synthetic";
+ 
++  @Name("Reference-Aware Synthetic Retention")
++  @Description("Retains removed synthetic and bridge members when the decompiled Java still refers to them.")
++  @ShortName("ras")
++  @Type(DecompilerOption.Type.BOOLEAN)
++  String REFERENCE_AWARE_SYNTHETIC_RETENTION = "reference-aware-synthetic-retention";
++
+   @Name("Decompile Inner Classes")
+   @Description("Process inner classes and add them to the decompiled output.")
+   @ShortName("din")
+@@ -425,6 +431,7 @@ public interface IFernflowerPreferences {
+ 
+     defaults.put(REMOVE_BRIDGE, "1");
+     defaults.put(REMOVE_SYNTHETIC, "1");
++    defaults.put(REFERENCE_AWARE_SYNTHETIC_RETENTION, "0");
+     defaults.put(DECOMPILE_INNER, "1");
+     defaults.put(DECOMPILE_CLASS_1_4, "1");
+     defaults.put(DECOMPILE_ASSERTIONS, "1");
+diff --git a/src/org/jetbrains/java/decompiler/modules/decompiler/exps/InvocationExprent.java b/src/org/jetbrains/java/decompiler/modules/decompiler/exps/InvocationExprent.java
+index af5be5f..a9eabec 100644
+--- a/src/org/jetbrains/java/decompiler/modules/decompiler/exps/InvocationExprent.java
++++ b/src/org/jetbrains/java/decompiler/modules/decompiler/exps/InvocationExprent.java
+@@ -898,6 +898,9 @@ public class InvocationExprent extends Exprent {
+ 
+       case INIT:
+         buf.addBytecodeMapping(bytecode);
++        if (DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++          buf.appendMethod("", false, classname, name, descriptor);
++        }
+         if (super_qualifier != null) {
+           buf.append("super(");
+         }
+diff --git a/src/org/jetbrains/java/decompiler/modules/decompiler/exps/NewExprent.java b/src/org/jetbrains/java/decompiler/modules/decompiler/exps/NewExprent.java
+index 09d135c..7b0adda 100644
+--- a/src/org/jetbrains/java/decompiler/modules/decompiler/exps/NewExprent.java
++++ b/src/org/jetbrains/java/decompiler/modules/decompiler/exps/NewExprent.java
+@@ -383,6 +383,7 @@ public class NewExprent extends Exprent {
+ 
+       if (!lambda && constructor != null) {
+         appendParameters(buf, constructor.getGenericArgs());
++        appendReferenceAwareConstructorToken(buf, constructor);
+         buf.append('(').append(constructor.appendParamList(indent));
+       }
+       else {
+@@ -459,6 +460,7 @@ public class NewExprent extends Exprent {
+         int start = enumConst ? 2 : 0;
+         if (!enumConst || start < constructor.getLstParameters().size()) {
+           appendParameters(buf, constructor.getGenericArgs());
++          appendReferenceAwareConstructorToken(buf, constructor);
+           buf.append('(').append(constructor.appendParamList(indent)).append(')');
+         }
+       }
+@@ -529,6 +531,12 @@ public class NewExprent extends Exprent {
+     return buf;
+   }
+ 
++  private static void appendReferenceAwareConstructorToken(TextBuffer buffer, InvocationExprent constructor) {
++    if (DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++      buffer.appendMethod("", false, constructor.getClassname(), constructor.getName(), constructor.getDescriptor());
++    }
++  }
++
+   // TODO move to InvocationExprent
+   public static boolean probablySyntheticParameter(String className) {
+     ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(className);
+diff --git a/test/org/jetbrains/java/decompiler/SingleClassesTest.java b/test/org/jetbrains/java/decompiler/SingleClassesTest.java
+index 2d27082..877ac01 100644
+--- a/test/org/jetbrains/java/decompiler/SingleClassesTest.java
++++ b/test/org/jetbrains/java/decompiler/SingleClassesTest.java
+@@ -13,6 +13,9 @@ import static org.jetbrains.java.decompiler.SingleClassesTestBase.TestDefinition
+ public class SingleClassesTest extends SingleClassesTestBase {
+   @Override
+   protected void registerAll() {
++    registerSet("Reference-aware synthetic retention", () -> register(JASM, "TestReferenceAwareSynthetic"),
++      IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION, "1"
++    );
+     registerSet("Default", this::registerDefault,
+       IFernflowerPreferences.BYTECODE_SOURCE_MAPPING, "1",
+       IFernflowerPreferences.DUMP_ORIGINAL_LINES, "1",
+diff --git a/testData/results/pkg/TestReferenceAwareSynthetic.dec b/testData/results/pkg/TestReferenceAwareSynthetic.dec
+new file mode 100644
+index 0000000..a29f015
+--- /dev/null
++++ b/testData/results/pkg/TestReferenceAwareSynthetic.dec
+@@ -0,0 +1,23 @@
++package pkg;
++
++public class TestReferenceAwareSynthetic {
++   // $VF: synthetic field
++   public static int hidden;
++
++   public static int use() {
++      return hidden;
++   }
++
++   // $VF: synthetic method
++   public static int hiddenMethod() {
++      return hidden;
++   }
++
++   public static int useMethod() {
++      return hiddenMethod();
++   }
++
++   public static String mention() {
++      return "hidden unused";
++   }
++}
+diff --git a/testData/src/jasm/TestReferenceAwareSynthetic.jasm b/testData/src/jasm/TestReferenceAwareSynthetic.jasm
+new file mode 100644
+index 0000000..9d585ae
+--- /dev/null
++++ b/testData/src/jasm/TestReferenceAwareSynthetic.jasm
+@@ -0,0 +1,36 @@
++package pkg;
++
++super public class TestReferenceAwareSynthetic
++  version 52:0
++{
++  public static synthetic Field hidden:"I";
++  public static synthetic Field unused:"I";
++
++  public static Method use:"()I"
++    stack 1 locals 0
++  {
++    getstatic Field hidden:"I";
++    ireturn;
++  }
++
++  public static synthetic Method hiddenMethod:"()I"
++    stack 1 locals 0
++  {
++    getstatic Field hidden:"I";
++    ireturn;
++  }
++
++  public static Method useMethod:"()I"
++    stack 1 locals 0
++  {
++    invokestatic Method hiddenMethod:"()I";
++    ireturn;
++  }
++
++  public static Method mention:"()Ljava/lang/String;"
++    stack 1 locals 0
++  {
++    ldc "hidden unused";
++    areturn;
++  }
++}

@@ -1,0 +1,389 @@
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassWriter.java b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+index 0a6b7a9..c516362 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassWriter.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+@@ -44,6 +44,10 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
+ import org.jetbrains.java.decompiler.struct.gen.generics.GenericsChecker;
+ import org.jetbrains.java.decompiler.util.*;
+ import org.jetbrains.java.decompiler.util.collections.VBStyleCollection;
++import org.jetbrains.java.decompiler.util.token.ClassTextToken;
++import org.jetbrains.java.decompiler.util.token.FieldTextToken;
++import org.jetbrains.java.decompiler.util.token.MethodTextToken;
++import org.jetbrains.java.decompiler.util.token.TextToken;
+ 
+ import java.io.IOException;
+ import java.util.*;
+@@ -57,9 +61,18 @@ public class ClassWriter implements StatementWriter {
+     "ClassWriter.methodLambdaToJava",
+     "ClassWriter.classLambdaToJava"
+   ));
++  private static final Key<ReferenceAwareRetentionState> REFERENCE_AWARE_RETENTION_STATE = Key.of("REFERENCE_AWARE_RETENTION_STATE");
+   private final PoolInterceptor interceptor;
+   private final IFabricJavadocProvider javadocProvider;
+ 
++  private static final class ReferenceAwareRetentionState {
++    private final Set<String> candidateMembers = new HashSet<>();
++    private final Map<String, String> candidateOwners = new HashMap<>();
++    private final Set<String> retainedMembers = new HashSet<>();
++    private final Set<ClassNode> processedClasses = Collections.newSetFromMap(new IdentityHashMap<>());
++    private int renderPass;
++  }
++
+   public ClassWriter() {
+     interceptor = DecompilerContext.getPoolInterceptor();
+     javadocProvider = (IFabricJavadocProvider) DecompilerContext.getProperty(IFabricJavadocProvider.PROPERTY_NAME);
+@@ -226,8 +239,7 @@ public class ClassWriter implements StatementWriter {
+           RootStatement root = wrapper.getMethodWrapper(mt.getName(), mt.getDescriptor()).root;
+           if (DecompilerContext.getOption(IFernflowerPreferences.MARK_CORRESPONDING_SYNTHETICS)) {
+             buffer.append("/* ")
+-              .appendMethod(node.lambdaInformation.content_method_name,
+-                true, node.lambdaInformation.content_class_name, node.lambdaInformation.content_method_name, node.lambdaInformation.content_method_descriptor)
++              .append(node.lambdaInformation.content_method_name)
+               .append(" */ ");
+           }
+           // Array constructor lambda
+@@ -370,13 +382,238 @@ public class ClassWriter implements StatementWriter {
+     importCollector.writeImports(buffer, true);
+   }
+ 
++  /**
++   * Writes a class while retaining generated declarations that are referenced by the Java emitted for the
++   * complete source file. The first pass deliberately uses the normal omission rules. Subsequent passes only
++   * add declarations, so code in an omitted generated member cannot make another member reachable.
++   */
++  public void writeClassWithReferenceAwareRetention(ClassNode node, TextBuffer buffer, int indent) {
++    ReferenceAwareRetentionState state = new ReferenceAwareRetentionState();
++    collectGeneratedMembers(node, state.candidateMembers, state.candidateOwners);
++    DecompilerContext.setProperty(REFERENCE_AWARE_RETENTION_STATE, state);
++
++    try {
++      TextBuffer lastPass = null;
++
++      while (true) {
++        TextBuffer pass = new TextBuffer(ClassesProcessor.AVERAGE_CLASS_SIZE);
++        writeClass(node, pass, indent);
++        state.renderPass++;
++
++        lastPass = pass;
++        Set<String> newlyReferenced = findReferencedGeneratedMembers(pass, state.candidateMembers, state.candidateOwners);
++        boolean changed = state.retainedMembers.addAll(newlyReferenced);
++
++        if (!changed) {
++          break;
++        }
++
++      }
++
++      // The regular class-writing pipeline reformats this buffer once after the writer returns.
++      buffer.append(lastPass);
++    }
++    finally {
++      DecompilerContext.setProperty(REFERENCE_AWARE_RETENTION_STATE, null);
++    }
++  }
++
++  private static void collectGeneratedMembers(ClassNode node, Set<String> candidates, Map<String, String> owners) {
++    if (node.type != ClassNode.Type.LAMBDA) {
++      StructClass cl = node.classStruct;
++
++      if (node.type == ClassNode.Type.MEMBER && isSyntheticClass(node)) {
++        candidates.add(classKey(cl.qualifiedName));
++      }
++
++      for (StructField fd : cl.getFields()) {
++        if (fd.isSynthetic()) {
++          String key = fieldKey(cl.qualifiedName, fd.getName(), fd.getDescriptor());
++          candidates.add(key);
++          owners.put(key, classKey(cl.qualifiedName));
++        }
++      }
++
++      for (StructMethod mt : cl.getMethods()) {
++        if (mt.isSynthetic() || mt.hasModifier(CodeConstants.ACC_BRIDGE)) {
++          String key = methodKey(cl.qualifiedName, mt.getName(), mt.getDescriptor());
++          candidates.add(key);
++          owners.put(key, classKey(cl.qualifiedName));
++        }
++      }
++    }
++
++    for (ClassNode child : node.nested) {
++      collectGeneratedMembers(child, candidates, owners);
++    }
++  }
++
++  private static Set<String> findReferencedGeneratedMembers(TextBuffer buffer, Set<String> candidates, Map<String, String> owners) {
++    String content = buffer.convertToStringAndAllowDataDiscard();
++    boolean[] code = codePositions(content);
++    Set<String> referenced = new HashSet<>();
++
++    for (TextToken token : buffer.getTokens()) {
++      if (token.isDeclaration() || !isCode(token, code)) {
++        continue;
++      }
++
++      String key = null;
++      if (token instanceof FieldTextToken field) {
++        key = fieldKey(field.className, field.name, field.descriptor.descriptorString);
++      }
++      else if (token instanceof MethodTextToken method) {
++        key = methodKey(method.className, method.name, method.descriptor.toString());
++      }
++      else if (token instanceof ClassTextToken clazz) {
++        key = classKey(clazz.qualifiedName);
++      }
++
++      if (key != null && candidates.contains(key)) {
++        referenced.add(key);
++        String owner = owners.get(key);
++        if (owner != null && candidates.contains(owner)) {
++          referenced.add(owner);
++        }
++      }
++    }
++
++    return referenced;
++  }
++
++  private static boolean isCode(TextToken token, boolean[] code) {
++    int start = Math.max(0, token.getStart());
++    int end = Math.min(code.length, start + token.getLength());
++    if (start >= end) {
++      return false;
++    }
++
++    for (int i = start; i < end; i++) {
++      if (!code[i]) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  /**
++   * Text tokens are normally emitted only for Java syntax, but a few diagnostic forms deliberately put a token
++   * inside a comment or a literal. Keep those forms from becoming references for retention purposes.
++   */
++  private static boolean[] codePositions(String text) {
++    boolean[] code = new boolean[text.length()];
++    Arrays.fill(code, true);
++
++    final int normal = 0;
++    final int lineComment = 1;
++    final int blockComment = 2;
++    final int string = 3;
++    final int character = 4;
++    final int textBlock = 5;
++    int state = normal;
++
++    for (int i = 0; i < text.length(); i++) {
++      if (state == normal) {
++        if (text.charAt(i) == '/' && i + 1 < text.length() && text.charAt(i + 1) == '/') {
++          code[i] = false;
++          code[++i] = false;
++          state = lineComment;
++        }
++        else if (text.charAt(i) == '/' && i + 1 < text.length() && text.charAt(i + 1) == '*') {
++          code[i] = false;
++          code[++i] = false;
++          state = blockComment;
++        }
++        else if (text.charAt(i) == '"') {
++          if (i + 2 < text.length() && text.charAt(i + 1) == '"' && text.charAt(i + 2) == '"') {
++            code[i] = false;
++            code[++i] = false;
++            code[++i] = false;
++            state = textBlock;
++          }
++          else {
++            code[i] = false;
++            state = string;
++          }
++        }
++        else if (text.charAt(i) == '\'') {
++          code[i] = false;
++          state = character;
++        }
++      }
++      else if (state == lineComment) {
++        code[i] = false;
++        if (text.charAt(i) == '\n' || text.charAt(i) == '\r') {
++          state = normal;
++        }
++      }
++      else if (state == blockComment) {
++        code[i] = false;
++        if (text.charAt(i) == '*' && i + 1 < text.length() && text.charAt(i + 1) == '/') {
++          code[++i] = false;
++          state = normal;
++        }
++      }
++      else if (state == string || state == character) {
++        code[i] = false;
++        if (text.charAt(i) == '\\' && i + 1 < text.length()) {
++          code[++i] = false;
++        }
++        else if ((state == string && text.charAt(i) == '"') || (state == character && text.charAt(i) == '\'')) {
++          state = normal;
++        }
++      }
++      else {
++        code[i] = false;
++        if (text.charAt(i) == '"' && i + 2 < text.length() && text.charAt(i + 1) == '"' && text.charAt(i + 2) == '"') {
++          code[++i] = false;
++          code[++i] = false;
++          state = normal;
++        }
++        else if (text.charAt(i) == '\\' && i + 1 < text.length()) {
++          code[++i] = false;
++        }
++      }
++    }
++
++    return code;
++  }
++
++  private static boolean isSyntheticClass(ClassNode node) {
++    return (node.access & CodeConstants.ACC_SYNTHETIC) != 0 || node.classStruct.isSynthetic();
++  }
++
++  private static String classKey(String className) {
++    return "C " + className;
++  }
++
++  private static String fieldKey(String className, String name, String descriptor) {
++    return "F " + className + " " + name + " " + descriptor;
++  }
++
++  private static String methodKey(String className, String name, String descriptor) {
++    return "M " + className + " " + name + " " + descriptor;
++  }
++
++  private static boolean isReferenceAwareRetained(String key) {
++    ReferenceAwareRetentionState state = DecompilerContext.getContextProperty(REFERENCE_AWARE_RETENTION_STATE);
++    return state != null && state.retainedMembers.contains(key);
++  }
++
+   public void writeClass(ClassNode node, TextBuffer buffer, int indent) {
+     ClassNode outerNode = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+     DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
+ 
+     try {
+       // last minute processing
+-      boolean ok = invokeProcessors(buffer, node);
++      ReferenceAwareRetentionState retentionState = DecompilerContext.getContextProperty(REFERENCE_AWARE_RETENTION_STATE);
++      boolean ok;
++      if (retentionState == null || retentionState.renderPass == 0 || retentionState.processedClasses.add(node)) {
++        ok = invokeProcessors(buffer, node);
++      }
++      else {
++        ok = true;
++      }
+ 
+       if (!ok) {
+         return;
+@@ -452,8 +689,12 @@ public class ClassWriter implements StatementWriter {
+         }
+ 
+         for (StructField fd : nonEnumFields) {
++          String fieldKey = fieldKey(cl.qualifiedName, fd.getName(), fd.getDescriptor());
+           boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+             wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
++          if (hide && isReferenceAwareRetained(fieldKey)) {
++            hide = false;
++          }
+           if (hide) continue;
+ 
+           if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
+@@ -482,6 +723,9 @@ public class ClassWriter implements StatementWriter {
+           hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                  mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
+                  wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
++          if (hide && isReferenceAwareRetained(methodKey(cl.qualifiedName, mt.getName(), mt.getDescriptor()))) {
++            hide = false;
++          }
+         } else {
+           hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
+                  (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
+@@ -505,9 +749,12 @@ public class ClassWriter implements StatementWriter {
+           StructClass innerCl = inner.classStruct;
+           boolean hide;
+           if (methodToDecompile.isEmpty()) {
+-            boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
++            boolean isSynthetic = isSyntheticClass(inner);
+             hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                    wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
++            if (hide && isReferenceAwareRetained(classKey(innerCl.qualifiedName))) {
++              hide = false;
++            }
+           } else {
+             hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+           }
+@@ -848,7 +1095,8 @@ public class ClassWriter implements StatementWriter {
+   }
+ 
+   public void writeField(ClassWrapper wrapper, StructClass cl, StructField fd, TextBuffer buffer, int indent) {
+-    if (RecordHelper.isHiddenRecordField(cl.getRecordComponents(), fd)) {
++    if (RecordHelper.isHiddenRecordField(cl.getRecordComponents(), fd) &&
++        !isReferenceAwareRetained(fieldKey(cl.qualifiedName, fd.getName(), fd.getDescriptor()))) {
+       return;
+     }
+ 
+@@ -1345,12 +1593,13 @@ public class ClassWriter implements StatementWriter {
+         if (root != null && methodWrapper.decompileError == null) { // check for existence
+           try {
+             // Avoid generating imports for ObjectMethods during root.toJava(...)
+-            if (RecordHelper.isHiddenRecordMethod(cl, mt, root)) {
++            boolean retained = isReferenceAwareRetained(methodKey(cl.qualifiedName, mt.getName(), mt.getDescriptor()));
++            if (RecordHelper.isHiddenRecordMethod(cl, mt, root) && !retained) {
+               hideMethod = true;
+             } else {
+               TextBuffer code = root.toJava(indent + 1);
+               code.addBytecodeMapping(root.getDummyExit().bytecode);
+-              hideMethod = code.length() == 0 && (clInit || dInit || hideConstructor(node, init, throwsExceptions, paramCount, flags, mt));
++              hideMethod = !retained && code.length() == 0 && (clInit || dInit || hideConstructor(node, init, throwsExceptions, paramCount, flags, mt));
+               buffer.append(code, cl.qualifiedName, InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
+             }
+           }
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java b/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java
+index 485b8db..532c213 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java
+@@ -518,7 +518,12 @@ public class ClassesProcessor implements CodeConstants {
+         DecompilerContext.getCurrentContext().structContext.getPluginContext()
+           .runClassPasses(ClassPassLocation.BEFORE_WRITING, root);
+ 
+-        writer.writeClass(root, classBuffer, 0);
++        if (writer instanceof ClassWriter classWriter &&
++            DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++          classWriter.writeClassWithReferenceAwareRetention(root, classBuffer, 0);
++        } else {
++          writer.writeClass(root, classBuffer, 0);
++        }
+         classBuffer.reformat();
+ 
+         classBuffer.getTracers().forEach((classAndMethod, tracer) -> {
+diff --git a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+index 5353261..6eb7e63 100644
+--- a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
++++ b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+@@ -21,6 +21,11 @@ public interface IFernflowerPreferences {
+   @Type(DecompilerOption.Type.BOOLEAN)
+   String REMOVE_SYNTHETIC = "remove-synthetic";
+ 
++  @Name("Reference-Aware Synthetic Retention")
++  @Description("Retains generated declarations referenced by emitted Java code.")
++  @Type(DecompilerOption.Type.BOOLEAN)
++  String REFERENCE_AWARE_SYNTHETIC_RETENTION = "reference-aware-synthetic-retention";
++
+   @Name("Decompile Inner Classes")
+   @Description("Process inner classes and add them to the decompiled output.")
+   @ShortName("din")
+@@ -425,6 +430,7 @@ public interface IFernflowerPreferences {
+ 
+     defaults.put(REMOVE_BRIDGE, "1");
+     defaults.put(REMOVE_SYNTHETIC, "1");
++    defaults.put(REFERENCE_AWARE_SYNTHETIC_RETENTION, "0");
+     defaults.put(DECOMPILE_INNER, "1");
+     defaults.put(DECOMPILE_CLASS_1_4, "1");
+     defaults.put(DECOMPILE_ASSERTIONS, "1");

@@ -1,0 +1,1846 @@
+diff --git a/NEXT_RELEASE_CHANGELOG.md b/NEXT_RELEASE_CHANGELOG.md
+index e0f4cd3..0176daf 100644
+--- a/NEXT_RELEASE_CHANGELOG.md
++++ b/NEXT_RELEASE_CHANGELOG.md
+@@ -1,5 +1,8 @@
+ ### Features
+ 
++* Add opt-in inheritance of property mappings from overridden mapper methods through
++  `@BeanMapping(inheritSuperMappings = true)`
++
+ ### Enhancements
+ 
+ ### Bugs
+@@ -7,4 +10,3 @@
+ ### Documentation
+ 
+ ### Build
+-
+diff --git a/core/src/main/java/org/mapstruct/BeanMapping.java b/core/src/main/java/org/mapstruct/BeanMapping.java
+index 309458f..19f17d7 100644
+--- a/core/src/main/java/org/mapstruct/BeanMapping.java
++++ b/core/src/main/java/org/mapstruct/BeanMapping.java
+@@ -154,6 +154,18 @@ NullValuePropertyMappingStrategy nullValuePropertyMappingStrategy()
+      */
+     boolean ignoreByDefault() default false;
+ 
++    /**
++     * Inherits {@link Mapping} declarations from overridden mapping methods in mapper supertypes.
++     * <p>
++     * Only property mappings are inherited. Other method-level mapping options declared on overridden methods are
++     * not inherited. Mappings declared on this method take precedence for the same target property.
++     *
++     * @return whether mappings declared on overridden mapping methods should be inherited
++     *
++     * @since 1.7.0
++     */
++    boolean inheritSuperMappings() default false;
++
+     /**
+      * Unmapped source properties to be ignored. This could be used when {@link ReportingPolicy#WARN}
+      * or {@link ReportingPolicy#ERROR} is used for {@link Mapper#unmappedSourcePolicy()} or
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java b/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java
+index c37b12e..936ebfb 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java
+@@ -65,6 +65,7 @@ public static class BuilderFromMapping {
+ 
+         private boolean isForwarded = false;
+         private Method templateMethod = null;
++        private Integer sourceParameterPosition = null;
+         private String sourceName;
+         private AnnotationMirror annotationMirror;
+         private AnnotationValue sourceAnnotationValue;
+@@ -81,6 +82,7 @@ public BuilderFromMapping mapping(MappingOptions mapping) {
+             if ( mapping.getInheritContext() != null ) {
+                 isForwarded = mapping.getInheritContext().isForwarded();
+                 templateMethod = mapping.getInheritContext().getTemplateMethod();
++                sourceParameterPosition = mapping.getInheritContext().getSourceParameterPosition();
+             }
+             return this;
+         }
+@@ -124,7 +126,13 @@ public SourceReference build() {
+ 
+             // start with an invalid source reference
+             SourceReference result = new SourceReference( null, new ArrayList<>(  ), false );
+-            if ( method.getSourceParameters().size() > 1 ) {
++            if ( sourceParameterPosition != null ) {
++                Parameter parameter = method.getParameters().get( sourceParameterPosition );
++                if ( method.getSourceParameters().contains( parameter ) ) {
++                    result = buildFromMultipleSourceParameters( segments, parameter );
++                }
++            }
++            else if ( method.getSourceParameters().size() > 1 ) {
+                 Parameter parameter = fetchMatchingParameterFromFirstSegment( segments );
+                 if ( parameter != null ) {
+                     result = buildFromMultipleSourceParameters( segments, parameter );
+@@ -138,6 +146,42 @@ public SourceReference build() {
+ 
+         }
+ 
++        public static Integer getSourceParameterPosition(String sourceName, Method method, TypeFactory typeFactory) {
++            if ( sourceName == null ) {
++                return null;
++            }
++
++            String[] segments = sourceName.trim().split( "\\." );
++            if ( segments.length == 0 ) {
++                return null;
++            }
++
++            BuilderFromMapping builder = new BuilderFromMapping()
++                .method( method )
++                .typeFactory( typeFactory );
++
++            if ( method.getSourceParameters().size() > 1 ) {
++                Parameter parameter = Parameter.getSourceParameter( method.getParameters(), segments[0] );
++                return parameter == null ? null : method.getParameters().indexOf( parameter );
++            }
++
++            if ( method.getSourceParameters().size() == 1 ) {
++                Parameter parameter = method.getSourceParameters().get( 0 );
++                boolean allowedMapToBean = parameter.getType().isMapType()
++                    && !segments[0].equals( parameter.getName() );
++                List<PropertyEntry> entries = builder.matchWithSourceAccessorTypes(
++                    parameter.getType(),
++                    segments,
++                    allowedMapToBean
++                );
++                if ( entries.size() != segments.length && segments[0].equals( parameter.getName() ) ) {
++                    return method.getParameters().indexOf( parameter );
++                }
++            }
++
++            return null;
++        }
++
+         /**
+          * When there is only one source parameters, the first segment name of the property may, or may not match
+          * the parameter name to avoid ambiguity
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java b/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java
+index 73a4d7c..03d4995 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java
+@@ -127,6 +127,7 @@ private static boolean isConsistent(BeanMappingGem gem, ExecutableElement method
+             && !gem.unmappedTargetPolicy().hasValue()
+             && !gem.unmappedSourcePolicy().hasValue()
+             && !gem.ignoreByDefault().hasValue()
++            && !gem.inheritSuperMappings().hasValue()
+             && !gem.builder().hasValue() ) {
+ 
+             messager.printMessage( method, Message.BEANMAPPING_NO_ELEMENTS );
+@@ -238,6 +239,12 @@ public boolean isIgnoredByDefault() {
+             .orElse( false );
+     }
+ 
++    public boolean isInheritSuperMappings() {
++        return Optional.ofNullable( beanMapping ).map( BeanMappingGem::inheritSuperMappings )
++            .map( GemValue::get )
++            .orElse( false );
++    }
++
+     public List<String> getIgnoreUnmappedSourceProperties() {
+         return ignoreUnmappedSourceProperties;
+     }
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java b/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java
+index 746aca5..f1d6c78 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java
+@@ -64,11 +64,18 @@ public static class InheritContext {
+         private final boolean isReversed;
+         private final boolean isForwarded;
+         private final Method templateMethod;
++        private final Integer sourceParameterPosition;
+ 
+         public InheritContext(boolean isReversed, boolean isForwarded, Method templateMethod) {
++            this( isReversed, isForwarded, templateMethod, null );
++        }
++
++        public InheritContext(boolean isReversed, boolean isForwarded, Method templateMethod,
++                              Integer sourceParameterPosition) {
+             this.isReversed = isReversed;
+             this.isForwarded = isForwarded;
+             this.templateMethod = templateMethod;
++            this.sourceParameterPosition = sourceParameterPosition;
+         }
+ 
+         public boolean isReversed() {
+@@ -82,6 +89,10 @@ public boolean isForwarded() {
+         public Method getTemplateMethod() {
+             return templateMethod;
+         }
++
++        public Integer getSourceParameterPosition() {
++            return sourceParameterPosition;
++        }
+     }
+ 
+     public static Set<String> getMappingTargetNamesBy(Predicate<MappingOptions> predicate,
+@@ -548,6 +559,43 @@ public MappingOptions copyForForwardInheritance(SourceMethod templateMethod,
+         return mappingOptions;
+     }
+ 
++    public MappingOptions copyForSuperMappingInheritance(SourceMethod templateMethod,
++                                                          SourceMethod sourceMethod,
++                                                          BeanMappingOptions beanMappingOptions,
++                                                          Integer sourceParameterPosition) {
++        String inheritedSourceName = sourceName;
++        if ( sourceParameterPosition != null ) {
++            inheritedSourceName = rebindSourceParameter( sourceMethod, sourceParameterPosition );
++        }
++
++        return new MappingOptions(
++            targetName,
++            templateMethod.getExecutable(),
++            targetAnnotationValue,
++            inheritedSourceName,
++            sourceAnnotationValue,
++            constant,
++            javaExpression,
++            defaultJavaExpression,
++            conditionJavaExpression,
++            defaultValue,
++            isIgnored,
++            formattingParameters,
++            selectionParameters,
++            dependsOn,
++            mapping,
++            new InheritContext( false, false, templateMethod, sourceParameterPosition ),
++            beanMappingOptions
++        );
++    }
++
++    private String rebindSourceParameter(SourceMethod sourceMethod, int sourceParameterPosition) {
++        String sourceNameTrimmed = sourceName.trim();
++        int separatorPosition = sourceNameTrimmed.indexOf( '.' );
++        String remainingPath = separatorPosition < 0 ? "" : sourceNameTrimmed.substring( separatorPosition );
++        return sourceMethod.getParameters().get( sourceParameterPosition ).getName() + remainingPath;
++    }
++
+     @Override
+     public boolean equals(Object o) {
+         if ( this == o ) {
+@@ -583,4 +631,3 @@ public boolean hasAnnotation() {
+     }
+ 
+ }
+-
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java b/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
+index d7a0329..ac2a127 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
+@@ -8,6 +8,8 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -18,6 +20,7 @@
+ import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.ExecutableType;
+ import javax.lang.model.type.TypeKind;
++import javax.lang.model.type.TypeMirror;
+ 
+ import org.mapstruct.ap.internal.gem.BeanMappingGem;
+ import org.mapstruct.ap.internal.gem.ConditionGem;
+@@ -34,6 +37,7 @@
+ import org.mapstruct.ap.internal.gem.TargetPropertyNameGem;
+ import org.mapstruct.ap.internal.gem.ValueMappingGem;
+ import org.mapstruct.ap.internal.gem.ValueMappingsGem;
++import org.mapstruct.ap.internal.model.beanmapping.SourceReference;
+ import org.mapstruct.ap.internal.model.common.Parameter;
+ import org.mapstruct.ap.internal.model.common.Type;
+ import org.mapstruct.ap.internal.model.common.TypeFactory;
+@@ -151,6 +155,7 @@ private List<SourceMethod> retrievePrototypeMethods(TypeElement mapperTypeElemen
+ 
+             SourceMethod method =
+                 getMethodRequiringImplementation(
++                    mapperAnnotation.mapperConfigType(),
+                     methodType,
+                     executable,
+                     parameters,
+@@ -240,7 +245,7 @@ private SourceMethod getMethod(Type usedMapperType,
+ 
+         //add method with property mappings if an implementation needs to be generated
+         if ( ( usedMapper.equals( mapperToImplement ) ) && methodRequiresImplementation ) {
+-            return getMethodRequiringImplementation( methodType,
++            return getMethodRequiringImplementation( (DeclaredType) usedMapperType.getTypeMirror(), methodType,
+                 method,
+                 parameters,
+                 containsTargetTypeParameter,
+@@ -259,7 +264,8 @@ else if ( isValidReferencedMethod( parameters ) || isValidFactoryMethod( method,
+         }
+     }
+ 
+-    private SourceMethod getMethodRequiringImplementation(ExecutableType methodType, ExecutableElement method,
++    private SourceMethod getMethodRequiringImplementation(DeclaredType mapperType, ExecutableType methodType,
++            ExecutableElement method,
+             List<Parameter> parameters,
+             boolean containsTargetTypeParameter,
+             MapperOptions mapperOptions,
+@@ -333,7 +339,7 @@ private SourceMethod getMethodRequiringImplementation(ExecutableType methodType,
+             subclassValidator
+         );
+ 
+-        return new SourceMethod.Builder()
++        SourceMethod sourceMethod = new SourceMethod.Builder()
+             .setExecutable( method )
+             .setParameters( parameters )
+             .setReturnType( returnType )
+@@ -353,6 +359,274 @@ private SourceMethod getMethodRequiringImplementation(ExecutableType methodType,
+             .setContextProvidedMethods( contextProvidedMethods )
+             .setVerboseLogging( options.isVerbose() )
+             .build();
++
++        if ( beanMappingOptions.isInheritSuperMappings() ) {
++            applyInheritedSuperMappings( sourceMethod, mapperType, mapperOptions );
++        }
++
++        return sourceMethod;
++    }
++
++    private void applyInheritedSuperMappings(SourceMethod sourceMethod, DeclaredType mapperType,
++                                              MapperOptions mapperOptions) {
++        List<SuperMethod> overriddenMethods = getOverriddenBeanMappingMethods(
++            sourceMethod,
++            mapperType,
++            mapperOptions
++        );
++        if ( overriddenMethods.isEmpty() ) {
++            messager.printMessage(
++                sourceMethod.getExecutable(),
++                sourceMethod.getOptions().getBeanMapping().getMirror(),
++                Message.BEANMAPPING_INHERIT_SUPER_MAPPINGS_NO_SUPER_MAPPING
++            );
++            return;
++        }
++
++        Set<String> currentTargets = new HashSet<>();
++        for ( MappingOptions mapping : sourceMethod.getOptions().getMappings() ) {
++            if ( !".".equals( mapping.getTargetName() ) ) {
++                currentTargets.add( mapping.getTargetName() );
++            }
++        }
++
++        Map<String, List<SuperMapping>> mappingsByTarget = new LinkedHashMap<>();
++        List<SuperMapping> targetThisMappings = new ArrayList<>();
++        for ( SuperMethod overriddenMethod : overriddenMethods ) {
++            for ( MappingOptions mapping : overriddenMethod.method.getOptions().getMappings() ) {
++                SuperMapping superMapping = new SuperMapping( overriddenMethod, mapping );
++                if ( ".".equals( mapping.getTargetName() ) ) {
++                    targetThisMappings.add( superMapping );
++                }
++                else if ( !currentTargets.contains( mapping.getTargetName() ) ) {
++                    mappingsByTarget.computeIfAbsent( mapping.getTargetName(), key -> new ArrayList<>() )
++                        .add( superMapping );
++                }
++            }
++        }
++
++        for ( SuperMapping targetThisMapping : targetThisMappings ) {
++            addInheritedSuperMapping( sourceMethod, targetThisMapping );
++        }
++
++        for ( Map.Entry<String, List<SuperMapping>> mappingsForTarget : mappingsByTarget.entrySet() ) {
++            List<SuperMapping> mostSpecificMappings = getMostSpecificMappings( mappingsForTarget.getValue() );
++            if ( mostSpecificMappings.size() == 1 ) {
++                addInheritedSuperMapping( sourceMethod, mostSpecificMappings.get( 0 ) );
++            }
++            else {
++                reportIncomparableSuperMappings(
++                    sourceMethod,
++                    mappingsForTarget.getKey(),
++                    mostSpecificMappings
++                );
++            }
++        }
++    }
++
++    private List<SuperMethod> getOverriddenBeanMappingMethods(SourceMethod sourceMethod, DeclaredType mapperType,
++                                                              MapperOptions mapperOptions) {
++        Map<String, OverriddenMethod> overriddenMethods = new LinkedHashMap<>();
++        collectOverriddenMethods(
++            sourceMethod.getExecutable(),
++            mapperType,
++            (TypeElement) mapperType.asElement(),
++            new HashSet<>(),
++            overriddenMethods
++        );
++
++        List<SuperMethod> beanMappingMethods = new ArrayList<>();
++        for ( OverriddenMethod overriddenMethod : overriddenMethods.values() ) {
++            SourceMethod superMethod = getSuperMappingMethod(
++                mapperType,
++                overriddenMethod.executable,
++                mapperOptions
++            );
++            if ( superMethod != null && isBeanMappingMethod( superMethod ) ) {
++                beanMappingMethods.add( new SuperMethod(
++                    superMethod,
++                    overriddenMethod.declaringType,
++                    overriddenMethod.declaringTypeName
++                ) );
++            }
++        }
++        return beanMappingMethods;
++    }
++
++    private void collectOverriddenMethods(ExecutableElement method, DeclaredType mapperType,
++                                          TypeElement mapperTypeElement, Set<String> visitedTypes,
++                                          Map<String, OverriddenMethod> overriddenMethods) {
++        for ( TypeMirror superType : typeUtils.directSupertypes( mapperType ) ) {
++            if ( superType.getKind() != TypeKind.DECLARED ) {
++                continue;
++            }
++
++            DeclaredType declaredSuperType = (DeclaredType) superType;
++            TypeElement superTypeElement = (TypeElement) declaredSuperType.asElement();
++            String declaringTypeName = getQualifiedName( declaredSuperType, superTypeElement );
++            if ( !visitedTypes.add( declaredSuperType.toString() ) ) {
++                continue;
++            }
++
++            for ( Element enclosedElement : superTypeElement.getEnclosedElements() ) {
++                if ( enclosedElement instanceof ExecutableElement ) {
++                    ExecutableElement executable = (ExecutableElement) enclosedElement;
++                    if ( elementUtils.overrides( method, executable, mapperTypeElement ) ) {
++                        String methodKey = declaringTypeName + "#" + executable;
++                        overriddenMethods.putIfAbsent(
++                            methodKey,
++                            new OverriddenMethod( executable, declaredSuperType, declaringTypeName )
++                        );
++                    }
++                }
++            }
++
++            collectOverriddenMethods(
++                method,
++                declaredSuperType,
++                mapperTypeElement,
++                visitedTypes,
++                overriddenMethods
++            );
++        }
++    }
++
++    private SourceMethod getSuperMappingMethod(DeclaredType mapperType, ExecutableElement method,
++                                               MapperOptions mapperOptions) {
++        ExecutableType methodType = typeFactory.getMethodType( mapperType, method );
++        List<Parameter> parameters = typeFactory.getParameters( methodType, method );
++        List<Parameter> sourceParameters = Parameter.getSourceParameters( parameters );
++        List<Parameter> contextParameters = Parameter.getContextParameters( parameters );
++        Parameter targetParameter = extractTargetParameter( parameters );
++        Type returnType = typeFactory.getReturnType( methodType );
++        Type resultType = selectResultType( returnType, targetParameter );
++        if ( !checkParameterAndReturnType(
++            method,
++            sourceParameters,
++            targetParameter,
++            contextParameters,
++            resultType,
++            returnType,
++            SourceMethod.containsTargetTypeParameter( parameters )
++        ) ) {
++            return null;
++        }
++
++        BeanMappingOptions beanMappingOptions = BeanMappingOptions.empty( mapperOptions );
++        return new SourceMethod.Builder()
++            .setExecutable( method )
++            .setParameters( parameters )
++            .setReturnType( returnType )
++            .setExceptionTypes( typeFactory.getThrownTypes( methodType ) )
++            .setMapper( mapperOptions )
++            .setBeanMappingOptions( beanMappingOptions )
++            .setMappingOptions( getMappings( method, beanMappingOptions ) )
++            .setTypeUtils( typeUtils )
++            .setTypeFactory( typeFactory )
++            .setPrototypeMethods( Collections.emptyList() )
++            .setVerboseLogging( options.isVerbose() )
++            .build();
++    }
++
++    private boolean isBeanMappingMethod(SourceMethod method) {
++        return !method.isIterableMapping()
++            && !method.isMapMapping()
++            && !method.isStreamMapping()
++            && !method.isRemovedEnumMapping();
++    }
++
++    private List<SuperMapping> getMostSpecificMappings(List<SuperMapping> mappings) {
++        List<SuperMapping> mostSpecificMappings = new ArrayList<>();
++        for ( SuperMapping candidate : mappings ) {
++            boolean overriddenByAnotherMapping = false;
++            for ( SuperMapping other : mappings ) {
++                if ( candidate != other && typeUtils.isSubtype(
++                    other.method.declaringType,
++                    candidate.method.declaringType
++                ) ) {
++                    overriddenByAnotherMapping = true;
++                    break;
++                }
++            }
++            if ( !overriddenByAnotherMapping ) {
++                mostSpecificMappings.add( candidate );
++            }
++        }
++        return mostSpecificMappings;
++    }
++
++    private void addInheritedSuperMapping(SourceMethod sourceMethod, SuperMapping superMapping) {
++        Integer sourceParameterPosition = SourceReference.BuilderFromMapping.getSourceParameterPosition(
++            superMapping.mapping.getSourceName(),
++            superMapping.method.method,
++            typeFactory
++        );
++        MappingOptions inheritedMapping = superMapping.mapping.copyForSuperMappingInheritance(
++            superMapping.method.method,
++            sourceMethod,
++            sourceMethod.getOptions().getBeanMapping(),
++            sourceParameterPosition
++        );
++        sourceMethod.getOptions().getMappings().add( inheritedMapping );
++    }
++
++    private void reportIncomparableSuperMappings(SourceMethod sourceMethod, String target,
++                                                  List<SuperMapping> mappings) {
++        Set<String> declaringMapperTypes = new LinkedHashSet<>();
++        for ( SuperMapping mapping : mappings ) {
++            declaringMapperTypes.add( mapping.method.declaringTypeName );
++        }
++        messager.printMessage(
++            sourceMethod.getExecutable(),
++            sourceMethod.getOptions().getBeanMapping().getMirror(),
++            Message.BEANMAPPING_INHERIT_SUPER_MAPPINGS_DUPLICATE_TARGET,
++            target,
++            String.join( ", ", declaringMapperTypes )
++        );
++    }
++
++    private static class SuperMapping {
++        private final SuperMethod method;
++        private final MappingOptions mapping;
++
++        private SuperMapping(SuperMethod method, MappingOptions mapping) {
++            this.method = method;
++            this.mapping = mapping;
++        }
++    }
++
++    private static class SuperMethod {
++        private final SourceMethod method;
++        private final DeclaredType declaringType;
++        private final String declaringTypeName;
++
++        private SuperMethod(SourceMethod method, DeclaredType declaringType, String declaringTypeName) {
++            this.method = method;
++            this.declaringType = declaringType;
++            this.declaringTypeName = declaringTypeName;
++        }
++    }
++
++    private static class OverriddenMethod {
++        private final ExecutableElement executable;
++        private final DeclaredType declaringType;
++        private final String declaringTypeName;
++
++        private OverriddenMethod(ExecutableElement executable, DeclaredType declaringType, String declaringTypeName) {
++            this.executable = executable;
++            this.declaringType = declaringType;
++            this.declaringTypeName = declaringTypeName;
++        }
++    }
++
++    private String getQualifiedName(DeclaredType declaredType, TypeElement typeElement) {
++        String qualifiedName = typeElement.getQualifiedName().toString();
++        if ( qualifiedName.isEmpty() ) {
++            String declaredTypeName = declaredType.toString();
++            int typeArgumentsStart = declaredTypeName.indexOf( '<' );
++            return typeArgumentsStart < 0 ? declaredTypeName : declaredTypeName.substring( 0, typeArgumentsStart );
++        }
++        return qualifiedName;
+     }
+ 
+     private ParameterProvidedMethods retrieveContextProvidedMethods(
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java b/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java
+index acac07b..0d40d6d 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java
+@@ -25,6 +25,10 @@ public enum Message {
+ 
+     BEANMAPPING_CREATE_NOTE( "creating bean mapping method implementation for %s.", Diagnostic.Kind.NOTE ),
+     BEANMAPPING_NO_ELEMENTS( "'nullValueMappingStrategy', 'nullValuePropertyMappingStrategy', 'resultType' and 'qualifiedBy' are undefined in @BeanMapping, define at least one of them." ),
++    BEANMAPPING_INHERIT_SUPER_MAPPINGS_NO_SUPER_MAPPING(
++        "Cannot inherit super mappings because this method does not override another bean mapping method." ),
++    BEANMAPPING_INHERIT_SUPER_MAPPINGS_DUPLICATE_TARGET(
++        "Inherited mappings for target \"%s\" are declared in multiple mapper types: %s." ),
+     BEANMAPPING_NOT_ASSIGNABLE( "%s not assignable to: %s." ),
+     BEANMAPPING_ABSTRACT( "The result type %s may not be an abstract class nor interface." ),
+     BEANMAPPING_UNKNOWN_PROPERTY_IN_RESULTTYPE( "Unknown property \"%s\" in result type %s. Did you mean \"%s\"?" ),
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/AbstractBaseMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/AbstractBaseMapper.java
+new file mode 100644
+index 0000000..51cbac7
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/AbstractBaseMapper.java
+@@ -0,0 +1,14 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public abstract class AbstractBaseMapper {
++
++    @Mapping(target = "value", source = "title")
++    public abstract BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/AbstractChildMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/AbstractChildMapper.java
+new file mode 100644
+index 0000000..68f051e
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/AbstractChildMapper.java
+@@ -0,0 +1,21 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.ReportingPolicy;
++import org.mapstruct.factory.Mappers;
++
++@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
++public abstract class AbstractChildMapper extends AbstractBaseMapper {
++
++    public static final AbstractChildMapper INSTANCE = Mappers.getMapper( AbstractChildMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    public abstract BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicBaseMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicBaseMapper.java
+new file mode 100644
+index 0000000..b71919a
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicBaseMapper.java
+@@ -0,0 +1,23 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapping;
++import org.mapstruct.NullValueMappingStrategy;
++
++public interface BasicBaseMapper {
++
++    @BeanMapping(
++        ignoreByDefault = true,
++        nullValueMappingStrategy = NullValueMappingStrategy.RETURN_DEFAULT
++    )
++    @Mapping(target = "inheritedValue", source = "name")
++    @Mapping(target = "superOnlyValue", source = "name")
++    @Mapping(target = "ignoredValue", source = "name")
++    @ComposedNameMapping
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicConfig.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicConfig.java
+new file mode 100644
+index 0000000..e7e2f06
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicConfig.java
+@@ -0,0 +1,18 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.MapperConfig;
++import org.mapstruct.Mapping;
++import org.mapstruct.MappingInheritanceStrategy;
++
++@MapperConfig(mappingInheritanceStrategy = MappingInheritanceStrategy.AUTO_INHERIT_FROM_CONFIG)
++public interface BasicConfig {
++
++    @Mapping(target = "configValue", source = "title")
++    @Mapping(target = "superOnlyValue", source = "title")
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicMapper.java
+new file mode 100644
+index 0000000..d160d1c
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicMapper.java
+@@ -0,0 +1,23 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++import org.mapstruct.factory.Mappers;
++
++@Mapper(config = BasicConfig.class)
++public interface BasicMapper extends BasicBaseMapper {
++
++    BasicMapper INSTANCE = Mappers.getMapper( BasicMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    @Mapping(target = "inheritedValue", source = "title")
++    @Mapping(target = "ignoredValue", ignore = true)
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicSource.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicSource.java
+new file mode 100644
+index 0000000..72c0d8c
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicSource.java
+@@ -0,0 +1,46 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public class BasicSource {
++
++    private String name;
++    private String title;
++    private String automaticValue;
++    private String value;
++
++    public String getName() {
++        return name;
++    }
++
++    public void setName(String name) {
++        this.name = name;
++    }
++
++    public String getTitle() {
++        return title;
++    }
++
++    public void setTitle(String title) {
++        this.title = title;
++    }
++
++    public String getAutomaticValue() {
++        return automaticValue;
++    }
++
++    public void setAutomaticValue(String automaticValue) {
++        this.automaticValue = automaticValue;
++    }
++
++    public String getValue() {
++        return value;
++    }
++
++    public void setValue(String value) {
++        this.value = value;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicTarget.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicTarget.java
+new file mode 100644
+index 0000000..2761da3
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/BasicTarget.java
+@@ -0,0 +1,73 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public class BasicTarget {
++
++    private String inheritedValue;
++    private String superOnlyValue;
++    private String ignoredValue;
++    private String composedValue;
++    private String configValue;
++    private String automaticValue;
++    private String value;
++
++    public String getInheritedValue() {
++        return inheritedValue;
++    }
++
++    public void setInheritedValue(String inheritedValue) {
++        this.inheritedValue = inheritedValue;
++    }
++
++    public String getSuperOnlyValue() {
++        return superOnlyValue;
++    }
++
++    public void setSuperOnlyValue(String superOnlyValue) {
++        this.superOnlyValue = superOnlyValue;
++    }
++
++    public String getIgnoredValue() {
++        return ignoredValue;
++    }
++
++    public void setIgnoredValue(String ignoredValue) {
++        this.ignoredValue = ignoredValue;
++    }
++
++    public String getComposedValue() {
++        return composedValue;
++    }
++
++    public void setComposedValue(String composedValue) {
++        this.composedValue = composedValue;
++    }
++
++    public String getConfigValue() {
++        return configValue;
++    }
++
++    public void setConfigValue(String configValue) {
++        this.configValue = configValue;
++    }
++
++    public String getAutomaticValue() {
++        return automaticValue;
++    }
++
++    public void setAutomaticValue(String automaticValue) {
++        this.automaticValue = automaticValue;
++    }
++
++    public String getValue() {
++        return value;
++    }
++
++    public void setValue(String value) {
++        this.value = value;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ComposedNameMapping.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ComposedNameMapping.java
+new file mode 100644
+index 0000000..5af1682
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ComposedNameMapping.java
+@@ -0,0 +1,19 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++import org.mapstruct.Mapping;
++
++@Mapping(target = "composedValue", source = "title")
++@Target(ElementType.METHOD)
++@Retention(RetentionPolicy.CLASS)
++public @interface ComposedNameMapping {
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictLeftMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictLeftMapper.java
+new file mode 100644
+index 0000000..53e770d
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictLeftMapper.java
+@@ -0,0 +1,14 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface ConflictLeftMapper {
++
++    @Mapping(target = "value", source = "name")
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictRightMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictRightMapper.java
+new file mode 100644
+index 0000000..51547e5
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictRightMapper.java
+@@ -0,0 +1,14 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface ConflictRightMapper {
++
++    @Mapping(target = "value", source = "name")
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictingMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictingMapper.java
+new file mode 100644
+index 0000000..f7f45bc
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ConflictingMapper.java
+@@ -0,0 +1,18 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.ReportingPolicy;
++
++@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
++public interface ConflictingMapper extends ConflictLeftMapper, ConflictRightMapper {
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/DisabledBaseMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/DisabledBaseMapper.java
+new file mode 100644
+index 0000000..8259f96
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/DisabledBaseMapper.java
+@@ -0,0 +1,14 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface DisabledBaseMapper {
++
++    @Mapping(target = "value", source = "title")
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/DisabledMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/DisabledMapper.java
+new file mode 100644
+index 0000000..9f2d8c2
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/DisabledMapper.java
+@@ -0,0 +1,19 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapper;
++import org.mapstruct.ReportingPolicy;
++import org.mapstruct.factory.Mappers;
++
++@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
++public interface DisabledMapper extends DisabledBaseMapper {
++
++    DisabledMapper INSTANCE = Mappers.getMapper( DisabledMapper.class );
++
++    @Override
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/EmptyBaseMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/EmptyBaseMapper.java
+new file mode 100644
+index 0000000..5170f91
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/EmptyBaseMapper.java
+@@ -0,0 +1,11 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public interface EmptyBaseMapper {
++
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/EmptySuperMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/EmptySuperMapper.java
+new file mode 100644
+index 0000000..4bcf5f5
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/EmptySuperMapper.java
+@@ -0,0 +1,21 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.ReportingPolicy;
++import org.mapstruct.factory.Mappers;
++
++@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
++public interface EmptySuperMapper extends EmptyBaseMapper {
++
++    EmptySuperMapper INSTANCE = Mappers.getMapper( EmptySuperMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenLeftMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenLeftMapper.java
+new file mode 100644
+index 0000000..70aa223
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenLeftMapper.java
+@@ -0,0 +1,15 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface FlattenLeftMapper extends FlattenRootMapper {
++
++    @Override
++    @Mapping(target = ".", source = "left")
++    FlattenTarget map(FlattenSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenMapper.java
+new file mode 100644
+index 0000000..8714224
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenMapper.java
+@@ -0,0 +1,22 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++import org.mapstruct.factory.Mappers;
++
++@Mapper
++public interface FlattenMapper extends FlattenLeftMapper, FlattenRightMapper {
++
++    FlattenMapper INSTANCE = Mappers.getMapper( FlattenMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    @Mapping(target = ".", source = "current")
++    FlattenTarget map(FlattenSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenRightMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenRightMapper.java
+new file mode 100644
+index 0000000..d1035ce
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenRightMapper.java
+@@ -0,0 +1,15 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface FlattenRightMapper extends FlattenRootMapper {
++
++    @Override
++    @Mapping(target = ".", source = "right")
++    FlattenTarget map(FlattenSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenRootMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenRootMapper.java
+new file mode 100644
+index 0000000..86c2b17
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenRootMapper.java
+@@ -0,0 +1,14 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface FlattenRootMapper {
++
++    @Mapping(target = ".", source = "root")
++    FlattenTarget map(FlattenSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenSource.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenSource.java
+new file mode 100644
+index 0000000..7bc5d7c
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenSource.java
+@@ -0,0 +1,94 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public class FlattenSource {
++
++    private RootPart root;
++    private LeftPart left;
++    private RightPart right;
++    private CurrentPart current;
++
++    public RootPart getRoot() {
++        return root;
++    }
++
++    public void setRoot(RootPart root) {
++        this.root = root;
++    }
++
++    public LeftPart getLeft() {
++        return left;
++    }
++
++    public void setLeft(LeftPart left) {
++        this.left = left;
++    }
++
++    public RightPart getRight() {
++        return right;
++    }
++
++    public void setRight(RightPart right) {
++        this.right = right;
++    }
++
++    public CurrentPart getCurrent() {
++        return current;
++    }
++
++    public void setCurrent(CurrentPart current) {
++        this.current = current;
++    }
++
++    public static class RootPart {
++        private String rootValue;
++
++        public String getRootValue() {
++            return rootValue;
++        }
++
++        public void setRootValue(String rootValue) {
++            this.rootValue = rootValue;
++        }
++    }
++
++    public static class LeftPart {
++        private String leftValue;
++
++        public String getLeftValue() {
++            return leftValue;
++        }
++
++        public void setLeftValue(String leftValue) {
++            this.leftValue = leftValue;
++        }
++    }
++
++    public static class RightPart {
++        private String rightValue;
++
++        public String getRightValue() {
++            return rightValue;
++        }
++
++        public void setRightValue(String rightValue) {
++            this.rightValue = rightValue;
++        }
++    }
++
++    public static class CurrentPart {
++        private String currentValue;
++
++        public String getCurrentValue() {
++            return currentValue;
++        }
++
++        public void setCurrentValue(String currentValue) {
++            this.currentValue = currentValue;
++        }
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenTarget.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenTarget.java
+new file mode 100644
+index 0000000..9746fdc
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlattenTarget.java
+@@ -0,0 +1,46 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public class FlattenTarget {
++
++    private String rootValue;
++    private String leftValue;
++    private String rightValue;
++    private String currentValue;
++
++    public String getRootValue() {
++        return rootValue;
++    }
++
++    public void setRootValue(String rootValue) {
++        this.rootValue = rootValue;
++    }
++
++    public String getLeftValue() {
++        return leftValue;
++    }
++
++    public void setLeftValue(String leftValue) {
++        this.leftValue = leftValue;
++    }
++
++    public String getRightValue() {
++        return rightValue;
++    }
++
++    public void setRightValue(String rightValue) {
++        this.rightValue = rightValue;
++    }
++
++    public String getCurrentValue() {
++        return currentValue;
++    }
++
++    public void setCurrentValue(String currentValue) {
++        this.currentValue = currentValue;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/GenericBaseMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/GenericBaseMapper.java
+new file mode 100644
+index 0000000..a25890f
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/GenericBaseMapper.java
+@@ -0,0 +1,20 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface GenericBaseMapper<S> {
++
++    @Mapping(target = "firstValue", source = "first.name")
++    @Mapping(target = "secondValue", source = "second.name")
++    @Mapping(target = "whole", source = "first")
++    @Mapping(target = "expressionValue", expression = "java(\"first\")")
++    ParameterTarget map(S first, S second);
++
++    @Mapping(target = "propertyValue", source = "value")
++    ParameterTarget mapSingle(S value);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/GenericMiddleMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/GenericMiddleMapper.java
+new file mode 100644
+index 0000000..6a2a44d
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/GenericMiddleMapper.java
+@@ -0,0 +1,9 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public interface GenericMiddleMapper<S> extends GenericBaseMapper<S> {
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyLeftMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyLeftMapper.java
+new file mode 100644
+index 0000000..1da699e
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyLeftMapper.java
+@@ -0,0 +1,16 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface HierarchyLeftMapper extends HierarchyRootMapper {
++
++    @Override
++    @Mapping(target = "leftValue", source = "name")
++    @Mapping(target = "overriddenValue", source = "title")
++    HierarchyTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyMapper.java
+new file mode 100644
+index 0000000..bbf3f5f
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyMapper.java
+@@ -0,0 +1,20 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.factory.Mappers;
++
++@Mapper
++public interface HierarchyMapper extends HierarchyLeftMapper, HierarchyRightMapper {
++
++    HierarchyMapper INSTANCE = Mappers.getMapper( HierarchyMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    HierarchyTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyRightMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyRightMapper.java
+new file mode 100644
+index 0000000..91a8036
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyRightMapper.java
+@@ -0,0 +1,15 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface HierarchyRightMapper extends HierarchyRootMapper {
++
++    @Override
++    @Mapping(target = "rightValue", source = "title")
++    HierarchyTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyRootMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyRootMapper.java
+new file mode 100644
+index 0000000..37db623
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyRootMapper.java
+@@ -0,0 +1,15 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.Mapping;
++
++public interface HierarchyRootMapper {
++
++    @Mapping(target = "rootValue", source = "name")
++    @Mapping(target = "overriddenValue", source = "name")
++    HierarchyTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyTarget.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyTarget.java
+new file mode 100644
+index 0000000..5d4744b
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/HierarchyTarget.java
+@@ -0,0 +1,46 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public class HierarchyTarget {
++
++    private String rootValue;
++    private String overriddenValue;
++    private String leftValue;
++    private String rightValue;
++
++    public String getRootValue() {
++        return rootValue;
++    }
++
++    public void setRootValue(String rootValue) {
++        this.rootValue = rootValue;
++    }
++
++    public String getOverriddenValue() {
++        return overriddenValue;
++    }
++
++    public void setOverriddenValue(String overriddenValue) {
++        this.overriddenValue = overriddenValue;
++    }
++
++    public String getLeftValue() {
++        return leftValue;
++    }
++
++    public void setLeftValue(String leftValue) {
++        this.leftValue = leftValue;
++    }
++
++    public String getRightValue() {
++        return rightValue;
++    }
++
++    public void setRightValue(String rightValue) {
++        this.rightValue = rightValue;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsTest.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsTest.java
+new file mode 100644
+index 0000000..0aa2773
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsTest.java
+@@ -0,0 +1,208 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import javax.tools.Diagnostic.Kind;
++
++import org.mapstruct.ap.testutil.ProcessorTest;
++import org.mapstruct.ap.testutil.WithClasses;
++import org.mapstruct.ap.testutil.compilation.annotation.CompilationResult;
++import org.mapstruct.ap.testutil.compilation.annotation.Diagnostic;
++import org.mapstruct.ap.testutil.compilation.annotation.ExpectedCompilationOutcome;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++@WithClasses({
++    BasicSource.class,
++    BasicTarget.class,
++    ComposedNameMapping.class,
++    BasicConfig.class,
++    BasicBaseMapper.class,
++    BasicMapper.class,
++    HierarchyRootMapper.class,
++    HierarchyLeftMapper.class,
++    HierarchyRightMapper.class,
++    HierarchyTarget.class,
++    HierarchyMapper.class,
++    FlattenSource.class,
++    FlattenTarget.class,
++    FlattenRootMapper.class,
++    FlattenLeftMapper.class,
++    FlattenRightMapper.class,
++    FlattenMapper.class,
++    ParameterSource.class,
++    ParameterTarget.class,
++    GenericBaseMapper.class,
++    GenericMiddleMapper.class,
++    ParameterMapper.class,
++    EmptyBaseMapper.class,
++    EmptySuperMapper.class,
++    DisabledBaseMapper.class,
++    DisabledMapper.class,
++    AbstractBaseMapper.class,
++    AbstractChildMapper.class,
++    ConflictLeftMapper.class,
++    ConflictRightMapper.class,
++    ResolvedConflictMapper.class
++})
++public class InheritedSuperMappingsTest {
++
++    @ProcessorTest
++    public void shouldInheritMappingsWithoutBeanMappingOptions() {
++        BasicSource source = source();
++
++        BasicTarget target = BasicMapper.INSTANCE.map( source );
++
++        assertThat( target.getInheritedValue() ).isEqualTo( "title" );
++        assertThat( target.getSuperOnlyValue() ).isEqualTo( "name" );
++        assertThat( target.getIgnoredValue() ).isNull();
++        assertThat( target.getComposedValue() ).isEqualTo( "title" );
++        assertThat( target.getConfigValue() ).isEqualTo( "title" );
++        assertThat( target.getAutomaticValue() ).isEqualTo( "automatic" );
++        assertThat( BasicMapper.INSTANCE.map( null ) ).isNull();
++    }
++
++    @ProcessorTest
++    public void shouldResolveHierarchyBySpecificity() {
++        HierarchyTarget target = HierarchyMapper.INSTANCE.map( source() );
++
++        assertThat( target.getRootValue() ).isEqualTo( "name" );
++        assertThat( target.getOverriddenValue() ).isEqualTo( "title" );
++        assertThat( target.getLeftValue() ).isEqualTo( "name" );
++        assertThat( target.getRightValue() ).isEqualTo( "title" );
++    }
++
++    @ProcessorTest
++    public void shouldAccumulateTargetThisMappings() {
++        FlattenSource source = new FlattenSource();
++        source.setRoot( rootPart( "root" ) );
++        source.setLeft( leftPart( "left" ) );
++        source.setRight( rightPart( "right" ) );
++        source.setCurrent( currentPart( "current" ) );
++
++        FlattenTarget target = FlattenMapper.INSTANCE.map( source );
++
++        assertThat( target.getRootValue() ).isEqualTo( "root" );
++        assertThat( target.getLeftValue() ).isEqualTo( "left" );
++        assertThat( target.getRightValue() ).isEqualTo( "right" );
++        assertThat( target.getCurrentValue() ).isEqualTo( "current" );
++    }
++
++    @ProcessorTest
++    public void shouldRebindQualifiedParametersByPosition() {
++        ParameterSource firstArgument = parameterSource( "first argument", "first property", "property named second" );
++        ParameterSource secondArgument = parameterSource( "second argument", "second property", "other" );
++
++        ParameterTarget target = ParameterMapper.INSTANCE.map( firstArgument, secondArgument );
++        ParameterTarget singleTarget = ParameterMapper.INSTANCE.mapSingle( firstArgument );
++
++        assertThat( target.getFirstValue() ).isEqualTo( "first argument" );
++        assertThat( target.getSecondValue() ).isEqualTo( "second argument" );
++        assertThat( target.getWhole() ).isSameAs( firstArgument );
++        assertThat( target.getExpressionValue() ).isEqualTo( "first" );
++        assertThat( singleTarget.getPropertyValue() ).isEqualTo( "first property" );
++    }
++
++    @ProcessorTest
++    public void shouldCountSuperMethodWithoutMappings() {
++        BasicTarget target = EmptySuperMapper.INSTANCE.map( source() );
++
++        assertThat( target.getAutomaticValue() ).isEqualTo( "automatic" );
++    }
++
++    @ProcessorTest
++    public void shouldKeepBehaviorDisabledByDefault() {
++        BasicTarget target = DisabledMapper.INSTANCE.map( source() );
++
++        assertThat( target.getValue() ).isEqualTo( "automatic source value" );
++    }
++
++    @ProcessorTest
++    public void shouldInheritFromSuperclass() {
++        BasicTarget target = AbstractChildMapper.INSTANCE.map( source() );
++
++        assertThat( target.getValue() ).isEqualTo( "title" );
++    }
++
++    @ProcessorTest
++    public void shouldLetCurrentMappingResolveBranchConflict() {
++        BasicTarget target = ResolvedConflictMapper.INSTANCE.map( source() );
++
++        assertThat( target.getValue() ).isEqualTo( "title" );
++    }
++
++    @ProcessorTest
++    @WithClasses(ConflictingMapper.class)
++    @ExpectedCompilationOutcome(
++        value = CompilationResult.FAILED,
++        diagnostics = @Diagnostic(
++            type = ConflictingMapper.class,
++            kind = Kind.ERROR,
++            line = 16,
++            message = "Inherited mappings for target \"value\" are declared in multiple mapper types: "
++                + "org.mapstruct.ap.test.inheritsupermappings.ConflictLeftMapper, "
++                + "org.mapstruct.ap.test.inheritsupermappings.ConflictRightMapper."
++        )
++    )
++    public void shouldReportIncomparableMappingsForSameTarget() {
++    }
++
++    @ProcessorTest
++    @WithClasses(NoSuperMapper.class)
++    @ExpectedCompilationOutcome(
++        value = CompilationResult.FAILED,
++        diagnostics = @Diagnostic(
++            type = NoSuperMapper.class,
++            kind = Kind.ERROR,
++            line = 15,
++            message = "Cannot inherit super mappings because this method does not override another bean mapping "
++                + "method."
++        )
++    )
++    public void shouldReportMissingOverriddenMappingMethod() {
++    }
++
++    private BasicSource source() {
++        BasicSource source = new BasicSource();
++        source.setName( "name" );
++        source.setTitle( "title" );
++        source.setAutomaticValue( "automatic" );
++        source.setValue( "automatic source value" );
++        return source;
++    }
++
++    private ParameterSource parameterSource(String name, String value, String second) {
++        ParameterSource source = new ParameterSource();
++        source.setName( name );
++        source.setValue( value );
++        source.setSecond( second );
++        return source;
++    }
++
++    private FlattenSource.RootPart rootPart(String value) {
++        FlattenSource.RootPart part = new FlattenSource.RootPart();
++        part.setRootValue( value );
++        return part;
++    }
++
++    private FlattenSource.LeftPart leftPart(String value) {
++        FlattenSource.LeftPart part = new FlattenSource.LeftPart();
++        part.setLeftValue( value );
++        return part;
++    }
++
++    private FlattenSource.RightPart rightPart(String value) {
++        FlattenSource.RightPart part = new FlattenSource.RightPart();
++        part.setRightValue( value );
++        return part;
++    }
++
++    private FlattenSource.CurrentPart currentPart(String value) {
++        FlattenSource.CurrentPart part = new FlattenSource.CurrentPart();
++        part.setCurrentValue( value );
++        return part;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/NoSuperMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/NoSuperMapper.java
+new file mode 100644
+index 0000000..17448b2
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/NoSuperMapper.java
+@@ -0,0 +1,17 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.ReportingPolicy;
++
++@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
++public interface NoSuperMapper {
++
++    @BeanMapping(inheritSuperMappings = true)
++    BasicTarget map(BasicSource source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterMapper.java
+new file mode 100644
+index 0000000..43f3d4d
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterMapper.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.ReportingPolicy;
++import org.mapstruct.factory.Mappers;
++
++@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
++public interface ParameterMapper extends GenericMiddleMapper<ParameterSource> {
++
++    ParameterMapper INSTANCE = Mappers.getMapper( ParameterMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    ParameterTarget map(ParameterSource second, ParameterSource first);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    ParameterTarget mapSingle(ParameterSource renamed);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterSource.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterSource.java
+new file mode 100644
+index 0000000..10c7ad4
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterSource.java
+@@ -0,0 +1,37 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public class ParameterSource {
++
++    private String name;
++    private String value;
++    private String second;
++
++    public String getName() {
++        return name;
++    }
++
++    public void setName(String name) {
++        this.name = name;
++    }
++
++    public String getValue() {
++        return value;
++    }
++
++    public void setValue(String value) {
++        this.value = value;
++    }
++
++    public String getSecond() {
++        return second;
++    }
++
++    public void setSecond(String second) {
++        this.second = second;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterTarget.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterTarget.java
+new file mode 100644
+index 0000000..a02b5df
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ParameterTarget.java
+@@ -0,0 +1,55 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++public class ParameterTarget {
++
++    private String firstValue;
++    private String secondValue;
++    private String propertyValue;
++    private String expressionValue;
++    private ParameterSource whole;
++
++    public String getFirstValue() {
++        return firstValue;
++    }
++
++    public void setFirstValue(String firstValue) {
++        this.firstValue = firstValue;
++    }
++
++    public String getSecondValue() {
++        return secondValue;
++    }
++
++    public void setSecondValue(String secondValue) {
++        this.secondValue = secondValue;
++    }
++
++    public String getPropertyValue() {
++        return propertyValue;
++    }
++
++    public void setPropertyValue(String propertyValue) {
++        this.propertyValue = propertyValue;
++    }
++
++    public String getExpressionValue() {
++        return expressionValue;
++    }
++
++    public void setExpressionValue(String expressionValue) {
++        this.expressionValue = expressionValue;
++    }
++
++    public ParameterSource getWhole() {
++        return whole;
++    }
++
++    public void setWhole(ParameterSource whole) {
++        this.whole = whole;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ResolvedConflictMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ResolvedConflictMapper.java
+new file mode 100644
+index 0000000..4fb23d8
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ResolvedConflictMapper.java
+@@ -0,0 +1,23 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++import org.mapstruct.ReportingPolicy;
++import org.mapstruct.factory.Mappers;
++
++@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
++public interface ResolvedConflictMapper extends ConflictLeftMapper, ConflictRightMapper {
++
++    ResolvedConflictMapper INSTANCE = Mappers.getMapper( ResolvedConflictMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    @Mapping(target = "value", source = "title")
++    BasicTarget map(BasicSource source);
++}

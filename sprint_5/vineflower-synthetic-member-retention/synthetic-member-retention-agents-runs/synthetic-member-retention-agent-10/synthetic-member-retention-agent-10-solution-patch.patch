@@ -1,0 +1,539 @@
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassWriter.java b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+index 0a6b7a9..ae1047d 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassWriter.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+@@ -376,7 +376,20 @@ public class ClassWriter implements StatementWriter {
+ 
+     try {
+       // last minute processing
+-      boolean ok = invokeProcessors(buffer, node);
++      boolean ok;
++      if (DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++        Map<ClassNode, Boolean> invokedProcessors = node.getRoot().getReferenceAwareInvokedProcessors();
++        Boolean processed = invokedProcessors.get(node);
++        if (processed == null) {
++          processed = invokeProcessors(buffer, node);
++          if (processed) {
++            invokedProcessors.put(node, true);
++          }
++        }
++        ok = processed;
++      } else {
++        ok = invokeProcessors(buffer, node);
++      }
+ 
+       if (!ok) {
+         return;
+@@ -454,6 +467,9 @@ public class ClassWriter implements StatementWriter {
+         for (StructField fd : nonEnumFields) {
+           boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+             wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
++          if (hide && ReferenceAwareSyntheticRetention.isRetainedField(node, fd)) {
++            hide = false;
++          }
+           if (hide) continue;
+ 
+           if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
+@@ -482,6 +498,9 @@ public class ClassWriter implements StatementWriter {
+           hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                  mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
+                  wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
++          if (hide && ReferenceAwareSyntheticRetention.isRetainedMethod(node, mt)) {
++            hide = false;
++          }
+         } else {
+           hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
+                  (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
+@@ -508,6 +527,9 @@ public class ClassWriter implements StatementWriter {
+             boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
+             hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                    wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
++            if (hide && ReferenceAwareSyntheticRetention.isRetainedMemberClass(inner)) {
++              hide = false;
++            }
+           } else {
+             hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+           }
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java b/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java
+index 485b8db..867e7a5 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassesProcessor.java
+@@ -515,12 +515,27 @@ public class ClassesProcessor implements CodeConstants {
+         TextBuffer classBuffer = new TextBuffer(AVERAGE_CLASS_SIZE);
+         StatementWriter writer = spec != null ? spec.writer : new ClassWriter();
+ 
++        if (DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++          root.getReferenceAwareRetainedMembers().clear();
++          root.getReferenceAwareInvokedProcessors().clear();
++        }
++
+         DecompilerContext.getCurrentContext().structContext.getPluginContext()
+           .runClassPasses(ClassPassLocation.BEFORE_WRITING, root);
+ 
+         writer.writeClass(root, classBuffer, 0);
+         classBuffer.reformat();
+ 
++        if (writer instanceof ClassWriter) {
++          boolean changed = ReferenceAwareSyntheticRetention.retainReferencedMembers(root, classBuffer);
++          while (changed) {
++            classBuffer = new TextBuffer(AVERAGE_CLASS_SIZE);
++            writer.writeClass(root, classBuffer, 0);
++            classBuffer.reformat();
++            changed = ReferenceAwareSyntheticRetention.retainReferencedMembers(root, classBuffer);
++          }
++        }
++
+         classBuffer.getTracers().forEach((classAndMethod, tracer) -> {
+           // get the class by name
+           StructClass clazz = DecompilerContext.getStructContext().getClass(classAndMethod.a);
+@@ -636,6 +651,8 @@ public class ClassesProcessor implements CodeConstants {
+     public VarType anonymousClassType;
+     public final List<ClassNode> nested = new ArrayList<>();
+     public final Set<String> enclosingClasses = new HashSet<>();
++    private final Set<ReferenceAwareSyntheticRetention.MemberKey> referenceAwareRetainedMembers = new HashSet<>();
++    private final Map<ClassNode, Boolean> referenceAwareInvokedProcessors = new IdentityHashMap<>();
+     public @Nullable ClassNode parent;
+     public LambdaInformation lambdaInformation;
+ 
+@@ -720,6 +737,22 @@ public class ClassesProcessor implements CodeConstants {
+       return nested;
+     }
+ 
++    Set<ReferenceAwareSyntheticRetention.MemberKey> getReferenceAwareRetainedMembers() {
++      return referenceAwareRetainedMembers;
++    }
++
++    Map<ClassNode, Boolean> getReferenceAwareInvokedProcessors() {
++      return referenceAwareInvokedProcessors;
++    }
++
++    ClassNode getRoot() {
++      ClassNode root = this;
++      while (root.parent != null) {
++        root = root.parent;
++      }
++      return root;
++    }
++
+     @Override
+     public int compareTo(ClassNode o) {
+       //TODO: Take line numbers into account?
+diff --git a/src/org/jetbrains/java/decompiler/main/ReferenceAwareSyntheticRetention.java b/src/org/jetbrains/java/decompiler/main/ReferenceAwareSyntheticRetention.java
+new file mode 100644
+index 0000000..3d57508
+--- /dev/null
++++ b/src/org/jetbrains/java/decompiler/main/ReferenceAwareSyntheticRetention.java
+@@ -0,0 +1,204 @@
++/*
++ * Copyright 2000-2025 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
++ */
++package org.jetbrains.java.decompiler.main;
++
++import org.jetbrains.java.decompiler.code.CodeConstants;
++import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
++import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
++import org.jetbrains.java.decompiler.main.rels.ClassWrapper;
++import org.jetbrains.java.decompiler.struct.StructField;
++import org.jetbrains.java.decompiler.struct.StructMethod;
++import org.jetbrains.java.decompiler.util.InterpreterUtil;
++import org.jetbrains.java.decompiler.util.TextBuffer;
++import org.jetbrains.java.decompiler.util.token.ClassTextToken;
++import org.jetbrains.java.decompiler.util.token.FieldTextToken;
++import org.jetbrains.java.decompiler.util.token.MethodTextToken;
++import org.jetbrains.java.decompiler.util.token.TextToken;
++
++import java.util.HashSet;
++import java.util.Objects;
++import java.util.Set;
++
++/**
++ * Finds references to generated members in the Java text produced by {@link ClassWriter}.
++ *
++ * <p>The writer's text tokens are deliberately used here instead of searching the resulting
++ * text.  Tokens distinguish code references from comments and literals, and retain the JVM
++ * owner/name/descriptor of a member even when its source spelling is shortened or renamed.</p>
++ */
++final class ReferenceAwareSyntheticRetention {
++  private ReferenceAwareSyntheticRetention() { }
++
++  enum Kind {
++    FIELD,
++    METHOD,
++    MEMBER_CLASS
++  }
++
++  static final class MemberKey {
++    private final Kind kind;
++    private final String owner;
++    private final String name;
++    private final String descriptor;
++
++    private MemberKey(Kind kind, String owner, String name, String descriptor) {
++      this.kind = kind;
++      this.owner = owner;
++      this.name = name;
++      this.descriptor = descriptor;
++    }
++
++    static MemberKey field(String owner, String name, String descriptor) {
++      return new MemberKey(Kind.FIELD, owner, name, descriptor);
++    }
++
++    static MemberKey method(String owner, String name, String descriptor) {
++      return new MemberKey(Kind.METHOD, owner, name, descriptor);
++    }
++
++    static MemberKey memberClass(String qualifiedName) {
++      return new MemberKey(Kind.MEMBER_CLASS, qualifiedName, null, null);
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) return true;
++      if (!(o instanceof MemberKey)) return false;
++      MemberKey key = (MemberKey)o;
++      return kind == key.kind &&
++        Objects.equals(owner, key.owner) &&
++        Objects.equals(name, key.name) &&
++        Objects.equals(descriptor, key.descriptor);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(kind, owner, name, descriptor);
++    }
++  }
++
++  /**
++   * Adds generated members referenced by the current emitted file to the root's retention set.
++   * Only members that the normal writer would omit are candidates.  The return value indicates
++   * whether the file needs to be emitted again so that bodies of newly retained members can be
++   * inspected on the next pass.
++   */
++  static boolean retainReferencedMembers(ClassNode root, TextBuffer buffer) {
++    if (!DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++      return false;
++    }
++
++    Set<MemberKey> candidates = new HashSet<>();
++    collectCandidates(root, candidates);
++    if (candidates.isEmpty()) {
++      return false;
++    }
++
++    Set<MemberKey> retained = root.getReferenceAwareRetainedMembers();
++    boolean changed = false;
++    for (TextToken token : buffer.getTokens()) {
++      if (token.isDeclaration()) {
++        continue;
++      }
++
++      MemberKey referenced = referencedMember(token);
++      if (referenced != null && candidates.contains(referenced) && retained.add(referenced)) {
++        changed = true;
++      }
++    }
++
++    return changed;
++  }
++
++  static boolean isRetainedField(ClassNode node, StructField field) {
++    return isRetained(node, MemberKey.field(node.classStruct.qualifiedName, field.getName(), field.getDescriptor()));
++  }
++
++  static boolean isRetainedMethod(ClassNode node, StructMethod method) {
++    return isRetained(node, MemberKey.method(node.classStruct.qualifiedName, method.getName(), method.getDescriptor()));
++  }
++
++  static boolean isRetainedMemberClass(ClassNode node) {
++    return isRetained(node, MemberKey.memberClass(node.classStruct.qualifiedName));
++  }
++
++  private static boolean isRetained(ClassNode node, MemberKey key) {
++    if (!DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION)) {
++      return false;
++    }
++    return rootOf(node).getReferenceAwareRetainedMembers().contains(key);
++  }
++
++  private static void collectCandidates(ClassNode node, Set<MemberKey> candidates) {
++    if (node.type != ClassNode.Type.LAMBDA) {
++      ClassWrapper wrapper = node.getWrapper();
++      if (wrapper != null) {
++        String owner = node.classStruct.qualifiedName;
++
++        if (methodToDecompileIsEmpty()) {
++          for (StructField field : node.classStruct.getFields()) {
++            boolean hidden = wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(field.getName(), field.getDescriptor()));
++            if (field.isSynthetic() &&
++                (DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) || hidden)) {
++              candidates.add(MemberKey.field(owner, field.getName(), field.getDescriptor()));
++            }
++          }
++        }
++
++        if (methodToDecompileIsEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
++          for (StructMethod method : node.classStruct.getMethods()) {
++            boolean hidden = wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
++            boolean synthetic = method.isSynthetic();
++            boolean bridge = method.hasModifier(CodeConstants.ACC_BRIDGE);
++            if ((synthetic || bridge) &&
++                ((synthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC)) ||
++                 (bridge && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE)) ||
++                 hidden)) {
++              candidates.add(MemberKey.method(owner, method.getName(), method.getDescriptor()));
++            }
++          }
++        }
++      }
++    }
++
++    for (ClassNode child : node.nested) {
++      if (child.type == ClassNode.Type.MEMBER && methodToDecompileIsEmpty()) {
++        boolean synthetic = (child.access & CodeConstants.ACC_SYNTHETIC) != 0 || child.classStruct.isSynthetic();
++        ClassWrapper parentWrapper = child.parent == null ? null : child.parent.getWrapper();
++        boolean hidden = parentWrapper != null && parentWrapper.getHiddenMembers().contains(child.classStruct.qualifiedName);
++        if (synthetic &&
++            (DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) || hidden)) {
++          candidates.add(MemberKey.memberClass(child.classStruct.qualifiedName));
++        }
++      }
++
++      collectCandidates(child, candidates);
++    }
++  }
++
++  private static MemberKey referencedMember(TextToken token) {
++    if (token instanceof FieldTextToken field) {
++      return MemberKey.field(field.className, field.name, field.descriptor.descriptorString);
++    }
++    if (token instanceof MethodTextToken method) {
++      return MemberKey.method(method.className, method.name, method.descriptor.toString());
++    }
++    if (token instanceof ClassTextToken clazz) {
++      return MemberKey.memberClass(clazz.qualifiedName);
++    }
++    return null;
++  }
++
++  private static boolean methodToDecompileIsEmpty() {
++    Object value = DecompilerContext.getProperty(IFernflowerPreferences.METHOD_TO_DECOMPILE);
++    return value == null || value.toString().isEmpty();
++  }
++
++  private static ClassNode rootOf(ClassNode node) {
++    while (node.parent != null) {
++      node = node.parent;
++    }
++    return node;
++  }
++}
+diff --git a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+index 5353261..a2b8567 100644
+--- a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
++++ b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+@@ -21,6 +21,11 @@ public interface IFernflowerPreferences {
+   @Type(DecompilerOption.Type.BOOLEAN)
+   String REMOVE_SYNTHETIC = "remove-synthetic";
+ 
++  @Name("Reference-Aware Synthetic Retention")
++  @Description("Retains omitted generated declarations when emitted Java code refers to them.")
++  @Type(DecompilerOption.Type.BOOLEAN)
++  String REFERENCE_AWARE_SYNTHETIC_RETENTION = "reference-aware-synthetic-retention";
++
+   @Name("Decompile Inner Classes")
+   @Description("Process inner classes and add them to the decompiled output.")
+   @ShortName("din")
+@@ -425,6 +430,7 @@ public interface IFernflowerPreferences {
+ 
+     defaults.put(REMOVE_BRIDGE, "1");
+     defaults.put(REMOVE_SYNTHETIC, "1");
++    defaults.put(REFERENCE_AWARE_SYNTHETIC_RETENTION, "0");
+     defaults.put(DECOMPILE_INNER, "1");
+     defaults.put(DECOMPILE_CLASS_1_4, "1");
+     defaults.put(DECOMPILE_ASSERTIONS, "1");
+diff --git a/test/org/jetbrains/java/decompiler/OptionParserTest.java b/test/org/jetbrains/java/decompiler/OptionParserTest.java
+index 4ba063f..f757bf3 100644
+--- a/test/org/jetbrains/java/decompiler/OptionParserTest.java
++++ b/test/org/jetbrains/java/decompiler/OptionParserTest.java
+@@ -1,6 +1,7 @@
+ package org.jetbrains.java.decompiler;
+ 
+ import org.jetbrains.java.decompiler.main.decompiler.OptionParser;
++import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
+ import org.junit.jupiter.api.Assertions;
+ import org.junit.jupiter.api.Test;
+ 
+@@ -71,4 +72,17 @@ public class OptionParserTest {
+ 
+     Assertions.assertEquals(expected, result);
+   }
++
++  @Test
++  public void testReferenceAwareSyntheticRetentionOption() {
++    Assertions.assertEquals("0", IFernflowerPreferences.DEFAULTS.get(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION));
++
++    Map<String, Object> result = new HashMap<>();
++
++    OptionParser.parse("--reference-aware-synthetic-retention", result);
++    Assertions.assertEquals("1", result.get("reference-aware-synthetic-retention"));
++
++    OptionParser.parse("--no-reference-aware-synthetic-retention", result);
++    Assertions.assertEquals("0", result.get("reference-aware-synthetic-retention"));
++  }
+ }
+diff --git a/test/org/jetbrains/java/decompiler/ReferenceAwareSyntheticRetentionTest.java b/test/org/jetbrains/java/decompiler/ReferenceAwareSyntheticRetentionTest.java
+new file mode 100644
+index 0000000..f6371d8
+--- /dev/null
++++ b/test/org/jetbrains/java/decompiler/ReferenceAwareSyntheticRetentionTest.java
+@@ -0,0 +1,55 @@
++package org.jetbrains.java.decompiler;
++
++import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++public class ReferenceAwareSyntheticRetentionTest {
++  @Test
++  public void retainsOnlyReferencedGeneratedMembers() throws IOException {
++    String withoutRetention = decompile(Map.of());
++    assertFalse(withoutRetention.contains("synthetic field"));
++    assertFalse(withoutRetention.contains("synthetic method"));
++    assertFalse(withoutRetention.contains("class Generated"));
++
++    String withRetention = decompile(Map.of(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION, "1"));
++    assertTrue(withRetention.contains("int generated"));
++    assertFalse(withRetention.contains("int unused"));
++    assertTrue(withRetention.contains("int bridge()"));
++    assertTrue(withRetention.contains("int chained()"));
++    assertTrue(withRetention.contains("int deep()"));
++    assertTrue(withRetention.contains("class Generated"));
++  }
++
++  private static String decompile(Map<String, Object> options) throws IOException {
++    DecompilerTestFixture fixture = new DecompilerTestFixture();
++    Object[] optionPairs = options.entrySet().stream()
++      .flatMap(entry -> java.util.stream.Stream.of(entry.getKey(), entry.getValue()))
++      .toArray();
++    fixture.setUp(optionPairs);
++    try {
++      Path classFile = fixture.getTestDataDir().resolve("classes/jasm/pkg/TestReferenceAwareSyntheticRetention.class");
++      fixture.getDecompiler().addSource(classFile.toFile());
++      Path memberClassFile = fixture.getTestDataDir().resolve("classes/jasm/pkg/TestReferenceAwareSyntheticRetention$Generated.class");
++      fixture.getDecompiler().addSource(memberClassFile.toFile());
++      fixture.getDecompiler().decompileContext();
++
++      try (var files = Files.walk(fixture.getTargetDir())) {
++        Path output = files
++          .filter(path -> path.getFileName().toString().equals("TestReferenceAwareSyntheticRetention.java"))
++          .findFirst()
++          .orElseThrow();
++        return Files.readString(output);
++      }
++    } finally {
++      fixture.tearDown();
++    }
++  }
++}
+diff --git a/testData/src/jasm/TestReferenceAwareSyntheticRetention$Generated.jasm b/testData/src/jasm/TestReferenceAwareSyntheticRetention$Generated.jasm
+new file mode 100644
+index 0000000..9b5bd5b
+--- /dev/null
++++ b/testData/src/jasm/TestReferenceAwareSyntheticRetention$Generated.jasm
+@@ -0,0 +1,15 @@
++package pkg;
++
++synthetic public class TestReferenceAwareSyntheticRetention$Generated
++  version 52:0
++{
++  public static Field value:"I";
++
++  public Method "<init>":"()V"
++    stack 1 locals 1
++  {
++    aload_0;
++    invokespecial Method java/lang/Object."<init>":"()V";
++    return;
++  }
++}
+diff --git a/testData/src/jasm/TestReferenceAwareSyntheticRetention.jasm b/testData/src/jasm/TestReferenceAwareSyntheticRetention.jasm
+new file mode 100644
+index 0000000..59a59ef
+--- /dev/null
++++ b/testData/src/jasm/TestReferenceAwareSyntheticRetention.jasm
+@@ -0,0 +1,67 @@
++package pkg;
++
++super public class TestReferenceAwareSyntheticRetention
++  version 52:0
++{
++  synthetic private static Field generated:"I";
++  synthetic private static Field unused:"I";
++
++  public Method "<init>":"()V"
++    stack 1 locals 1
++  {
++    aload_0;
++    invokespecial Method java/lang/Object."<init>":"()V";
++    return;
++  }
++
++  public static Method useField:"()I"
++    stack 1 locals 0
++  {
++    getstatic Field TestReferenceAwareSyntheticRetention.generated:"I";
++    ireturn;
++  }
++
++  public static synthetic bridge Method bridge:"()I"
++    stack 1 locals 0
++  {
++    iconst_1;
++    ireturn;
++  }
++
++  public static Method useBridge:"()I"
++    stack 1 locals 0
++  {
++    invokestatic Method TestReferenceAwareSyntheticRetention.bridge:"()I";
++    ireturn;
++  }
++
++  synthetic private static Method chained:"()I"
++    stack 1 locals 0
++  {
++    invokestatic Method TestReferenceAwareSyntheticRetention.deep:"()I";
++    ireturn;
++  }
++
++  synthetic private static Method deep:"()I"
++    stack 1 locals 0
++  {
++    iconst_2;
++    ireturn;
++  }
++
++  public static Method useChain:"()I"
++    stack 1 locals 0
++  {
++    invokestatic Method TestReferenceAwareSyntheticRetention.chained:"()I";
++    ireturn;
++  }
++
++  public static Method useMember:"()I"
++    stack 1 locals 0
++  {
++    getstatic Field TestReferenceAwareSyntheticRetention$Generated.value:"I";
++    ireturn;
++  }
++
++  public static InnerClass Generated=class TestReferenceAwareSyntheticRetention$Generated of class TestReferenceAwareSyntheticRetention;
++}

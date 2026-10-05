@@ -1,0 +1,1389 @@
+diff --git a/NEXT_RELEASE_CHANGELOG.md b/NEXT_RELEASE_CHANGELOG.md
+index e0f4cd3..d051197 100644
+--- a/NEXT_RELEASE_CHANGELOG.md
++++ b/NEXT_RELEASE_CHANGELOG.md
+@@ -1,5 +1,7 @@
+ ### Features
+ 
++* Add `@BeanMapping#inheritSuperMappings()` for inheriting property mappings from overridden mapper methods.
++
+ ### Enhancements
+ 
+ ### Bugs
+@@ -7,4 +9,3 @@
+ ### Documentation
+ 
+ ### Build
+-
+diff --git a/core/src/main/java/org/mapstruct/BeanMapping.java b/core/src/main/java/org/mapstruct/BeanMapping.java
+index 309458f..9ae0605 100644
+--- a/core/src/main/java/org/mapstruct/BeanMapping.java
++++ b/core/src/main/java/org/mapstruct/BeanMapping.java
+@@ -21,7 +21,7 @@
+  * <p>
+  * Unless otherwise specified these properties are inherited to the generated bean mapping methods.
+  * <p>
+- * Either {@link #resultType()}, {@link #qualifiedBy()} or {@link #nullValueMappingStrategy()} must be specified.
++ * At least one annotation element must be specified.
+  * </p>
+  * <p><strong>Example:</strong> Determining the result type</p>
+  * <pre><code class='java'>
+@@ -144,6 +144,20 @@ NullValuePropertyMappingStrategy nullValuePropertyMappingStrategy()
+      */
+     Class<? extends Exception> subclassExhaustiveException() default IllegalArgumentException.class;
+ 
++    /**
++     * Inherits property mappings declared on overridden mapping methods from mapper interfaces and superclasses.
++     * Other method-level mapping options are not inherited implicitly. A mapping declared on the overriding method
++     * takes precedence for the same target. Mappings from unrelated supertypes for the same target are ambiguous,
++     * except for mappings with {@code target = "."}, which accumulate.
++     * <p>
++     * The annotated method must override at least one mapping method.
++     *
++     * @return whether property mappings from overridden mapping methods should be inherited
++     *
++     * @since 1.7
++     */
++    boolean inheritSuperMappings() default false;
++
+     /**
+      * Default ignore all mappings. All mappings have to be defined manually. No automatic mapping will take place. No
+      * warning will be issued on missing source or target properties.
+diff --git a/documentation/src/main/asciidoc/chapter-11-reusing-mapping-configurations.asciidoc b/documentation/src/main/asciidoc/chapter-11-reusing-mapping-configurations.asciidoc
+index efacaed..dacf787 100644
+--- a/documentation/src/main/asciidoc/chapter-11-reusing-mapping-configurations.asciidoc
++++ b/documentation/src/main/asciidoc/chapter-11-reusing-mapping-configurations.asciidoc
+@@ -39,6 +39,42 @@ A method can use `@InheritConfiguration` and override or amend the configuration
+ `@InheritConfiguration` cannot refer to methods in a used mapper.
+ ====
+ 
++[[super-mapping-inheritance]]
++=== Inheriting mappings from overridden methods
++
++An overriding bean mapping method can inherit the property mappings declared by the methods it overrides by enabling
++`@BeanMapping(inheritSuperMappings = true)`. This includes `@Mapping` declarations supplied through mapping
++composition annotations, but does not implicitly inherit other method-level options such as `@BeanMapping` settings.
++
++.Mapping method inheriting mappings from an overridden method
++====
++[source, java, linenums]
++[subs="verbatim,attributes"]
++----
++public interface BaseCarMapper {
++
++    @Mapping(target = "numberOfSeats", source = "seatCount")
++    Car carDtoToCar(CarDto source);
++}
++
++@Mapper
++public interface CarMapper extends BaseCarMapper {
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    Car carDtoToCar(CarDto carDto);
++}
++----
++====
++
++A mapping or ignore declared on the overriding method takes precedence for the same target path. Otherwise, the
++mapping from the most specific overridden declaration is used. Mappings for different targets from unrelated parent
++interfaces are combined. If unrelated parent interfaces declare mappings for the same target, the ambiguity must be
++resolved on the overriding method. Mappings with `target = "."` always accumulate.
++
++Override relationships are resolved transitively and through generic supertypes. Qualified source parameter paths are
++rebound to renamed parameters by signature position. Java expressions are copied without modification.
++
+ [[inverse-mappings]]
+ === Inverse mappings
+ 
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java b/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java
+index c37b12e..ebf2381 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/beanmapping/SourceReference.java
+@@ -65,6 +65,7 @@ public static class BuilderFromMapping {
+ 
+         private boolean isForwarded = false;
+         private Method templateMethod = null;
++        private Integer inheritedSourceParameterPosition;
+         private String sourceName;
+         private AnnotationMirror annotationMirror;
+         private AnnotationValue sourceAnnotationValue;
+@@ -78,6 +79,7 @@ public BuilderFromMapping mapping(MappingOptions mapping) {
+             this.sourceName = mapping.getSourceName();
+             this.annotationMirror = mapping.getMirror();
+             this.sourceAnnotationValue = mapping.getSourceAnnotationValue();
++            this.inheritedSourceParameterPosition = mapping.getInheritedSourceParameterPosition();
+             if ( mapping.getInheritContext() != null ) {
+                 isForwarded = mapping.getInheritContext().isForwarded();
+                 templateMethod = mapping.getInheritContext().getTemplateMethod();
+@@ -124,7 +126,13 @@ public SourceReference build() {
+ 
+             // start with an invalid source reference
+             SourceReference result = new SourceReference( null, new ArrayList<>(  ), false );
+-            if ( method.getSourceParameters().size() > 1 ) {
++            if ( inheritedSourceParameterPosition != null
++                && inheritedSourceParameterPosition >= 0
++                && inheritedSourceParameterPosition < method.getParameters().size() ) {
++                Parameter parameter = method.getParameters().get( inheritedSourceParameterPosition );
++                result = buildFromMultipleSourceParameters( segments, parameter );
++            }
++            else if ( method.getSourceParameters().size() > 1 ) {
+                 Parameter parameter = fetchMatchingParameterFromFirstSegment( segments );
+                 if ( parameter != null ) {
+                     result = buildFromMultipleSourceParameters( segments, parameter );
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java b/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java
+index 73a4d7c..1ff8899 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/source/BeanMappingOptions.java
+@@ -127,6 +127,7 @@ private static boolean isConsistent(BeanMappingGem gem, ExecutableElement method
+             && !gem.unmappedTargetPolicy().hasValue()
+             && !gem.unmappedSourcePolicy().hasValue()
+             && !gem.ignoreByDefault().hasValue()
++            && !gem.inheritSuperMappings().hasValue()
+             && !gem.builder().hasValue() ) {
+ 
+             messager.printMessage( method, Message.BEANMAPPING_NO_ELEMENTS );
+@@ -238,6 +239,31 @@ public boolean isIgnoredByDefault() {
+             .orElse( false );
+     }
+ 
++    public boolean isInheritSuperMappings() {
++        return Optional.ofNullable( beanMapping ).map( BeanMappingGem::inheritSuperMappings )
++            .map( GemValue::get )
++            .orElse( false );
++    }
++
++    public boolean hasInheritableOptions() {
++        return beanMapping != null && (
++            beanMapping.resultType().hasValue()
++                || beanMapping.mappingControl().hasValue()
++                || beanMapping.qualifiedBy().hasValue()
++                || beanMapping.qualifiedByName().hasValue()
++                || beanMapping.ignoreUnmappedSourceProperties().hasValue()
++                || beanMapping.nullValueCheckStrategy().hasValue()
++                || beanMapping.nullValuePropertyMappingStrategy().hasValue()
++                || beanMapping.nullValueMappingStrategy().hasValue()
++                || beanMapping.subclassExhaustiveStrategy().hasValue()
++                || beanMapping.subclassExhaustiveException().hasValue()
++                || beanMapping.unmappedTargetPolicy().hasValue()
++                || beanMapping.unmappedSourcePolicy().hasValue()
++                || beanMapping.ignoreByDefault().hasValue()
++                || beanMapping.builder().hasValue()
++        );
++    }
++
+     public List<String> getIgnoreUnmappedSourceProperties() {
+         return ignoreUnmappedSourceProperties;
+     }
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingMethodOptions.java b/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingMethodOptions.java
+index caf7639..714c53a 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingMethodOptions.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingMethodOptions.java
+@@ -166,7 +166,8 @@ public void applyInheritedOptions(SourceMethod sourceMethod, SourceMethod templa
+                 setMapMapping( templateOptions.getMapMapping() );
+             }
+ 
+-            if ( !getBeanMapping().hasAnnotation() && templateOptions.getBeanMapping().hasAnnotation() ) {
++            if ( !getBeanMapping().hasInheritableOptions()
++                && templateOptions.getBeanMapping().hasInheritableOptions() ) {
+                 setBeanMapping( BeanMappingOptions.forInheritance( templateOptions.getBeanMapping( ), isInverse ) );
+             }
+ 
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java b/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java
+index 746aca5..b9d9ceb 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/source/MappingOptions.java
+@@ -58,6 +58,7 @@ public class MappingOptions extends DelegatingOptions {
+     private final MappingGem mapping;
+ 
+     private final InheritContext inheritContext;
++    private final Integer inheritedSourceParameterPosition;
+ 
+     public static class InheritContext {
+ 
+@@ -160,6 +161,7 @@ public static void addInstance(MappingGem mapping, ExecutableElement method,
+             dependsOn,
+             mapping,
+             null,
++            null,
+             beanMappingOptions
+         );
+ 
+@@ -189,6 +191,7 @@ public static MappingOptions forIgnore(String targetName) {
+             Collections.emptySet(),
+             null,
+             null,
++            null,
+             null
+         );
+     }
+@@ -293,6 +296,7 @@ private MappingOptions(String targetName,
+                            Set<String> dependsOn,
+                            MappingGem mapping,
+                            InheritContext inheritContext,
++                           Integer inheritedSourceParameterPosition,
+                            DelegatingOptions next
+     ) {
+         super( next );
+@@ -312,6 +316,7 @@ private MappingOptions(String targetName,
+         this.dependsOn = dependsOn;
+         this.mapping = mapping;
+         this.inheritContext = inheritContext;
++        this.inheritedSourceParameterPosition = inheritedSourceParameterPosition;
+     }
+ 
+     private static String getExpression(MappingGem mapping, ExecutableElement element,
+@@ -454,6 +459,10 @@ public InheritContext getInheritContext() {
+         return inheritContext;
+     }
+ 
++    public Integer getInheritedSourceParameterPosition() {
++        return inheritedSourceParameterPosition;
++    }
++
+     @Override
+     public NullValueCheckStrategyGem getNullValueCheckStrategy() {
+         return Optional.ofNullable( mapping ).map( MappingGem::nullValueCheckStrategy )
+@@ -510,6 +519,7 @@ public MappingOptions copyForInverseInheritance(SourceMethod templateMethod,
+             Collections.emptySet(),
+             mapping,
+             new InheritContext( true, false, templateMethod ),
++            null,
+             beanMappingOptions
+         );
+         return mappingOptions;
+@@ -543,11 +553,36 @@ public MappingOptions copyForForwardInheritance(SourceMethod templateMethod,
+             dependsOn,
+             mapping,
+             new InheritContext( false, true, templateMethod ),
++            null,
+             beanMappingOptions
+         );
+         return mappingOptions;
+     }
+ 
++    public MappingOptions copyForSuperInheritance(Integer sourceParameterPosition,
++                                                  BeanMappingOptions beanMappingOptions) {
++        return new MappingOptions(
++            targetName,
++            element,
++            targetAnnotationValue,
++            sourceName,
++            sourceAnnotationValue,
++            constant,
++            javaExpression,
++            defaultJavaExpression,
++            conditionJavaExpression,
++            defaultValue,
++            isIgnored,
++            formattingParameters,
++            selectionParameters,
++            dependsOn,
++            mapping,
++            null,
++            sourceParameterPosition,
++            beanMappingOptions
++        );
++    }
++
+     @Override
+     public boolean equals(Object o) {
+         if ( this == o ) {
+@@ -583,4 +618,3 @@ public boolean hasAnnotation() {
+     }
+ 
+ }
+-
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java b/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
+index d7a0329..4292438 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
+@@ -8,6 +8,8 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -18,6 +20,8 @@
+ import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.ExecutableType;
+ import javax.lang.model.type.TypeKind;
++import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.ElementFilter;
+ 
+ import org.mapstruct.ap.internal.gem.BeanMappingGem;
+ import org.mapstruct.ap.internal.gem.ConditionGem;
+@@ -58,7 +62,9 @@
+ import org.mapstruct.ap.internal.util.Message;
+ import org.mapstruct.ap.internal.util.MetaAnnotations;
+ import org.mapstruct.ap.internal.util.RepeatableAnnotations;
++import org.mapstruct.ap.internal.util.Strings;
+ import org.mapstruct.ap.internal.util.TypeUtils;
++import org.mapstruct.ap.internal.util.accessor.ReadAccessor;
+ import org.mapstruct.ap.spi.EnumTransformationStrategy;
+ 
+ /**
+@@ -151,6 +157,8 @@ private List<SourceMethod> retrievePrototypeMethods(TypeElement mapperTypeElemen
+ 
+             SourceMethod method =
+                 getMethodRequiringImplementation(
++                    mapperAnnotation.mapperConfigType(),
++                    typeElement,
+                     methodType,
+                     executable,
+                     parameters,
+@@ -240,7 +248,10 @@ private SourceMethod getMethod(Type usedMapperType,
+ 
+         //add method with property mappings if an implementation needs to be generated
+         if ( ( usedMapper.equals( mapperToImplement ) ) && methodRequiresImplementation ) {
+-            return getMethodRequiringImplementation( methodType,
++            return getMethodRequiringImplementation(
++                (DeclaredType) usedMapperType.getTypeMirror(),
++                usedMapper,
++                methodType,
+                 method,
+                 parameters,
+                 containsTargetTypeParameter,
+@@ -259,7 +270,8 @@ else if ( isValidReferencedMethod( parameters ) || isValidFactoryMethod( method,
+         }
+     }
+ 
+-    private SourceMethod getMethodRequiringImplementation(ExecutableType methodType, ExecutableElement method,
++    private SourceMethod getMethodRequiringImplementation(DeclaredType includingType,
++            TypeElement overrideContextType, ExecutableType methodType, ExecutableElement method,
+             List<Parameter> parameters,
+             boolean containsTargetTypeParameter,
+             MapperOptions mapperOptions,
+@@ -289,8 +301,9 @@ private SourceMethod getMethodRequiringImplementation(ExecutableType methodType,
+         ParameterProvidedMethods contextProvidedMethods =
+             retrieveContextProvidedMethods( contextParameters, mapperToImplement, mapperOptions );
+ 
++        BeanMappingGem beanMapping = BeanMappingGem.instanceOn( method );
+         BeanMappingOptions beanMappingOptions = BeanMappingOptions.getInstanceOn(
+-            BeanMappingGem.instanceOn( method ),
++            beanMapping,
+             mapperOptions,
+             method,
+             messager,
+@@ -298,6 +311,19 @@ private SourceMethod getMethodRequiringImplementation(ExecutableType methodType,
+             typeFactory );
+ 
+         Set<MappingOptions> mappingOptions = getMappings( method, beanMappingOptions );
++        if ( beanMappingOptions.isInheritSuperMappings() ) {
++            mappingOptions.addAll(
++                getInheritedSuperMappings(
++                    includingType,
++                    overrideContextType,
++                    method,
++                    parameters,
++                    beanMappingOptions,
++                    beanMapping,
++                    mappingOptions
++                )
++            );
++        }
+ 
+         IterableMappingOptions iterableMappingOptions = IterableMappingOptions.fromGem(
+             IterableMappingGem.instanceOn( method ),
+@@ -642,6 +668,219 @@ private Set<MappingOptions> getMappings(ExecutableElement method, BeanMappingOpt
+         return processedAnnotations;
+     }
+ 
++    private Set<MappingOptions> getInheritedSuperMappings(DeclaredType includingType,
++                                                           TypeElement overrideContextType,
++                                                           ExecutableElement method,
++                                                           List<Parameter> parameters,
++                                                           BeanMappingOptions beanMappingOptions,
++                                                           BeanMappingGem beanMapping,
++                                                           Set<MappingOptions> declaredMappings) {
++        List<ExecutableElement> overriddenMethods = new ArrayList<>();
++        collectOverriddenMappingMethods(
++            method,
++            (TypeElement) method.getEnclosingElement(),
++            overrideContextType,
++            new HashSet<>(),
++            overriddenMethods
++        );
++
++        if ( overriddenMethods.isEmpty() ) {
++            messager.printMessage(
++                method,
++                beanMapping.mirror(),
++                beanMapping.inheritSuperMappings().getAnnotationValue(),
++                Message.BEANMAPPING_INHERIT_SUPER_MAPPINGS_NO_SUPER
++            );
++            return Collections.emptySet();
++        }
++
++        Set<String> declaredTargets = new HashSet<>();
++        for ( MappingOptions declaredMapping : declaredMappings ) {
++            if ( !".".equals( declaredMapping.getTargetName() ) ) {
++                declaredTargets.add( declaredMapping.getTargetName() );
++            }
++        }
++
++        Set<MappingOptions> inheritedMappings = new LinkedHashSet<>();
++        Map<String, List<SuperMapping>> mappingsByTarget = new LinkedHashMap<>();
++        for ( ExecutableElement overriddenMethod : overriddenMethods ) {
++            ExecutableType overriddenMethodType = typeFactory.getMethodType( includingType, overriddenMethod );
++            List<Parameter> overriddenParameters = typeFactory.getParameters(
++                overriddenMethodType,
++                overriddenMethod
++            );
++            Set<MappingOptions> mappings = getMappings( overriddenMethod, beanMappingOptions );
++            for ( MappingOptions mapping : mappings ) {
++                Integer sourceParameterPosition = getSuperMappingSourceParameterPosition(
++                    mapping.getSourceName(),
++                    overriddenParameters,
++                    parameters
++                );
++                MappingOptions inheritedMapping = mapping.copyForSuperInheritance(
++                    sourceParameterPosition,
++                    beanMappingOptions
++                );
++                String targetName = mapping.getTargetName();
++                if ( ".".equals( targetName ) ) {
++                    inheritedMappings.add( inheritedMapping );
++                }
++                else if ( !declaredTargets.contains( targetName ) ) {
++                    mappingsByTarget.computeIfAbsent( targetName, key -> new ArrayList<>() )
++                        .add( new SuperMapping( overriddenMethod, inheritedMapping ) );
++                }
++            }
++        }
++
++        for ( Map.Entry<String, List<SuperMapping>> entry : mappingsByTarget.entrySet() ) {
++            List<SuperMapping> mostSpecificMappings = getMostSpecificMappings(
++                entry.getValue()
++            );
++            if ( mostSpecificMappings.size() == 1 ) {
++                inheritedMappings.add( mostSpecificMappings.get( 0 ).mapping );
++            }
++            else {
++                Set<String> declaringTypes = new LinkedHashSet<>();
++                for ( SuperMapping mostSpecificMapping : mostSpecificMappings ) {
++                    TypeElement declaringType = (TypeElement) mostSpecificMapping.method.getEnclosingElement();
++                    declaringTypes.add( declaringType.getQualifiedName().toString() );
++                }
++                messager.printMessage(
++                    method,
++                    beanMapping.mirror(),
++                    beanMapping.inheritSuperMappings().getAnnotationValue(),
++                    Message.BEANMAPPING_INHERIT_SUPER_MAPPINGS_AMBIGUOUS,
++                    entry.getKey(),
++                    Strings.join( declaringTypes, ", " )
++                );
++            }
++        }
++
++        return inheritedMappings;
++    }
++
++    private void collectOverriddenMappingMethods(ExecutableElement method,
++                                                 TypeElement declaringType,
++                                                 TypeElement overrideContextType,
++                                                 Set<ExecutableElement> visitedMethods,
++                                                 List<ExecutableElement> overriddenMethods) {
++        for ( TypeMirror supertype : typeUtils.directSupertypes( declaringType.asType() ) ) {
++            Element supertypeElement = typeUtils.asElement( supertype );
++            if ( !( supertypeElement instanceof TypeElement ) ) {
++                continue;
++            }
++
++            TypeElement supertypeDeclaration = (TypeElement) supertypeElement;
++            List<ExecutableElement> declaredMethods = ElementFilter.methodsIn(
++                supertypeDeclaration.getEnclosedElements()
++            );
++            for ( ExecutableElement candidate : declaredMethods ) {
++                if ( candidate.getModifiers().contains( Modifier.ABSTRACT )
++                    && elementUtils.overrides( method, candidate, overrideContextType )
++                    && visitedMethods.add( candidate ) ) {
++                    overriddenMethods.add( candidate );
++                }
++            }
++            collectOverriddenMappingMethods(
++                method,
++                supertypeDeclaration,
++                overrideContextType,
++                visitedMethods,
++                overriddenMethods
++            );
++        }
++    }
++
++    private List<SuperMapping> getMostSpecificMappings(List<SuperMapping> mappings) {
++        List<SuperMapping> mostSpecificMappings = new ArrayList<>();
++        for ( SuperMapping candidate : mappings ) {
++            boolean overridden = false;
++            for ( SuperMapping other : mappings ) {
++                TypeElement candidateDeclaringType = (TypeElement) candidate.method.getEnclosingElement();
++                TypeElement otherDeclaringType = (TypeElement) other.method.getEnclosingElement();
++                if ( candidate != other
++                    && typeUtils.isSubtypeErased( otherDeclaringType.asType(), candidateDeclaringType.asType() ) ) {
++                    overridden = true;
++                    break;
++                }
++            }
++            if ( !overridden ) {
++                mostSpecificMappings.add( candidate );
++            }
++        }
++        return mostSpecificMappings;
++    }
++
++    private Integer getSuperMappingSourceParameterPosition(String sourceName,
++                                                           List<Parameter> overriddenParameters,
++                                                           List<Parameter> overridingParameters) {
++        if ( sourceName == null ) {
++            return null;
++        }
++
++        String trimmedSourceName = sourceName.trim();
++        String[] sourceSegments = trimmedSourceName.split( "\\." );
++        if ( sourceSegments.length == 0 ) {
++            return null;
++        }
++
++        List<Parameter> sourceParameters = Parameter.getSourceParameters( overriddenParameters );
++        Parameter referencedParameter = null;
++        if ( sourceParameters.size() > 1 ) {
++            referencedParameter = Parameter.getSourceParameter( overriddenParameters, sourceSegments[0] );
++        }
++        else if ( sourceParameters.size() == 1 ) {
++            Parameter sourceParameter = sourceParameters.get( 0 );
++            boolean allowedMapToBean = !sourceParameter.getType().isMapType()
++                || !sourceSegments[0].equals( sourceParameter.getName() );
++            if ( !matchesSourceProperties( sourceParameter.getType(), sourceSegments, allowedMapToBean )
++                && sourceSegments[0].equals( sourceParameter.getName() ) ) {
++                referencedParameter = sourceParameter;
++            }
++        }
++
++        if ( referencedParameter == null ) {
++            return null;
++        }
++
++        int parameterPosition = overriddenParameters.indexOf( referencedParameter );
++        if ( parameterPosition < 0 || parameterPosition >= overridingParameters.size() ) {
++            return null;
++        }
++        return parameterPosition;
++    }
++
++    private boolean matchesSourceProperties(Type sourceType, String[] sourceSegments, boolean allowedMapToBean) {
++        Type currentType = sourceType;
++        for ( int i = 0; i < sourceSegments.length; i++ ) {
++            Type noBoundsType = currentType.withoutBounds();
++            if ( noBoundsType.isOptionalType() ) {
++                noBoundsType = noBoundsType.getOptionalBaseType();
++            }
++            ReadAccessor readAccessor = noBoundsType.getReadAccessor(
++                sourceSegments[i],
++                i > 0 || allowedMapToBean
++            );
++            if ( readAccessor == null ) {
++                return false;
++            }
++            currentType = typeFactory.getReturnType(
++                (DeclaredType) noBoundsType.getTypeMirror(),
++                readAccessor
++            );
++        }
++        return true;
++    }
++
++    private static class SuperMapping {
++        private final ExecutableElement method;
++        private final MappingOptions mapping;
++
++        private SuperMapping(ExecutableElement method, MappingOptions mapping) {
++            this.method = method;
++            this.mapping = mapping;
++        }
++    }
++
+     /**
+      * Retrieves the subclass mappings configured via {@code @SubclassMapping} from the given method.
+      *
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java b/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java
+index acac07b..72c7bad 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/util/Message.java
+@@ -48,6 +48,10 @@ public enum Message {
+     BEANMAPPING_UNKNOWN_PROPERTY_IN_DEPENDS_ON( "\"%s\" is no property of the method return type." ),
+     BEANMAPPING_IGNORE_BY_DEFAULT_WITH_MAPPING_TARGET_THIS( "Using @BeanMapping( ignoreByDefault = true ) with @Mapping( target = \".\", ... ) is not allowed. You'll need to explicitly ignore the target properties that should be ignored instead." ),
+     BEANMAPPING_UNKNOWN_PROPERTY_IN_IGNORED("No property named \"%s\" exists in @Ignored for target type \"%s\". Did you mean \"%s\"?"),
++    BEANMAPPING_INHERIT_SUPER_MAPPINGS_NO_SUPER(
++        "@BeanMapping( inheritSuperMappings = true ) requires the method to override at least one mapping method." ),
++    BEANMAPPING_INHERIT_SUPER_MAPPINGS_AMBIGUOUS(
++        "Cannot inherit mapping for target \"%s\" from unrelated mapper types %s." ),
+ 
+     CONDITION_MISSING_APPLIES_TO_STRATEGY("'appliesTo' has to have at least one value in @Condition" ),
+     CONDITION_SOURCE_PARAMETERS_INVALID_PARAMETER("Parameter \"%s\" cannot be used with the ConditionStrategy#SOURCE_PARAMETERS. Only source and @Context parameters are allowed for conditions applicable to source parameters." ),
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ErroneousInheritedSuperMappingsMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ErroneousInheritedSuperMappingsMapper.java
+new file mode 100644
+index 0000000..13d3a89
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/ErroneousInheritedSuperMappingsMapper.java
+@@ -0,0 +1,57 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++
++@Mapper
++public interface ErroneousInheritedSuperMappingsMapper extends ConflictLeft, ConflictRight {
++
++    @BeanMapping(inheritSuperMappings = true)
++    Target noSuper(Source source);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    Target conflict(Source source);
++
++    class Source {
++        private String value;
++
++        public String getValue() {
++            return value;
++        }
++
++        public void setValue(String value) {
++            this.value = value;
++        }
++    }
++
++    class Target {
++        private String value;
++
++        public String getValue() {
++            return value;
++        }
++
++        public void setValue(String value) {
++            this.value = value;
++        }
++    }
++}
++
++interface ConflictLeft {
++
++    @Mapping(target = "value", source = "value")
++    ErroneousInheritedSuperMappingsMapper.Target conflict(ErroneousInheritedSuperMappingsMapper.Source source);
++}
++
++interface ConflictRight {
++
++    @Mapping(target = "value", source = "value")
++    ErroneousInheritedSuperMappingsMapper.Target conflict(ErroneousInheritedSuperMappingsMapper.Source source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlatteningSuperMappingsMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlatteningSuperMappingsMapper.java
+new file mode 100644
+index 0000000..f5dca46
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/FlatteningSuperMappingsMapper.java
+@@ -0,0 +1,168 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++import org.mapstruct.factory.Mappers;
++
++@Mapper
++public interface FlatteningSuperMappingsMapper extends FlatteningLeft, FlatteningRight {
++
++    FlatteningSuperMappingsMapper INSTANCE = Mappers.getMapper( FlatteningSuperMappingsMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    @Mapping(target = ".", source = "current")
++    FlatTarget map(Container source);
++
++    class Container {
++        private RootPart root;
++        private LeftPart left;
++        private RightPart right;
++        private CurrentPart current;
++
++        public RootPart getRoot() {
++            return root;
++        }
++
++        public void setRoot(RootPart root) {
++            this.root = root;
++        }
++
++        public LeftPart getLeft() {
++            return left;
++        }
++
++        public void setLeft(LeftPart left) {
++            this.left = left;
++        }
++
++        public RightPart getRight() {
++            return right;
++        }
++
++        public void setRight(RightPart right) {
++            this.right = right;
++        }
++
++        public CurrentPart getCurrent() {
++            return current;
++        }
++
++        public void setCurrent(CurrentPart current) {
++            this.current = current;
++        }
++    }
++
++    class RootPart {
++        private String rootValue;
++
++        public String getRootValue() {
++            return rootValue;
++        }
++
++        public void setRootValue(String rootValue) {
++            this.rootValue = rootValue;
++        }
++    }
++
++    class LeftPart {
++        private String leftValue;
++
++        public String getLeftValue() {
++            return leftValue;
++        }
++
++        public void setLeftValue(String leftValue) {
++            this.leftValue = leftValue;
++        }
++    }
++
++    class RightPart {
++        private String rightValue;
++
++        public String getRightValue() {
++            return rightValue;
++        }
++
++        public void setRightValue(String rightValue) {
++            this.rightValue = rightValue;
++        }
++    }
++
++    class CurrentPart {
++        private String currentValue;
++
++        public String getCurrentValue() {
++            return currentValue;
++        }
++
++        public void setCurrentValue(String currentValue) {
++            this.currentValue = currentValue;
++        }
++    }
++
++    class FlatTarget {
++        private String rootValue;
++        private String leftValue;
++        private String rightValue;
++        private String currentValue;
++
++        public String getRootValue() {
++            return rootValue;
++        }
++
++        public void setRootValue(String rootValue) {
++            this.rootValue = rootValue;
++        }
++
++        public String getLeftValue() {
++            return leftValue;
++        }
++
++        public void setLeftValue(String leftValue) {
++            this.leftValue = leftValue;
++        }
++
++        public String getRightValue() {
++            return rightValue;
++        }
++
++        public void setRightValue(String rightValue) {
++            this.rightValue = rightValue;
++        }
++
++        public String getCurrentValue() {
++            return currentValue;
++        }
++
++        public void setCurrentValue(String currentValue) {
++            this.currentValue = currentValue;
++        }
++    }
++}
++
++interface FlatteningRoot {
++
++    @Mapping(target = ".", source = "root")
++    FlatteningSuperMappingsMapper.FlatTarget map(FlatteningSuperMappingsMapper.Container source);
++}
++
++interface FlatteningLeft extends FlatteningRoot {
++
++    @Override
++    @Mapping(target = ".", source = "left")
++    FlatteningSuperMappingsMapper.FlatTarget map(FlatteningSuperMappingsMapper.Container source);
++}
++
++interface FlatteningRight extends FlatteningRoot {
++
++    @Override
++    @Mapping(target = ".", source = "right")
++    FlatteningSuperMappingsMapper.FlatTarget map(FlatteningSuperMappingsMapper.Container source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsMapper.java
+new file mode 100644
+index 0000000..e6b891d
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsMapper.java
+@@ -0,0 +1,317 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.InheritConfiguration;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++import org.mapstruct.NullValueMappingStrategy;
++import org.mapstruct.factory.Mappers;
++
++@Mapper
++public interface InheritedSuperMappingsMapper extends BasicParent, PropertyParent, PairParent,
++    ConcreteGenericParent, NoMappingsParent, DisabledParent, ExpressionParent, ConfigurationParent, SpecificParent,
++    BranchLeft, BranchRight, ResolvedBranchLeft, ResolvedBranchRight {
++
++    InheritedSuperMappingsMapper INSTANCE = Mappers.getMapper( InheritedSuperMappingsMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    @Mapping(target = "ignored", ignore = true)
++    Target basic(Source renamed);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    PropertyTarget property(PropertySource renamed);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    PairTarget pair(Source alpha, Source name);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    PropertyTarget generic(Source renamed);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    Target automatic(Source renamed);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = false)
++    Target disabled(Source renamed);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    Target expression(Source renamed);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    @InheritConfiguration(name = "configurationTemplate")
++    Target configured(Source source);
++
++    @Mapping(target = "display", source = "alias")
++    @Mapping(target = "age", source = "configuredAge")
++    @BeanMapping(nullValueMappingStrategy = NullValueMappingStrategy.RETURN_DEFAULT)
++    Target configurationTemplate(Source source);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    Target specific(Source source);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    Target branches(Source source);
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    @Mapping(target = "display", source = "alias")
++    Target resolvedBranches(Source source);
++
++    class Source {
++        private String name;
++        private String display;
++        private String alias;
++        private int age;
++        private int configuredAge;
++        private String ignored;
++
++        public String getName() {
++            return name;
++        }
++
++        public void setName(String name) {
++            this.name = name;
++        }
++
++        public String getDisplay() {
++            return display;
++        }
++
++        public void setDisplay(String display) {
++            this.display = display;
++        }
++
++        public String getAlias() {
++            return alias;
++        }
++
++        public void setAlias(String alias) {
++            this.alias = alias;
++        }
++
++        public int getAge() {
++            return age;
++        }
++
++        public void setAge(int age) {
++            this.age = age;
++        }
++
++        public int getConfiguredAge() {
++            return configuredAge;
++        }
++
++        public void setConfiguredAge(int configuredAge) {
++            this.configuredAge = configuredAge;
++        }
++
++        public String getIgnored() {
++            return ignored;
++        }
++
++        public void setIgnored(String ignored) {
++            this.ignored = ignored;
++        }
++    }
++
++    class PropertySource {
++        private String source;
++        private String name;
++
++        public String getSource() {
++            return source;
++        }
++
++        public void setSource(String source) {
++            this.source = source;
++        }
++
++        public String getName() {
++            return name;
++        }
++
++        public void setName(String name) {
++            this.name = name;
++        }
++    }
++
++    class Target {
++        private String display;
++        private int age;
++        private String ignored;
++
++        public String getDisplay() {
++            return display;
++        }
++
++        public void setDisplay(String display) {
++            this.display = display;
++        }
++
++        public int getAge() {
++            return age;
++        }
++
++        public void setAge(int age) {
++            this.age = age;
++        }
++
++        public String getIgnored() {
++            return ignored;
++        }
++
++        public void setIgnored(String ignored) {
++            this.ignored = ignored;
++        }
++    }
++
++    class PropertyTarget {
++        private String value;
++
++        public String getValue() {
++            return value;
++        }
++
++        public void setValue(String value) {
++            this.value = value;
++        }
++    }
++
++    class PairTarget {
++        private String left;
++        private Source right;
++
++        public String getLeft() {
++            return left;
++        }
++
++        public void setLeft(String left) {
++            this.left = left;
++        }
++
++        public Source getRight() {
++            return right;
++        }
++
++        public void setRight(Source right) {
++            this.right = right;
++        }
++    }
++}
++
++interface BasicParent {
++
++    @BeanMapping(ignoreByDefault = true)
++    @DisplayMapping
++    @Mapping(target = "ignored", source = "original.ignored")
++    InheritedSuperMappingsMapper.Target basic(InheritedSuperMappingsMapper.Source original);
++}
++
++@Target({ ElementType.METHOD, ElementType.ANNOTATION_TYPE })
++@Retention(RetentionPolicy.CLASS)
++@Mapping(target = "display", source = "original.name")
++@interface DisplayMapping {
++}
++
++interface PropertyParent {
++
++    @Mapping(target = "value", source = "source")
++    InheritedSuperMappingsMapper.PropertyTarget property(InheritedSuperMappingsMapper.PropertySource source);
++}
++
++interface PairParent {
++
++    @Mapping(target = "left", source = "first.name")
++    @Mapping(target = "right", source = "second")
++    InheritedSuperMappingsMapper.PairTarget pair(InheritedSuperMappingsMapper.Source first,
++                                                 InheritedSuperMappingsMapper.Source second);
++}
++
++interface GenericParent<S extends InheritedSuperMappingsMapper.Source> {
++
++    @Mapping(target = "value", source = "input.name")
++    InheritedSuperMappingsMapper.PropertyTarget generic(S input);
++}
++
++interface ConcreteGenericParent extends GenericParent<InheritedSuperMappingsMapper.Source> {
++}
++
++interface NoMappingsParent {
++
++    InheritedSuperMappingsMapper.Target automatic(InheritedSuperMappingsMapper.Source source);
++}
++
++interface DisabledParent {
++
++    @Mapping(target = "display", source = "alias")
++    InheritedSuperMappingsMapper.Target disabled(InheritedSuperMappingsMapper.Source source);
++}
++
++interface ExpressionParent {
++
++    @Mapping(target = "display", expression = "java(\"source\")")
++    InheritedSuperMappingsMapper.Target expression(InheritedSuperMappingsMapper.Source source);
++}
++
++interface ConfigurationParent {
++
++    @Mapping(target = "display", source = "parent.name")
++    InheritedSuperMappingsMapper.Target configured(InheritedSuperMappingsMapper.Source parent);
++}
++
++interface SpecificRoot {
++
++    @Mapping(target = "display", source = "name")
++    @Mapping(target = "age", source = "age")
++    InheritedSuperMappingsMapper.Target specific(InheritedSuperMappingsMapper.Source source);
++}
++
++interface SpecificParent extends SpecificRoot {
++
++    @Override
++    @Mapping(target = "display", source = "alias")
++    InheritedSuperMappingsMapper.Target specific(InheritedSuperMappingsMapper.Source source);
++}
++
++interface BranchLeft {
++
++    @Mapping(target = "display", source = "name")
++    InheritedSuperMappingsMapper.Target branches(InheritedSuperMappingsMapper.Source source);
++}
++
++interface BranchRight {
++
++    @Mapping(target = "age", source = "configuredAge")
++    InheritedSuperMappingsMapper.Target branches(InheritedSuperMappingsMapper.Source source);
++}
++
++interface ResolvedBranchLeft {
++
++    @Mapping(target = "display", source = "name")
++    InheritedSuperMappingsMapper.Target resolvedBranches(InheritedSuperMappingsMapper.Source source);
++}
++
++interface ResolvedBranchRight {
++
++    @Mapping(target = "display", source = "name")
++    InheritedSuperMappingsMapper.Target resolvedBranches(InheritedSuperMappingsMapper.Source source);
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsTest.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsTest.java
+new file mode 100644
+index 0000000..df36d86
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/InheritedSuperMappingsTest.java
+@@ -0,0 +1,138 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import javax.tools.Diagnostic.Kind;
++
++import org.mapstruct.ap.testutil.ProcessorTest;
++import org.mapstruct.ap.testutil.WithClasses;
++import org.mapstruct.ap.testutil.compilation.annotation.CompilationResult;
++import org.mapstruct.ap.testutil.compilation.annotation.Diagnostic;
++import org.mapstruct.ap.testutil.compilation.annotation.ExpectedCompilationOutcome;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++class InheritedSuperMappingsTest {
++
++    @ProcessorTest
++    @WithClasses(InheritedSuperMappingsMapper.class)
++    void shouldInheritAndMergeSuperMappings() {
++        InheritedSuperMappingsMapper.Source source = source();
++
++        InheritedSuperMappingsMapper.Target basic = InheritedSuperMappingsMapper.INSTANCE.basic( source );
++        assertThat( basic.getDisplay() ).isEqualTo( "name" );
++        assertThat( basic.getAge() ).isEqualTo( 10 );
++        assertThat( basic.getIgnored() ).isNull();
++
++        InheritedSuperMappingsMapper.PropertySource propertySource =
++            new InheritedSuperMappingsMapper.PropertySource();
++        propertySource.setSource( "property" );
++        propertySource.setName( "whole-parameter" );
++        assertThat( InheritedSuperMappingsMapper.INSTANCE.property( propertySource ).getValue() )
++            .isEqualTo( "property" );
++
++        InheritedSuperMappingsMapper.Source second = source();
++        second.setName( "second" );
++        InheritedSuperMappingsMapper.PairTarget pair = InheritedSuperMappingsMapper.INSTANCE.pair( source, second );
++        assertThat( pair.getLeft() ).isEqualTo( "name" );
++        assertThat( pair.getRight() ).isSameAs( second );
++
++        assertThat( InheritedSuperMappingsMapper.INSTANCE.generic( source ).getValue() ).isEqualTo( "name" );
++        assertThat( InheritedSuperMappingsMapper.INSTANCE.automatic( source ).getAge() ).isEqualTo( 10 );
++        assertThat( InheritedSuperMappingsMapper.INSTANCE.disabled( source ).getDisplay() ).isEqualTo( "display" );
++        assertThat( InheritedSuperMappingsMapper.INSTANCE.expression( source ).getDisplay() ).isEqualTo( "source" );
++
++        InheritedSuperMappingsMapper.Target configured =
++            InheritedSuperMappingsMapper.INSTANCE.configured( source );
++        assertThat( configured.getDisplay() ).isEqualTo( "name" );
++        assertThat( configured.getAge() ).isEqualTo( 20 );
++        assertThat( InheritedSuperMappingsMapper.INSTANCE.configured( null ) ).isNotNull();
++
++        InheritedSuperMappingsMapper.Target specific = InheritedSuperMappingsMapper.INSTANCE.specific( source );
++        assertThat( specific.getDisplay() ).isEqualTo( "alias" );
++        assertThat( specific.getAge() ).isEqualTo( 10 );
++
++        InheritedSuperMappingsMapper.Target branches = InheritedSuperMappingsMapper.INSTANCE.branches( source );
++        assertThat( branches.getDisplay() ).isEqualTo( "name" );
++        assertThat( branches.getAge() ).isEqualTo( 20 );
++
++        InheritedSuperMappingsMapper.Target resolvedBranches =
++            InheritedSuperMappingsMapper.INSTANCE.resolvedBranches( source );
++        assertThat( resolvedBranches.getDisplay() ).isEqualTo( "alias" );
++    }
++
++    @ProcessorTest
++    @WithClasses(SuperclassInheritedSuperMappingsMapper.class)
++    void shouldInheritMappingsFromSuperclass() {
++        SuperclassInheritedSuperMappingsMapper.Source source =
++            new SuperclassInheritedSuperMappingsMapper.Source();
++        source.setName( "superclass" );
++
++        assertThat( SuperclassInheritedSuperMappingsMapper.INSTANCE.map( source ).getValue() )
++            .isEqualTo( "superclass" );
++    }
++
++    @ProcessorTest
++    @WithClasses(FlatteningSuperMappingsMapper.class)
++    void shouldAccumulateFlatteningMappingsAcrossDiamond() {
++        FlatteningSuperMappingsMapper.Container source = new FlatteningSuperMappingsMapper.Container();
++        FlatteningSuperMappingsMapper.RootPart root = new FlatteningSuperMappingsMapper.RootPart();
++        root.setRootValue( "root" );
++        source.setRoot( root );
++        FlatteningSuperMappingsMapper.LeftPart left = new FlatteningSuperMappingsMapper.LeftPart();
++        left.setLeftValue( "left" );
++        source.setLeft( left );
++        FlatteningSuperMappingsMapper.RightPart right = new FlatteningSuperMappingsMapper.RightPart();
++        right.setRightValue( "right" );
++        source.setRight( right );
++        FlatteningSuperMappingsMapper.CurrentPart current = new FlatteningSuperMappingsMapper.CurrentPart();
++        current.setCurrentValue( "current" );
++        source.setCurrent( current );
++
++        FlatteningSuperMappingsMapper.FlatTarget target = FlatteningSuperMappingsMapper.INSTANCE.map( source );
++
++        assertThat( target.getRootValue() ).isEqualTo( "root" );
++        assertThat( target.getLeftValue() ).isEqualTo( "left" );
++        assertThat( target.getRightValue() ).isEqualTo( "right" );
++        assertThat( target.getCurrentValue() ).isEqualTo( "current" );
++    }
++
++    @ProcessorTest
++    @WithClasses(ErroneousInheritedSuperMappingsMapper.class)
++    @ExpectedCompilationOutcome(
++        value = CompilationResult.FAILED,
++        diagnostics = {
++            @Diagnostic(
++                type = ErroneousInheritedSuperMappingsMapper.class,
++                kind = Kind.ERROR,
++                line = 15,
++                message = "@BeanMapping( inheritSuperMappings = true ) requires the method to override at least " +
++                    "one mapping method."
++            ),
++            @Diagnostic(
++                type = ErroneousInheritedSuperMappingsMapper.class,
++                kind = Kind.ERROR,
++                line = 19,
++                message = "Cannot inherit mapping for target \"value\" from unrelated mapper types " +
++                    "org.mapstruct.ap.test.inheritsupermappings.ConflictLeft, " +
++                    "org.mapstruct.ap.test.inheritsupermappings.ConflictRight."
++            )
++        }
++    )
++    void shouldReportInvalidSuperMappingInheritance() {
++    }
++
++    private InheritedSuperMappingsMapper.Source source() {
++        InheritedSuperMappingsMapper.Source source = new InheritedSuperMappingsMapper.Source();
++        source.setName( "name" );
++        source.setDisplay( "display" );
++        source.setAlias( "alias" );
++        source.setAge( 10 );
++        source.setConfiguredAge( 20 );
++        source.setIgnored( "ignored" );
++        return source;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/SuperclassInheritedSuperMappingsMapper.java b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/SuperclassInheritedSuperMappingsMapper.java
+new file mode 100644
+index 0000000..2207cb5
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/inheritsupermappings/SuperclassInheritedSuperMappingsMapper.java
+@@ -0,0 +1,54 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.inheritsupermappings;
++
++import org.mapstruct.BeanMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++import org.mapstruct.factory.Mappers;
++
++@Mapper
++public abstract class SuperclassInheritedSuperMappingsMapper extends SuperclassParent {
++
++    static final SuperclassInheritedSuperMappingsMapper INSTANCE =
++        Mappers.getMapper( SuperclassInheritedSuperMappingsMapper.class );
++
++    @Override
++    @BeanMapping(inheritSuperMappings = true)
++    public abstract Target map(Source renamed);
++
++    public static class Source {
++        private String name;
++
++        public String getName() {
++            return name;
++        }
++
++        public void setName(String name) {
++            this.name = name;
++        }
++    }
++
++    public static class Target {
++        private String value;
++
++        public String getValue() {
++            return value;
++        }
++
++        public void setValue(String value) {
++            this.value = value;
++        }
++    }
++}
++
++abstract class SuperclassParent {
++
++    @Mapping(target = "value", source = "source.name")
++    public abstract SuperclassInheritedSuperMappingsMapper.Target map(
++        SuperclassInheritedSuperMappingsMapper.Source source
++    );
++}

@@ -1,0 +1,1234 @@
+diff --git a/serial/src/org/immutables/serial/CompactBinary.java b/serial/src/org/immutables/serial/CompactBinary.java
+new file mode 100644
+index 0000000..16bb44d
+--- /dev/null
++++ b/serial/src/org/immutables/serial/CompactBinary.java
+@@ -0,0 +1,485 @@
++package org.immutables.serial;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInput;
++import java.io.DataInputStream;
++import java.io.DataOutput;
++import java.io.DataOutputStream;
++import java.io.EOFException;
++import java.io.IOException;
++import java.lang.reflect.Array;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.List;
++import java.util.Map;
++
++/** Runtime support used by compact binary methods generated for immutable values. */
++public final class CompactBinary {
++  private static final int MAGIC = 0x494D4231;
++
++  private CompactBinary() {}
++
++  public static Writer writer(DataOutput output, int fieldCount) throws IOException {
++    return new Writer(output, fieldCount);
++  }
++
++  public static Reader reader(DataInput input) throws IOException {
++    return new Reader(input);
++  }
++
++  public static final class Writer {
++    private final DataOutput output;
++    private int remaining;
++
++    private Writer(DataOutput output, int fieldCount) throws IOException {
++      if (fieldCount < 0) {
++        throw new IllegalArgumentException("Negative field count");
++      }
++      this.output = output;
++      this.remaining = fieldCount;
++      output.writeInt(MAGIC);
++      output.writeInt(fieldCount);
++    }
++
++    public void write(long id, String shape, Object value) throws IOException {
++      if (remaining == 0) {
++        throw new IOException("Too many compact binary fields");
++      }
++      byte[] shapeBytes = shape.getBytes(StandardCharsets.US_ASCII);
++      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++      DataOutputStream data = new DataOutputStream(bytes);
++      new Parser(shape).parse().write(data, value);
++      data.flush();
++
++      output.writeLong(id);
++      output.writeInt(shapeBytes.length);
++      output.write(shapeBytes);
++      output.writeInt(bytes.size());
++      output.write(bytes.toByteArray());
++      remaining--;
++    }
++  }
++
++  public static final class Reader {
++    private final List<Field> fields;
++
++    private Reader(DataInput input) throws IOException {
++      if (input.readInt() != MAGIC) {
++        throw new IOException("Invalid compact binary header");
++      }
++      int count = input.readInt();
++      if (count < 0) {
++        throw new IOException("Negative compact binary field count");
++      }
++      fields = new ArrayList<>(count);
++      for (int i = 0; i < count; i++) {
++        long id = input.readLong();
++        int shapeLength = input.readInt();
++        if (shapeLength < 0 || shapeLength > 1024) {
++          throw new IOException("Invalid compact binary shape length");
++        }
++        byte[] shape = new byte[shapeLength];
++        input.readFully(shape);
++        int valueLength = input.readInt();
++        if (valueLength < 0) {
++          throw new IOException("Negative compact binary value length");
++        }
++        byte[] value = new byte[valueLength];
++        input.readFully(value);
++        fields.add(new Field(id, shape, value));
++      }
++    }
++
++    public boolean has(long id, String shape) {
++      return find(id, shape) != null;
++    }
++
++    public Object read(long id, String shape, Class<?>... leafTypes) throws IOException {
++      Field field = find(id, shape);
++      if (field == null) {
++        return null;
++      }
++      Node node = new Parser(shape).parse();
++      if (node.leafCount() != leafTypes.length) {
++        throw new IOException("Incorrect compact binary leaf type count");
++      }
++      DataInputStream data = new DataInputStream(new ByteArrayInputStream(field.value));
++      Object value = node.read(data, leafTypes);
++      if (data.read() != -1) {
++        throw new IOException("Trailing compact binary value data");
++      }
++      return value;
++    }
++
++    private Field find(long id, String shape) {
++      byte[] expected = shape.getBytes(StandardCharsets.US_ASCII);
++      for (Field field : fields) {
++        if (field.id == id && Arrays.equals(field.shape, expected)) {
++          return field;
++        }
++      }
++      return null;
++    }
++  }
++
++  private static final class Field {
++    final long id;
++    final byte[] shape;
++    final byte[] value;
++
++    Field(long id, byte[] shape, byte[] value) {
++      this.id = id;
++      this.shape = shape;
++      this.value = value;
++    }
++  }
++
++  private abstract static class Node {
++    abstract void write(DataOutput output, Object value) throws IOException;
++    abstract Object read(DataInput input, Class<?>[] leafTypes) throws IOException;
++    int leafCount() { return 0; }
++  }
++
++  private static final class ScalarNode extends Node {
++    private final char kind;
++    private final int leaf;
++
++    ScalarNode(char kind, int leaf) {
++      this.kind = kind;
++      this.leaf = leaf;
++    }
++
++    @Override void write(DataOutput output, Object value) throws IOException {
++      boolean nullable = Character.isUpperCase(kind) || kind == 's' || kind == 'e' || kind == 'n';
++      if (nullable) {
++        output.writeBoolean(value != null);
++        if (value == null) return;
++      }
++      switch (Character.toLowerCase(kind)) {
++      case 'z': output.writeBoolean((Boolean) value); return;
++      case 'b': output.writeByte((Byte) value); return;
++      case 'h': output.writeShort((Short) value); return;
++      case 'i': output.writeInt((Integer) value); return;
++      case 'j': output.writeLong((Long) value); return;
++      case 'f': output.writeFloat((Float) value); return;
++      case 'd': output.writeDouble((Double) value); return;
++      case 'c': output.writeChar((Character) value); return;
++      case 's': writeString(output, (String) value); return;
++      case 'e': writeString(output, ((Enum<?>) value).name()); return;
++      case 'n': invokeWrite(value, output); return;
++      default: throw new IOException("Unknown compact binary scalar " + kind);
++      }
++    }
++
++    @Override Object read(DataInput input, Class<?>[] leafTypes) throws IOException {
++      boolean nullable = Character.isUpperCase(kind) || kind == 's' || kind == 'e' || kind == 'n';
++      if (nullable && !input.readBoolean()) return null;
++      switch (Character.toLowerCase(kind)) {
++      case 'z': return input.readBoolean();
++      case 'b': return input.readByte();
++      case 'h': return input.readShort();
++      case 'i': return input.readInt();
++      case 'j': return input.readLong();
++      case 'f': return input.readFloat();
++      case 'd': return input.readDouble();
++      case 'c': return input.readChar();
++      case 's': return readString(input);
++      case 'e': return readEnum(readString(input), leafTypes[leaf]);
++      case 'n': return invokeRead(leafTypes[leaf], input);
++      default: throw new IOException("Unknown compact binary scalar " + kind);
++      }
++    }
++
++    @Override int leafCount() {
++      return leaf < 0 ? 0 : leaf + 1;
++    }
++  }
++
++  private static final class OptionalNode extends Node {
++    private final char kind;
++    private final Node element;
++
++    OptionalNode(char kind, Node element) {
++      this.kind = kind;
++      this.element = element;
++    }
++
++    @Override void write(DataOutput output, Object value) throws IOException {
++      boolean present;
++      Object item;
++      try {
++        if (kind == 'o') {
++          present = ((java.util.Optional<?>) value).isPresent();
++          item = present ? ((java.util.Optional<?>) value).get() : null;
++        } else if (kind == 'g') {
++          Class<?> optionalType = Class.forName("com.Capella.common.base.Optional");
++          Method isPresent = optionalType.getMethod("isPresent");
++          present = (Boolean) isPresent.invoke(value);
++          item = present ? optionalType.getMethod("get").invoke(value) : null;
++        } else if (kind == 'i') {
++          present = ((java.util.OptionalInt) value).isPresent();
++          item = present ? ((java.util.OptionalInt) value).getAsInt() : null;
++        } else if (kind == 'j') {
++          present = ((java.util.OptionalLong) value).isPresent();
++          item = present ? ((java.util.OptionalLong) value).getAsLong() : null;
++        } else {
++          present = ((java.util.OptionalDouble) value).isPresent();
++          item = present ? ((java.util.OptionalDouble) value).getAsDouble() : null;
++        }
++      } catch (ReflectiveOperationException | LinkageError ex) {
++        throw reflectionFailure(ex);
++      }
++      output.writeBoolean(present);
++      if (present) element.write(output, item);
++    }
++
++    @Override Object read(DataInput input, Class<?>[] leafTypes) throws IOException {
++      return input.readBoolean() ? element.read(input, leafTypes) : null;
++    }
++
++    @Override int leafCount() { return element.leafCount(); }
++  }
++
++  private static final class ArrayNode extends Node {
++    private final Node element;
++
++    ArrayNode(Node element) {
++      this.element = element;
++    }
++
++    @Override void write(DataOutput output, Object value) throws IOException {
++      if (value == null) {
++        output.writeInt(-1);
++        return;
++      }
++      int length = Array.getLength(value);
++      output.writeInt(length);
++      for (int i = 0; i < length; i++) element.write(output, Array.get(value, i));
++    }
++
++    @Override Object read(DataInput input, Class<?>[] leafTypes) throws IOException {
++      int length = input.readInt();
++      if (length < -1) throw new IOException("Invalid compact binary array length");
++      if (length == -1) return null;
++      Class<?> component = componentType(element, leafTypes);
++      Object array = Array.newInstance(component, length);
++      for (int i = 0; i < length; i++) Array.set(array, i, element.read(input, leafTypes));
++      return array;
++    }
++
++    @Override int leafCount() { return element.leafCount(); }
++  }
++
++  private static final class CollectionNode extends Node {
++    private final Node element;
++
++    CollectionNode(Node element) {
++      this.element = element;
++    }
++
++    @Override void write(DataOutput output, Object value) throws IOException {
++      if (value == null) {
++        output.writeInt(-1);
++        return;
++      }
++      Collection<?> collection = (Collection<?>) value;
++      output.writeInt(collection.size());
++      for (Object item : collection) element.write(output, item);
++    }
++
++    @Override Object read(DataInput input, Class<?>[] leafTypes) throws IOException {
++      int size = input.readInt();
++      if (size < -1) throw new IOException("Invalid compact binary collection size");
++      if (size == -1) return null;
++      Object[] items = new Object[size];
++      for (int i = 0; i < size; i++) items[i] = element.read(input, leafTypes);
++      return items;
++    }
++
++    @Override int leafCount() { return element.leafCount(); }
++  }
++
++  private static final class MappingNode extends Node {
++    private final boolean multimap;
++    private final Node key;
++    private final Node value;
++
++    MappingNode(boolean multimap, Node key, Node value) {
++      this.multimap = multimap;
++      this.key = key;
++      this.value = value;
++    }
++
++    @Override void write(DataOutput output, Object mapping) throws IOException {
++      if (mapping == null) {
++        output.writeInt(-1);
++        return;
++      }
++      Iterable<?> entries;
++      int size;
++      if (multimap) {
++        try {
++          Object result = mapping.getClass().getMethod("entries").invoke(mapping);
++          entries = (Iterable<?>) result;
++          size = ((Collection<?>) result).size();
++        } catch (ReflectiveOperationException ex) {
++          throw reflectionFailure(ex);
++        }
++      } else {
++        Collection<?> result = ((Map<?, ?>) mapping).entrySet();
++        entries = result;
++        size = result.size();
++      }
++      output.writeInt(size);
++      for (Object item : entries) {
++        Map.Entry<?, ?> entry = (Map.Entry<?, ?>) item;
++        key.write(output, entry.getKey());
++        value.write(output, entry.getValue());
++      }
++    }
++
++    @Override Object read(DataInput input, Class<?>[] leafTypes) throws IOException {
++      int size = input.readInt();
++      if (size < -1) throw new IOException("Invalid compact binary mapping size");
++      if (size == -1) return null;
++      Object[] entries = new Object[size * 2];
++      for (int i = 0; i < entries.length; i += 2) {
++        entries[i] = key.read(input, leafTypes);
++        entries[i + 1] = value.read(input, leafTypes);
++      }
++      return entries;
++    }
++
++    @Override int leafCount() { return Math.max(key.leafCount(), value.leafCount()); }
++  }
++
++  private static final class Parser {
++    private final String shape;
++    private int position;
++    private int leaf;
++
++    Parser(String shape) {
++      this.shape = shape;
++    }
++
++    Node parse() throws IOException {
++      Node node = node();
++      if (position != shape.length()) throw new IOException("Invalid compact binary shape " + shape);
++      return node;
++    }
++
++    private Node node() throws IOException {
++      if (position >= shape.length()) throw new EOFException("Incomplete compact binary shape");
++      char kind = shape.charAt(position++);
++      if ("zZbBhHiIjJfFdDcCs".indexOf(kind) >= 0) return new ScalarNode(kind, -1);
++      if (kind == 'e' || kind == 'n') return new ScalarNode(kind, leaf++);
++      if (kind == 'o' || kind == 'g') return new OptionalNode(kind, enclosed());
++      if (kind == 'p') {
++        if (position >= shape.length()) throw new EOFException("Incomplete compact binary optional shape");
++        char specialized = shape.charAt(position++);
++        if (specialized == 'i') return new OptionalNode('i', new ScalarNode('i', -1));
++        if (specialized == 'j') return new OptionalNode('j', new ScalarNode('j', -1));
++        if (specialized == 'd') return new OptionalNode('d', new ScalarNode('d', -1));
++        throw new IOException("Invalid compact binary optional shape " + shape);
++      }
++      if (kind == 'a') return new ArrayNode(enclosed());
++      if ("ltruv".indexOf(kind) >= 0) return new CollectionNode(enclosed());
++      if ("mqxwyk".indexOf(kind) >= 0) {
++        expect('(');
++        Node key = node();
++        expect(',');
++        Node value = node();
++        expect(')');
++        return new MappingNode("wyk".indexOf(kind) >= 0, key, value);
++      }
++      throw new IOException("Unknown compact binary shape " + shape);
++    }
++
++    private Node enclosed() throws IOException {
++      expect('(');
++      Node result = node();
++      expect(')');
++      return result;
++    }
++
++    private void expect(char expected) throws IOException {
++      if (position >= shape.length() || shape.charAt(position++) != expected) {
++        throw new IOException("Invalid compact binary shape " + shape);
++      }
++    }
++  }
++
++  private static void writeString(DataOutput output, String value) throws IOException {
++    byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++    output.writeInt(bytes.length);
++    output.write(bytes);
++  }
++
++  private static String readString(DataInput input) throws IOException {
++    int length = input.readInt();
++    if (length < 0) throw new IOException("Negative compact binary string length");
++    byte[] bytes = new byte[length];
++    input.readFully(bytes);
++    return new String(bytes, StandardCharsets.UTF_8);
++  }
++
++  @SuppressWarnings({"rawtypes", "unchecked"})
++  private static Object readEnum(String name, Class<?> enumType) throws IOException {
++    try {
++      return Enum.valueOf((Class) enumType, name);
++    } catch (IllegalArgumentException ex) {
++      throw new IOException("Unknown enum constant " + name, ex);
++    }
++  }
++
++  private static void invokeWrite(Object value, DataOutput output) throws IOException {
++    try {
++      Method method = value.getClass().getDeclaredMethod("writeTo", DataOutput.class);
++      method.setAccessible(true);
++      method.invoke(value, output);
++    } catch (ReflectiveOperationException ex) {
++      throw reflectionFailure(ex);
++    }
++  }
++
++  private static Object invokeRead(Class<?> type, DataInput input) throws IOException {
++    try {
++      Method method = type.getDeclaredMethod("readFrom", DataInput.class);
++      method.setAccessible(true);
++      return method.invoke(null, input);
++    } catch (ReflectiveOperationException | SecurityException ex) {
++      throw reflectionFailure(ex);
++    }
++  }
++
++  private static IOException reflectionFailure(Throwable ex) {
++    Throwable cause = ex instanceof InvocationTargetException
++        ? ((InvocationTargetException) ex).getCause()
++        : ex;
++    if (cause instanceof IOException) return (IOException) cause;
++    return new IOException("Cannot access compact binary value", cause);
++  }
++
++  private static Class<?> componentType(Node node, Class<?>[] leafTypes) throws IOException {
++    if (!(node instanceof ScalarNode)) throw new IOException("Unsupported compact binary array component");
++    ScalarNode scalar = (ScalarNode) node;
++    switch (Character.toLowerCase(scalar.kind)) {
++    case 'z': return scalar.kind == 'z' ? boolean.class : Boolean.class;
++    case 'b': return scalar.kind == 'b' ? byte.class : Byte.class;
++    case 'h': return scalar.kind == 'h' ? short.class : Short.class;
++    case 'i': return scalar.kind == 'i' ? int.class : Integer.class;
++    case 'j': return scalar.kind == 'j' ? long.class : Long.class;
++    case 'f': return scalar.kind == 'f' ? float.class : Float.class;
++    case 'd': return scalar.kind == 'd' ? double.class : Double.class;
++    case 'c': return scalar.kind == 'c' ? char.class : Character.class;
++    case 's': return String.class;
++    case 'e': return leafTypes[scalar.leaf];
++    default: throw new IOException("Unsupported compact binary array component");
++    }
++  }
++}
+diff --git a/serial/test/org/immutables/serial/fixture/CompactBinaryTest.java b/serial/test/org/immutables/serial/fixture/CompactBinaryTest.java
+new file mode 100644
+index 0000000..5ec9ac1
+--- /dev/null
++++ b/serial/test/org/immutables/serial/fixture/CompactBinaryTest.java
+@@ -0,0 +1,204 @@
++package org.immutables.serial.fixture;
++
++import com.Capella.common.collect.ImmutableBiMap;
++import com.Capella.common.collect.ImmutableListMultimap;
++import com.Capella.common.collect.ImmutableSetMultimap;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.EOFException;
++import java.lang.reflect.Method;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Optional;
++import java.util.OptionalDouble;
++import java.util.OptionalInt;
++import java.util.OptionalLong;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import org.junit.Test;
++import static org.immutables.check.Checkers.check;
++
++public class CompactBinaryTest {
++  @Test
++  public void roundTripsBuilderValue() throws Exception {
++    char[] characters = new char[100_000];
++    Arrays.fill(characters, 'x');
++    String longText = new String(characters);
++    TreeMap<Integer, String> sortedMap = new TreeMap<>();
++    sortedMap.put(2, "two");
++    sortedMap.put(1, "one");
++    ImmutableCompactNested nested = ImmutableCompactNested.builder().number(7).text("nested").build();
++    ImmutableCompactBinaryValue value = ImmutableCompactBinaryValue.builder()
++        .flag(true)
++        .boxed(12)
++        .text(longText)
++        .color(BinaryColor.RED)
++        .optional("present")
++        .guavaOptional(BinaryColor.BLUE)
++        .optionalInt(OptionalInt.of(3))
++        .optionalLong(OptionalLong.of(4))
++        .optionalDouble(OptionalDouble.of(5.5))
++        .numbers(1, 2, 3)
++        .colors(BinaryColor.BLUE, BinaryColor.RED)
++        .addList("a", "b")
++        .addSet(BinaryColor.RED)
++        .addSortedSet(3, 1)
++        .addMultiset("same", "same", "other")
++        .putMap("one", 1)
++        .putAllSortedMap(sortedMap)
++        .putAllBiMap(ImmutableBiMap.of("red", BinaryColor.RED))
++        .putAllListMultimap(ImmutableListMultimap.of("k", 1, "k", 1))
++        .putAllSetMultimap(ImmutableSetMultimap.of("k", BinaryColor.BLUE))
++        .nested(nested)
++        .build();
++
++    ImmutableCompactBinaryValue copy = ImmutableCompactBinaryValue.readFrom(input(bytes(value)));
++
++    check(copy).is(value);
++    check(Arrays.equals(copy.numbers(), value.numbers()));
++    check(copy.colors()).isOf(value.colors());
++    check(copy.doubled()).is(24);
++    check(copy.auxiliary()).is(Optional.empty());
++  }
++
++  @Test
++  public void roundTripsConstructorValue() throws Exception {
++    ImmutableCompactConstructorValue value = ImmutableCompactConstructorValue.of(
++        9,
++        "constructor",
++        Optional.of(BinaryColor.BLUE),
++        Arrays.asList(1, 2),
++        new TreeSet<>(Arrays.asList("a", "b")),
++        Collections.singletonMap("x", 10L));
++
++    check(ImmutableCompactConstructorValue.readFrom(input(bytes(value)))).is(value);
++  }
++
++  @Test
++  public void matchesByNameAndShapeAcrossVersions() throws Exception {
++    ImmutableCompactVersionOne one = ImmutableCompactVersionOne.builder()
++        .number(1)
++        .text("text")
++        .changed(2)
++        .renamed("old")
++        .build();
++    ImmutableCompactVersionTwo two = ImmutableCompactVersionTwo.readFrom(input(bytes(one)));
++
++    check(two.number()).is(1);
++    check(two.text()).is("text");
++    check(two.added()).is(Optional.empty());
++    check(two.changed()).is(Optional.empty());
++    check(two.replacement()).is(Optional.empty());
++
++    ImmutableCompactVersionTwo newer = ImmutableCompactVersionTwo.builder()
++        .number(3)
++        .text("new")
++        .added(4L)
++        .changed("different")
++        .replacement("renamed")
++        .build();
++    ImmutableCompactVersionOne older = ImmutableCompactVersionOne.readFrom(input(bytes(newer)));
++
++    check(older.number()).is(3);
++    check(older.text()).is("new");
++    check(older.changed()).is(Optional.empty());
++    check(older.renamed()).is(Optional.empty());
++  }
++
++  @Test
++  public void enumAndNestedCompatibilityIgnoreDeclaredTypeName() throws Exception {
++    ImmutableCompactEnumOne enumOne = ImmutableCompactEnumOne.builder().color(BinaryColor.RED).build();
++    check(ImmutableCompactEnumTwo.readFrom(input(bytes(enumOne))).color())
++        .is(ReorderedBinaryColor.RED);
++
++    ImmutableCompactOuterOne outerOne = ImmutableCompactOuterOne.builder()
++        .nested(ImmutableCompactNested.builder().number(4).text("inside").build())
++        .tail("tail")
++        .build();
++    ImmutableCompactOuterTwo outerTwo = ImmutableCompactOuterTwo.readFrom(input(bytes(outerOne)));
++    check(outerTwo.tail()).is("tail");
++    check(outerTwo.nested().number()).is(4);
++    check(outerTwo.nested().text()).is("inside");
++
++    ImmutableCompactGenericOuter generic = ImmutableCompactGenericOuter.builder()
++        .nested(ImmutableCompactGenericNested.<Integer>builder().text("generic").build())
++        .build();
++    check(ImmutableCompactGenericOuter.readFrom(input(bytes(generic)))).is(generic);
++  }
++
++  @Test(expected = EOFException.class)
++  public void incompleteInputFails() throws Exception {
++    ImmutableCompactVersionOne value = ImmutableCompactVersionOne.builder()
++        .number(1)
++        .text("text")
++        .build();
++    byte[] bytes = bytes(value);
++    ImmutableCompactVersionOne.readFrom(input(Arrays.copyOf(bytes, bytes.length - 1)));
++  }
++
++  @Test
++  public void unsupportedRecursiveAndConflictingTypesHaveNoPair() {
++    check(!hasDeclaredMethod(ImmutableCompactRecursive.class, "writeTo"));
++    check(!hasDeclaredMethod(ImmutableCompactRecursive.class, "readFrom"));
++    check(!hasDeclaredMethod(ImmutableCompactUnsupported.class, "writeTo"));
++    check(!hasDeclaredMethod(ImmutableCompactUnsupported.class, "readFrom"));
++    check(!hasDeclaredMethod(ImmutableCompactRequiredAuxiliary.class, "writeTo"));
++    check(!hasDeclaredMethod(ImmutableCompactRequiredAuxiliary.class, "readFrom"));
++    check(!hasDeclaredMethod(ImmutableCompactConflict.class, "readFrom"));
++  }
++
++  private static byte[] bytes(ImmutableCompactBinaryValue value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    value.writeTo(new DataOutputStream(bytes));
++    return bytes.toByteArray();
++  }
++
++  private static byte[] bytes(ImmutableCompactConstructorValue value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    value.writeTo(new DataOutputStream(bytes));
++    return bytes.toByteArray();
++  }
++
++  private static byte[] bytes(ImmutableCompactVersionOne value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    value.writeTo(new DataOutputStream(bytes));
++    return bytes.toByteArray();
++  }
++
++  private static byte[] bytes(ImmutableCompactVersionTwo value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    value.writeTo(new DataOutputStream(bytes));
++    return bytes.toByteArray();
++  }
++
++  private static byte[] bytes(ImmutableCompactEnumOne value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    value.writeTo(new DataOutputStream(bytes));
++    return bytes.toByteArray();
++  }
++
++  private static byte[] bytes(ImmutableCompactOuterOne value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    value.writeTo(new DataOutputStream(bytes));
++    return bytes.toByteArray();
++  }
++
++  private static byte[] bytes(ImmutableCompactGenericOuter value) throws Exception {
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    value.writeTo(new DataOutputStream(bytes));
++    return bytes.toByteArray();
++  }
++
++  private static DataInputStream input(byte[] bytes) {
++    return new DataInputStream(new ByteArrayInputStream(bytes));
++  }
++
++  private static boolean hasDeclaredMethod(Class<?> type, String name) {
++    for (Method method : type.getDeclaredMethods()) {
++      if (method.getName().equals(name)) return true;
++    }
++    return false;
++  }
++}
+diff --git a/serial/test/org/immutables/serial/fixture/CompactBinaryValues.java b/serial/test/org/immutables/serial/fixture/CompactBinaryValues.java
+new file mode 100644
+index 0000000..46310fc
+--- /dev/null
++++ b/serial/test/org/immutables/serial/fixture/CompactBinaryValues.java
+@@ -0,0 +1,160 @@
++package org.immutables.serial.fixture;
++
++import com.Capella.common.collect.BiMap;
++import com.Capella.common.collect.ListMultimap;
++import com.Capella.common.collect.Multiset;
++import com.Capella.common.collect.SetMultimap;
++import java.io.DataOutput;
++import java.io.IOException;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.OptionalDouble;
++import java.util.OptionalInt;
++import java.util.OptionalLong;
++import java.util.Set;
++import java.util.SortedMap;
++import java.util.SortedSet;
++import org.immutables.value.Value;
++
++enum BinaryColor {
++  BLUE,
++  RED
++}
++
++enum ReorderedBinaryColor {
++  RED,
++  BLUE
++}
++
++@Value.Immutable
++interface CompactNested {
++  int number();
++  String text();
++}
++
++@Value.Immutable
++interface CompactNestedOther {
++  String text();
++  int number();
++}
++
++@Value.Immutable
++interface CompactBinaryValue {
++  boolean flag();
++  Integer boxed();
++  String text();
++  BinaryColor color();
++  Optional<String> optional();
++  com.Capella.common.base.Optional<BinaryColor> guavaOptional();
++  OptionalInt optionalInt();
++  OptionalLong optionalLong();
++  OptionalDouble optionalDouble();
++  int[] numbers();
++  BinaryColor[] colors();
++  List<String> list();
++  Set<BinaryColor> set();
++  @Value.NaturalOrder SortedSet<Integer> sortedSet();
++  Multiset<String> multiset();
++  Map<String, Integer> map();
++  @Value.NaturalOrder SortedMap<Integer, String> sortedMap();
++  BiMap<String, BinaryColor> biMap();
++  ListMultimap<String, Integer> listMultimap();
++  SetMultimap<String, BinaryColor> setMultimap();
++  CompactNested nested();
++
++  @Value.Derived
++  default int doubled() {
++    return boxed() * 2;
++  }
++
++  @Value.Auxiliary
++  @Value.Default
++  default Optional<String> auxiliary() {
++    return Optional.empty();
++  }
++}
++
++@Value.Immutable(builder = false)
++interface CompactConstructorValue {
++  @Value.Parameter int number();
++  @Value.Parameter String text();
++  @Value.Parameter Optional<BinaryColor> color();
++  @Value.Parameter List<Integer> list();
++  @Value.Parameter Set<String> set();
++  @Value.Parameter Map<String, Long> map();
++}
++
++@Value.Immutable
++interface CompactVersionOne {
++  int number();
++  String text();
++  Optional<Integer> changed();
++  Optional<String> renamed();
++}
++
++@Value.Immutable
++interface CompactVersionTwo {
++  Optional<Long> added();
++  Optional<String> changed();
++  String text();
++  int number();
++  Optional<String> replacement();
++}
++
++@Value.Immutable
++interface CompactEnumOne {
++  BinaryColor color();
++}
++
++@Value.Immutable
++interface CompactEnumTwo {
++  ReorderedBinaryColor color();
++}
++
++@Value.Immutable
++interface CompactOuterOne {
++  CompactNested nested();
++  String tail();
++}
++
++@Value.Immutable
++interface CompactOuterTwo {
++  String tail();
++  CompactNestedOther nested();
++}
++
++@Value.Immutable
++interface CompactGenericNested<T> {
++  String text();
++}
++
++@Value.Immutable
++interface CompactGenericOuter {
++  CompactGenericNested<Integer> nested();
++}
++
++@Value.Immutable
++interface CompactRecursive {
++  CompactRecursive next();
++}
++
++@Value.Immutable
++interface CompactUnsupported {
++  Object value();
++}
++
++@Value.Immutable
++interface CompactRequiredAuxiliary {
++  int value();
++  @Value.Auxiliary String requiredAuxiliary();
++}
++
++@Value.Immutable
++interface CompactConflict {
++  int value();
++
++  default void writeTo(DataOutput output) throws IOException {
++    output.writeInt(value());
++  }
++}
+diff --git a/value-processor/src/org/immutables/value/processor/Immutables.generator b/value-processor/src/org/immutables/value/processor/Immutables.generator
+index df98fab..b8040a5 100644
+--- a/value-processor/src/org/immutables/value/processor/Immutables.generator
++++ b/value-processor/src/org/immutables/value/processor/Immutables.generator
+@@ -229,6 +229,7 @@ public static[type.generics.def] [factoryBuildStageBuilderType type] [type.facto
+ [generateConstruction type]
+   [generateImmutableCopyOf type]
+   [generateSerialization type]
++  [generateCompactBinary type]
+   [rr.valueHelperMethods type.implementedAttributes]
+ [if type.generateToBuilder]
+   /**
+@@ -291,6 +292,134 @@ public static[type.generics.def] [factoryBuildStageBuilderType type] [type.facto
+ [/for]
+ [/template]
+ 
++[template generateCompactBinary Type type]
++[if type.compactBinary]
++[for String arr = '[]', String ai = '[i]', String ai1 = '[i + 1]']
++
++/** Writes this value in its compact structural binary form. */
++public void writeTo(java.io.DataOutput output) throws java.io.IOException {
++  org.immutables.serial.CompactBinary.Writer writer =
++      org.immutables.serial.CompactBinary.writer(output, [size type.compactBinaryAttributes]);
++[for v in type.compactBinaryAttributes]
++  writer.write([v.compactBinaryId]L, "[v.compactBinaryShape]", [v.names.get]());
++[/for]
++}
++
++/** Reads a value from its compact structural binary form. */
++public static[type.generics.def] [type.typeImmutable] readFrom(java.io.DataInput input)
++    throws java.io.IOException {
++  org.immutables.serial.CompactBinary.Reader reader =
++      org.immutables.serial.CompactBinary.reader(input);
++[if type.useBuilder]
++  [type.typeBuilder] builder = [castBuildStagedBuilder type][type.factoryBuilder.relative]()[/castBuildStagedBuilder];
++[for v in type.compactBinaryAttributes]
++  if (reader.has([v.compactBinaryId]L, "[v.compactBinaryShape]")) {
++    [if v.collectionType]
++    Object[arr] items = (Object[arr]) reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]);
++      [if v.nullable]
++    if (items == null) {
++      builder.[v.names.init](null);
++    } else {
++      [/if]
++    for (Object item : items) {
++      builder.[v.names.add]([castObject v.wrappedElementType]item);
++    }
++      [if v.nullable]
++    }
++      [/if]
++    [else if v.mapType]
++    Object[arr] entries = (Object[arr]) reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]);
++      [if v.nullable]
++    if (entries == null) {
++      builder.[v.names.init](null);
++    } else {
++      [/if]
++    for (int i = 0; i < entries.length; i += 2) {
++      builder.[v.names.put]([castObject v.wrappedElementType]entries[ai], [castObject v.wrappedSecondaryElementType]entries[ai1]);
++    }
++      [if v.nullable]
++    }
++      [/if]
++    [else if v.optionalType]
++    Object value = reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]);
++    if (value != null) {
++      builder.[v.names.init]([castObject v.wrappedElementType]value);
++    }
++    [else]
++    builder.[v.names.init]([castObject v.wrapperType]reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]));
++    [/if]
++  }
++[/for]
++  return builder.[type.names.build]();
++[else]
++  [for v in type.constructorArguments]
++    [if v.collectionType or v.mapType]
++  [createBuilderForCollection type v][v.name]Builder[/createBuilderForCollection]
++    [else if v.optionalType]
++  [v.type] [v.name]Value = [optionalEmpty v];
++    [else]
++  [atNullable v][v.wrapperType] [v.name]Value = null;
++  boolean [v.name]Present = false;
++    [/if]
++  [/for]
++[for v in type.compactBinaryAttributes]
++  if (reader.has([v.compactBinaryId]L, "[v.compactBinaryShape]")) {
++    [if v.collectionType]
++    Object[arr] items = (Object[arr]) reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]);
++      [if v.nullable]
++    if (items == null) {
++      [v.name]Builder = null;
++    } else {
++      [/if]
++    for (Object item : items) [v.name]Builder.add([castObject v.wrappedElementType]item);
++      [if v.nullable]
++    }
++      [/if]
++    [else if v.mapType]
++    Object[arr] entries = (Object[arr]) reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]);
++      [if v.nullable]
++    if (entries == null) {
++      [v.name]Builder = null;
++    } else {
++      [/if]
++    for (int i = 0; i < entries.length; i += 2) {
++      [v.name]Builder.put([castObject v.wrappedElementType]entries[ai], [castObject v.wrappedSecondaryElementType]entries[ai1]);
++    }
++      [if v.nullable]
++    }
++      [/if]
++    [else if v.optionalType]
++    Object value = reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]);
++    if (value != null) [v.name]Value = [optionalOf v]([castObject v.wrappedElementType]value);
++    [else]
++    [v.name]Value = [castObject v.wrapperType]reader.read([v.compactBinaryId]L, "[v.compactBinaryShape]"[for leaf in v.compactBinaryLeafTypes], [leaf].class[/for]);
++    [v.name]Present = true;
++    [/if]
++  }
++  [/for]
++  [for v in type.constructorArguments]
++    [if v.mandatory]
++      [if not v.collectionType]
++        [if not v.mapType]
++          [if not v.optionalType]
++  if (![v.name]Present) throw new java.io.EOFException("Missing compact binary attribute: [v.name]");
++          [/if]
++        [/if]
++      [/if]
++    [/if]
++  [/for]
++  [if type.useConstructor]
++  return [type.factoryOf.relative]([output.linesShortable][for v in type.constructorArguments][if not for.first],[/if]
++      [if v.collectionType or v.mapType][if v.nullable][v.name]Builder == null ? null : [/if][createBuiltCollection type v][v.name]Builder[/createBuiltCollection][else][v.name]Value[/if][/for]);[/output.linesShortable]
++  [else]
++  return [type.factoryInstance.relative]();
++  [/if]
++[/if]
++}
++[/for]
++[/if]
++[/template]
++
+ [template extendsImplements Type type]
+ [if type.implementing]
+ implements [type.typeAbstract][if type.serial.shouldImplement], java.io.Serializable[/if] {
+diff --git a/value-processor/src/org/immutables/value/processor/meta/ValueAttribute.java b/value-processor/src/org/immutables/value/processor/meta/ValueAttribute.java
+index d4b4a6a..e2df3b0 100644
+--- a/value-processor/src/org/immutables/value/processor/meta/ValueAttribute.java
++++ b/value-processor/src/org/immutables/value/processor/meta/ValueAttribute.java
+@@ -115,6 +115,8 @@ public final class ValueAttribute extends TypeIntrospectionBase implements HasSt
+ 
+   private boolean generateOrdinalValueSet;
+   private TypeMirror arrayComponent;
++  private boolean compactBinaryNestedTypeInitialized;
++  private @Nullable ValueType compactBinaryNestedType;
+ 
+   @Nullable
+   private NullabilityAnnotationInfo nullability;
+@@ -948,6 +950,139 @@ public final class ValueAttribute extends TypeIntrospectionBase implements HasSt
+     return isPrimitiveWrappedType(returnTypeName);
+   }
+ 
++  public String compactBinaryShape() {
++    ensureTypeIntrospected();
++    if (isJdkSpecializedOptional()) {
++      switch (typeKind) {
++      case OPTIONAL_INT_JDK: return "pi";
++      case OPTIONAL_LONG_JDK: return "pj";
++      case OPTIONAL_DOUBLE_JDK: return "pd";
++      default: throw new AssertionError();
++      }
++    }
++    if (isOptionalType()) {
++      String element = compactBinaryScalarShape(firstTypeParameter(), containedTypeElement, false);
++      return element.isEmpty() ? "" : (isGuavaOptional() ? "g(" : "o(") + element + ")";
++    }
++    if (isArrayType()) {
++      String element = compactBinaryScalarShape(firstTypeParameter(), containedTypeElement, true);
++      return element.isEmpty() ? "" : "a(" + element + ")";
++    }
++    if (isCollectionType()) {
++      if (isCustomCollectionType()) return "";
++      String element = compactBinaryScalarShape(firstTypeParameter(), containedTypeElement, false);
++      if (element.isEmpty()) return "";
++      String prefix;
++      if (typeKind.isList()) prefix = "l";
++      else if (typeKind.isSortedSet()) prefix = "r";
++      else if (typeKind.isSortedMultiset()) prefix = "v";
++      else if (typeKind.isMultiset()) prefix = "u";
++      else prefix = "t";
++      return prefix + "(" + element + ")";
++    }
++    if (isMapType()) {
++      String key = compactBinaryScalarShape(firstTypeParameter(), containedTypeElement, false);
++      String value = compactBinaryScalarShape(secondTypeParameter(), containedSecondaryTypeElement, false);
++      if (key.isEmpty() || value.isEmpty()) return "";
++      String prefix;
++      if (typeKind.isSortedMap()) prefix = "q";
++      else if (typeKind.isBiMap()) prefix = "x";
++      else if (typeKind.isListMultimap()) prefix = "y";
++      else if (typeKind.isSetMultimap()) prefix = "k";
++      else if (typeKind.isMultimap()) prefix = "w";
++      else prefix = "m";
++      return prefix + "(" + key + "," + value + ")";
++    }
++    return compactBinaryScalarShape(returnTypeName, containedTypeElement, false);
++  }
++
++  public List<String> compactBinaryLeafTypes() {
++    ensureTypeIntrospected();
++    ImmutableList.Builder<String> types = ImmutableList.builder();
++    if (isMapType()) {
++      addCompactBinaryLeafType(types, firstTypeParameter(), containedTypeElement, false);
++      addCompactBinaryLeafType(types, secondTypeParameter(), containedSecondaryTypeElement, false);
++    } else if (isContainerType() || isArrayType()) {
++      addCompactBinaryLeafType(types, firstTypeParameter(), containedTypeElement, false);
++    } else {
++      addCompactBinaryLeafType(types, returnTypeName, containedTypeElement, true);
++    }
++    return types.build();
++  }
++
++  public long compactBinaryId() {
++    long hash = 0xcbf29ce484222325L;
++    String attributeName = name();
++    for (int i = 0; i < attributeName.length(); i++) {
++      hash ^= attributeName.charAt(i);
++      hash *= 0x100000001b3L;
++    }
++    return hash;
++  }
++
++  public @Nullable ValueType compactBinaryNestedType() {
++    if (!compactBinaryNestedTypeInitialized) {
++      compactBinaryNestedTypeInitialized = true;
++      ensureTypeIntrospected();
++      if (!isContainerType() && !isArrayType() && containedTypeElement != null
++          && containedTypeElement.getKind() != ElementKind.ENUM) {
++        Environment environment = protoclass().environment();
++        for (Protoclass p : environment.protoclassesFrom(Collections.singleton(containedTypeElement))) {
++          if ((p.kind().isRecord() || p.kind().isDefinedValue()) && canAccessImplementation(p)) {
++            compactBinaryNestedType = environment.composeValue(p);
++          }
++          break;
++        }
++      }
++    }
++    return compactBinaryNestedType;
++  }
++
++  private String compactBinaryScalarShape(
++      String type, @Nullable TypeElement typeElement, boolean arrayElement) {
++    type = extractRawType(type);
++    String primitive = compactBinaryPrimitiveShape(type);
++    if (!primitive.isEmpty()) return primitive;
++    if (String.class.getName().equals(type) || String.class.getSimpleName().equals(type)) return "s";
++    if (typeElement != null && typeElement.getKind() == ElementKind.ENUM) return "e";
++    if (!arrayElement && type.equals(extractRawType(returnTypeName))
++        && compactBinaryNestedType() != null) return "n";
++    return "";
++  }
++
++  private void addCompactBinaryLeafType(
++      ImmutableList.Builder<String> types,
++      String type,
++      @Nullable TypeElement typeElement,
++      boolean allowNested) {
++    if (typeElement != null && typeElement.getKind() == ElementKind.ENUM) {
++      types.add(typeElement.getQualifiedName().toString());
++    } else if (allowNested && extractRawType(type).equals(extractRawType(returnTypeName))
++        && compactBinaryNestedType() != null) {
++      types.add(compactBinaryNestedType().typeImmutable().absoluteRaw());
++    }
++  }
++
++  private static String compactBinaryPrimitiveShape(String type) {
++    if (type.equals("boolean")) return "z";
++    if (type.equals(Boolean.class.getName()) || type.equals(Boolean.class.getSimpleName())) return "Z";
++    if (type.equals("byte")) return "b";
++    if (type.equals(Byte.class.getName()) || type.equals(Byte.class.getSimpleName())) return "B";
++    if (type.equals("short")) return "h";
++    if (type.equals(Short.class.getName()) || type.equals(Short.class.getSimpleName())) return "H";
++    if (type.equals("int")) return "i";
++    if (type.equals(Integer.class.getName()) || type.equals(Integer.class.getSimpleName())) return "I";
++    if (type.equals("long")) return "j";
++    if (type.equals(Long.class.getName()) || type.equals(Long.class.getSimpleName())) return "J";
++    if (type.equals("float")) return "f";
++    if (type.equals(Float.class.getName()) || type.equals(Float.class.getSimpleName())) return "F";
++    if (type.equals("double")) return "d";
++    if (type.equals(Double.class.getName()) || type.equals(Double.class.getSimpleName())) return "D";
++    if (type.equals("char")) return "c";
++    if (type.equals(Character.class.getName()) || type.equals(Character.class.getSimpleName())) return "C";
++    return "";
++  }
++
+   private static boolean isRegularMarshalableType(String name) {
+     return String.class.getName().equals(name)
+         || isPrimitiveType(name);
+diff --git a/value-processor/src/org/immutables/value/processor/meta/ValueType.java b/value-processor/src/org/immutables/value/processor/meta/ValueType.java
+index 7eb5d6a..64bcb61 100644
+--- a/value-processor/src/org/immutables/value/processor/meta/ValueType.java
++++ b/value-processor/src/org/immutables/value/processor/meta/ValueType.java
+@@ -913,6 +913,62 @@ public final class ValueType extends TypeIntrospectionBase implements HasStyleIn
+     return settableAttributes;
+   }
+ 
++  public boolean isCompactBinary() {
++    return isCompactBinary(new LinkedHashSet<String>());
++  }
++
++  public List<ValueAttribute> getCompactBinaryAttributes() {
++    ImmutableList.Builder<ValueAttribute> attributes = ImmutableList.builder();
++    for (ValueAttribute attribute : getSettableAttributes()) {
++      if (!attribute.isAuxiliary()) attributes.add(attribute);
++    }
++    return attributes.build();
++  }
++
++  private boolean isCompactBinary(Set<String> visiting) {
++    if (!constitution.protoclass().environment().hasSerialModule() || !kind().isValue()) return false;
++    if (hasCompactBinaryMethodConflict()) return false;
++
++    TypeElement typeElement = CachingElements.getDelegate((TypeElement) element);
++    String typeName = typeElement.getQualifiedName().toString();
++    if (!visiting.add(typeName)) return false;
++    try {
++      Set<Long> ids = new LinkedHashSet<>();
++      Set<ValueAttribute> constructorArguments = getConstructorArguments();
++      for (ValueAttribute attribute : getSettableAttributes()) {
++        if (attribute.isAuxiliary()) {
++          if (attribute.isMandatory()) return false;
++          continue;
++        }
++        if (!isUseBuilder() && !constructorArguments.contains(attribute)) return false;
++        if (attribute.compactBinaryShape().isEmpty()) return false;
++        if (!ids.add(attribute.compactBinaryId())) return false;
++        ValueType nested = attribute.compactBinaryNestedType();
++        if (nested != null && !nested.isCompactBinary(visiting)) return false;
++      }
++      return isUseBuilder() || isUseConstructor() || isUseSingleton();
++    } finally {
++      visiting.remove(typeName);
++    }
++  }
++
++  private boolean hasCompactBinaryMethodConflict() {
++    Proto.Environment environment = constitution.protoclass().environment();
++    TypeElement dataInput = environment.processing().getElementUtils().getTypeElement("java.io.DataInput");
++    TypeElement dataOutput = environment.processing().getElementUtils().getTypeElement("java.io.DataOutput");
++    for (ExecutableElement method : ElementFilter.methodsIn(
++        environment.processing().getElementUtils().getAllMembers(
++            CachingElements.getDelegate((TypeElement) element)))) {
++      if (method.getParameters().size() != 1) continue;
++      TypeMirror parameter = method.getParameters().get(0).asType();
++      if (method.getSimpleName().contentEquals("writeTo")
++          && environment.processing().getTypeUtils().isSameType(parameter, dataOutput.asType())) return true;
++      if (method.getSimpleName().contentEquals("readFrom")
++          && environment.processing().getTypeUtils().isSameType(parameter, dataInput.asType())) return true;
++    }
++    return false;
++  }
++
+   @Nullable
+   private Set<ValueAttribute> uniqueAttributeBuilderListAttributes;
+ 

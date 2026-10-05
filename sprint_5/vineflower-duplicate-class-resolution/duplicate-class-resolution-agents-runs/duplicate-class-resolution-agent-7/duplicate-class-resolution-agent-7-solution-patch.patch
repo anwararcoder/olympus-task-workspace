@@ -1,0 +1,1018 @@
+diff --git a/src/org/jetbrains/java/decompiler/main/Fernflower.java b/src/org/jetbrains/java/decompiler/main/Fernflower.java
+index 53721e7..f3a7b49 100644
+--- a/src/org/jetbrains/java/decompiler/main/Fernflower.java
++++ b/src/org/jetbrains/java/decompiler/main/Fernflower.java
+@@ -55,6 +55,8 @@ public class Fernflower implements IDecompiledData {
+       }
+     }
+ 
++    StructContext.validateDuplicateClassStrategy(properties.get(IFernflowerPreferences.DUPLICATE_CLASS_STRATEGY));
++
+     String level = (String)properties.get(IFernflowerPreferences.LOG_LEVEL);
+     if (level != null) {
+       try {
+diff --git a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+index 5353261..94dd2e8 100644
+--- a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
++++ b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+@@ -322,6 +322,11 @@ public interface IFernflowerPreferences {
+   @Type(DecompilerOption.Type.INTEGER)
+   String THREADS = "thread-count";
+ 
++  @Name("Duplicate Class Strategy")
++  @Description("Selects the first or last registered class origin, or rejects differing duplicate classfiles. Accepted values: first, last, error.")
++  @Type(DecompilerOption.Type.STRING)
++  String DUPLICATE_CLASS_STRATEGY = "duplicate-class-strategy";
++
+   String DUMP_ORIGINAL_LINES = "__dump_original_lines__";
+   String UNIT_TEST_MODE = "__unit_test_mode__";
+ 
+@@ -479,6 +484,7 @@ public interface IFernflowerPreferences {
+     defaults.put(UNIT_TEST_MODE, "0");
+     defaults.put(DUMP_ORIGINAL_LINES, "0");
+     defaults.put(THREADS, String.valueOf(Runtime.getRuntime().availableProcessors()));
++    defaults.put(DUPLICATE_CLASS_STRATEGY, "first");
+     defaults.put(SKIP_EXTRA_FILES, "0");
+     defaults.put(WARN_INCONSISTENT_INNER_CLASSES, "1");
+     defaults.put(DUMP_BYTECODE_ON_ERROR, "1");
+diff --git a/src/org/jetbrains/java/decompiler/struct/ContextUnit.java b/src/org/jetbrains/java/decompiler/struct/ContextUnit.java
+index 89a245c..709b61e 100644
+--- a/src/org/jetbrains/java/decompiler/struct/ContextUnit.java
++++ b/src/org/jetbrains/java/decompiler/struct/ContextUnit.java
+@@ -19,6 +19,7 @@ import java.util.*;
+ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.Function;
++import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+ 
+ public class ContextUnit {
+@@ -26,6 +27,7 @@ public class ContextUnit {
+   private final IContextSource source;
+   private final boolean own;
+   private final boolean root;
++  private final int originIndex;
+ 
+   private final IResultSaver resultSaver;
+   private final IDecompiledData decompiledData;
+@@ -37,9 +39,14 @@ public class ContextUnit {
+   private List<IContextSource> childContexts = List.of();
+ 
+   public ContextUnit(IContextSource source, boolean own, boolean root, IResultSaver resultSaver, IDecompiledData decompiledData) {
++    this(source, own, root, 0, resultSaver, decompiledData);
++  }
++
++  public ContextUnit(IContextSource source, boolean own, boolean root, int originIndex, IResultSaver resultSaver, IDecompiledData decompiledData) {
+     this.source = source;
+     this.own = own;
+     this.root = root;
++    this.originIndex = originIndex;
+     this.resultSaver = resultSaver;
+     this.decompiledData = decompiledData;
+   }
+@@ -127,10 +134,15 @@ public class ContextUnit {
+       this.classEntries = List.of();
+       this.dirEntries = List.of();
+       this.otherEntries = List.of();
++      this.childContexts = List.of();
+     }
+   }
+ 
+   public void save(final Function<String, StructClass> loader) throws IOException {
++    this.save(loader, ignored -> true);
++  }
++
++  public void save(final Function<String, StructClass> loader, final Predicate<String> selectedHere) throws IOException {
+     if (!this.isOwn()) {
+       throw new IllegalStateException("Trying to save non-own unit?");
+     }
+@@ -174,16 +186,19 @@ public class ContextUnit {
+     ForkJoinPool pool = new ForkJoinPool(threads, namingScheme(), null, true);
+     final List<ClassContext> toDump = new ArrayList<>(classEntries.size());
+     Set<String> seen = new LinkedHashSet<>();
++    Set<String> seenEntries = new HashSet<>();
+ 
+     // collect classes
+     for (int i = 0; i < classEntries.size(); i++) {
+-      StructClass cl = loader.apply(classEntries.get(i));
+-      String entryName = decompiledData.getClassEntryName(cl, classEntries.get(i));
++      String classEntry = classEntries.get(i);
++      if (!seenEntries.add(classEntry) || !selectedHere.test(classEntry)) {
++        continue;
++      }
++      StructClass cl = Objects.requireNonNull(loader.apply(classEntry), () -> "Could not load selected class " + classEntry);
++      String entryName = decompiledData.getClassEntryName(cl, classEntry);
+       if (entryName != null) {
+         if (seen.add(cl.qualifiedName)) {
+           toDump.add(new ClassContext(cl, entryName));
+-        } else {
+-          DecompilerContext.getLogger().writeMessage("Skipping writing already existing class: " + cl.qualifiedName, IFernflowerLogger.Severity.ERROR);
+         }
+       }
+     }
+@@ -294,6 +309,14 @@ public class ContextUnit {
+     return !this.own && this.source.isLazy();
+   }
+ 
++  int getOriginIndex() {
++    return this.originIndex;
++  }
++
++  IContextSource getSource() {
++    return this.source;
++  }
++
+   void close() throws Exception {
+     if (this.source instanceof AutoCloseable) {
+       ((AutoCloseable) this.source).close();
+diff --git a/src/org/jetbrains/java/decompiler/struct/StructContext.java b/src/org/jetbrains/java/decompiler/struct/StructContext.java
+index da294b1..1d2e928 100644
+--- a/src/org/jetbrains/java/decompiler/struct/StructContext.java
++++ b/src/org/jetbrains/java/decompiler/struct/StructContext.java
+@@ -6,8 +6,12 @@ import org.jetbrains.java.decompiler.main.DecompilerContext;
+ import org.jetbrains.java.decompiler.main.extern.IBytecodeProvider;
+ import org.jetbrains.java.decompiler.main.extern.IContextSource;
+ import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
++import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
+ import org.jetbrains.java.decompiler.main.extern.IResultSaver;
+ import org.jetbrains.java.decompiler.main.plugins.PluginContext;
++import org.jetbrains.java.decompiler.struct.attr.StructEnclosingMethodAttribute;
++import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
++import org.jetbrains.java.decompiler.struct.attr.StructInnerClassesAttribute;
+ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMain;
+ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
+ import org.jetbrains.java.decompiler.util.DataInputFullStream;
+@@ -21,11 +25,25 @@ import java.nio.ByteOrder;
+ import java.nio.channels.SeekableByteChannel;
+ import java.nio.file.Files;
+ import java.util.*;
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.stream.Collectors;
+ 
+ public class StructContext {
+   private static volatile StructClass SENTINEL_CLASS;
++  private static final byte[] MISSING_BYTES = new byte[0];
++
++  public enum DuplicateClassStrategy {
++    FIRST, LAST, ERROR
++  }
++
++  public static DuplicateClassStrategy validateDuplicateClassStrategy(Object value) {
++    String strategy = Objects.toString(value, "first");
++    return switch (strategy) {
++      case "first" -> DuplicateClassStrategy.FIRST;
++      case "last" -> DuplicateClassStrategy.LAST;
++      case "error" -> DuplicateClassStrategy.ERROR;
++      default -> throw new IllegalArgumentException(
++        "Invalid duplicate-class-strategy '" + value + "'; accepted values are: first, last, error");
++    };
++  }
+ 
+   static StructClass getSentinel() {
+     if (SENTINEL_CLASS == null) {
+@@ -47,13 +65,22 @@ public class StructContext {
+   private final IBytecodeProvider legacyProvider;
+   private final IResultSaver saver;
+   private final IDecompiledData decompiledData;
++  private final Object resolutionLock = new Object();
+   private final List<ContextUnit> units = new ArrayList<>();
+   private final List<ContextUnit> lazyUnits = new ArrayList<>();
+-  private final Map<String, StructClass> classes = new ConcurrentHashMap<>();
+-  private final Map<String, String> badlyPlacedClasses = new ConcurrentHashMap<>(); // original -> corrected
+-  private final Map<String, ContextUnit> unitsByClassName = new ConcurrentHashMap<>();
++  private final Map<String, List<ContextUnit>> candidatesByClassName = new LinkedHashMap<>();
++  private final Map<String, ContextUnit> selections = new HashMap<>();
++  private final Set<String> missingSelections = new HashSet<>();
++  private final Map<String, StructClass> classes = new HashMap<>();
++  private final Map<ContextUnit, Map<String, byte[]>> classBytes = new IdentityHashMap<>();
++  private final Map<ContextUnit, Map<String, byte[]>> lazyProbes = new IdentityHashMap<>();
++  private final Map<String, String> familyRoots = new HashMap<>();
++  private final Map<String, String> familyTriggers = new HashMap<>();
++  private final Map<String, ContextUnit> familyAnchors = new HashMap<>();
+   private final Map<String, List<String>> abstractNames = new HashMap<>();
+-  
++  private boolean familyIndexInitialized;
++  private int nextOriginIndex;
++
+   private final PluginContext pluginContext = new PluginContext();
+ 
+   @SuppressWarnings("deprecation")
+@@ -74,115 +101,103 @@ public class StructContext {
+       return null;
+     }
+ 
+-    final StructClass ret = this.classes.computeIfAbsent(name, key -> {
+-      // load class from a context unit
+-      final ContextUnit unitForClass = this.unitsByClassName.get(key);
+-      if (unitForClass != null) {
+-        final StructClass clazz = tryLoadClass(unitForClass, key);
+-        if (clazz != null) {
+-          return clazz;
+-        }
+-      }
+-      for (final ContextUnit unit : this.lazyUnits) {
+-        final StructClass clazz = tryLoadClass(unit, key);
+-        if (clazz != null) {
+-          return clazz;
+-        }
+-      }
+-      return getSentinel();
+-    });
+-    if (ret == getSentinel()) {
+-      return null;
+-    } else {
+-      final var correctedName = this.badlyPlacedClasses.remove(name);
+-      // Correct the class location
+-      if (correctedName != null) {
+-        this.classes.put(correctedName, ret);
+-        this.classes.remove(name);
++    synchronized (this.resolutionLock) {
++      StructClass cached = this.classes.get(name);
++      if (cached != null) {
++        return cached == getSentinel() ? null : cached;
+       }
+-      return ret;
+-    }
+-  }
+ 
+-  private StructClass tryLoadClass(final ContextUnit unitForClass, final String key) {
+-    try {
+-      DecompilerContext.getLogger().writeMessage("Loading Class: " + key + " from " + unitForClass.getName(), IFernflowerLogger.Severity.INFO);
+-      StructClass clazz = unitForClass.tryLoadClass(key);
+-      if (clazz == null) {
++      ContextUnit selected = selectOrigin(name);
++      if (selected == null) {
++        this.classes.put(name, getSentinel());
+         return null;
+       }
+ 
+-      if (!key.equals(clazz.qualifiedName)) {
+-        // also place the class in the right key if it's wrong
+-        this.unitsByClassName.put(clazz.qualifiedName, unitForClass);
+-        this.badlyPlacedClasses.put(key, clazz.qualifiedName);
++      try {
++        DecompilerContext.getLogger().writeMessage(
++          "Loading Class: " + name + " from " + originName(selected), IFernflowerLogger.Severity.INFO);
++        byte[] bytes = getClassBytes(selected, name);
++        if (bytes == null) {
++          this.classes.put(name, getSentinel());
++          return null;
++        }
++        StructClass clazz = StructClass.create(new DataInputFullStream(bytes), selected.isOwn());
++        this.classes.put(name, clazz);
++        if (!name.equals(clazz.qualifiedName)) {
++          this.classes.put(clazz.qualifiedName, clazz);
++          this.selections.put(clazz.qualifiedName, selected);
++        }
++        return clazz;
++      } catch (IOException ex) {
++        String message = "Failed to read class " + name + " from " + originName(selected);
++        DecompilerContext.getLogger().writeMessage(message, IFernflowerLogger.Severity.ERROR, ex);
++        throw new UncheckedIOException(message, ex);
+       }
+-      return clazz;
+-    } catch (final IOException ex) {
+-      DecompilerContext.getLogger().writeMessage("Failed to read class " + key + " from " + unitForClass.getName(), IFernflowerLogger.Severity.ERROR, ex);
+     }
+-
+-    return null;
+   }
+ 
+   public boolean hasClass(final String name) {
+-    if (this.unitsByClassName.containsKey(name)) {
+-      return true;
++    if (name == null) {
++      return false;
+     }
+-
+-    for (final ContextUnit unit : this.lazyUnits) {
+-      try {
+-        if (unit.hasClass(name)) {
+-          return true;
+-        }
+-      } catch (final IOException ex) {
+-        DecompilerContext.getLogger().writeMessage("Failed to check if class " + name + " exists in " + unit.getName(), IFernflowerLogger.Severity.ERROR, ex);
+-      }
++    synchronized (this.resolutionLock) {
++      return selectOrigin(name) != null;
+     }
+-
+-    return false;
+   }
+ 
+   public List<StructClass> getOwnClasses() {
+-    return this.units.stream()
+-      .filter(ContextUnit::isOwn)
+-      .flatMap(unit -> unit.getClassNames().stream())
+-      .map(name -> Objects.requireNonNull(this.getClass(name), () -> "Could not find class " + name))
+-      .toList();
++    synchronized (this.resolutionLock) {
++      List<StructClass> result = new ArrayList<>();
++      Set<String> seen = new LinkedHashSet<>();
++      for (Map.Entry<String, List<ContextUnit>> entry : this.candidatesByClassName.entrySet()) {
++        if (entry.getValue().stream().noneMatch(ContextUnit::isOwn)) {
++          continue;
++        }
++        StructClass clazz = Objects.requireNonNull(this.getClass(entry.getKey()), () -> "Could not find class " + entry.getKey());
++        ContextUnit selected = this.selections.get(entry.getKey());
++        if (selected != null && selected.isOwn() && seen.add(clazz.qualifiedName)) {
++          result.add(clazz);
++        }
++      }
++      return List.copyOf(result);
++    }
+   }
+ 
+   public void reloadContext() throws IOException {
+-    this.classes.clear();
+-    this.unitsByClassName.clear();
+-    this.abstractNames.clear();
+-
+-    final List<ContextUnit> units = List.copyOf(this.units);
+-    this.units.clear();
+-    this.lazyUnits.clear();
+-    for (ContextUnit unit : units) {
+-      if (unit.isRoot()) {
+-        unit.clear();
+-        this.units.add(unit);
+-        if (unit.isLazy()) {
+-          this.lazyUnits.add(unit);
+-        }
+-        this.initUnit(unit);
++    synchronized (this.resolutionLock) {
++      List<ContextUnit> roots = this.units.stream().filter(ContextUnit::isRoot).toList();
++      this.units.clear();
++      this.lazyUnits.clear();
++      this.candidatesByClassName.clear();
++      this.abstractNames.clear();
++      this.nextOriginIndex = 0;
++      clearResolutionState();
++      for (ContextUnit root : roots) {
++        root.clear();
++        addSpace(root.getSource(), root.isOwn(), true);
+       }
+     }
+   }
+ 
+   public void saveContext() {
+-    for (ContextUnit unit : this.units) {
++    this.getOwnClasses();
++    for (ContextUnit unit : List.copyOf(this.units)) {
+       if (unit.isOwn()) {
+         try {
+-          unit.save(this::getClass);
++          unit.save(this::getClass, name -> isSelectedOrigin(name, unit));
+         } catch (final IOException ex) {
+-          DecompilerContext.getLogger().writeMessage("Failed to save data for context unit" + unit.getName(), IFernflowerLogger.Severity.ERROR, ex);
++          DecompilerContext.getLogger().writeMessage("Failed to save data for context unit " + originName(unit), IFernflowerLogger.Severity.ERROR, ex);
+         }
+       }
+     }
+   }
+ 
++  private boolean isSelectedOrigin(String name, ContextUnit unit) {
++    synchronized (this.resolutionLock) {
++      return selectOrigin(name) == unit;
++    }
++  }
++
+   private static boolean isJarFile(File file) {
+     if (!file.isFile()) return false;
+     String name = file.getName();
+@@ -190,7 +205,6 @@ public class StructContext {
+     if (name.endsWith(".class")) return false;
+     try (SeekableByteChannel channel = Files.newByteChannel(file.toPath())) {
+       long size = channel.size();
+-      // The EOCD ZIP record has 22+n bytes depending on the length of the comment.
+       if (size < 22) return false;
+       int bufferSize = (int) Math.min(size & ~3, 1024);
+       channel.position(size - bufferSize);
+@@ -215,7 +229,6 @@ public class StructContext {
+     if (file.isDirectory()) {
+       addSpace(new DirectoryContextSource(this.legacyProvider, file), isOwn);
+     } else if (isJarFile(file)) {
+-      // archive
+       try {
+         addSpace(new JarContextSource(this.legacyProvider, file), isOwn);
+       } catch (final IOException ex) {
+@@ -235,11 +248,14 @@ public class StructContext {
+   }
+ 
+   public void addSpace(final IContextSource source, final boolean isOwn) {
+-    this.addSpace(source, isOwn, true);
++    synchronized (this.resolutionLock) {
++      this.addSpace(source, isOwn, true);
++    }
+   }
+ 
+   private void addSpace(final IContextSource source, final boolean isOwn, final boolean isRoot) {
+-    final ContextUnit unit = new ContextUnit(source, isOwn, isRoot, saver, decompiledData);
++    clearResolutionState();
++    final ContextUnit unit = new ContextUnit(source, isOwn, isRoot, this.nextOriginIndex++, saver, decompiledData);
+     this.units.add(unit);
+     if (unit.isLazy()) {
+       this.lazyUnits.add(unit);
+@@ -250,29 +266,301 @@ public class StructContext {
+   public PluginContext getPluginContext() {
+     return this.pluginContext;
+   }
+-  
++
+   private void initUnit(final ContextUnit unit) {
+-    DecompilerContext.getLogger().writeMessage("Scanning classes from " + unit.getName(), IFernflowerLogger.Severity.INFO);
+-    boolean isOwn = unit.isOwn();
+-    for (final String clazz : unit.getClassNames()) {
+-      final ContextUnit existing = this.unitsByClassName.putIfAbsent(clazz, unit);
+-      if (existing != null) {
+-        if (!isOwn || existing.isOwn()) continue;
+-
+-        if (!this.unitsByClassName.replace(clazz, existing, unit)) continue;
++    DecompilerContext.getLogger().writeMessage("Scanning classes from " + originName(unit), IFernflowerLogger.Severity.INFO);
++    Set<String> namesInOrigin = new LinkedHashSet<>(unit.getClassNames());
++    for (String className : namesInOrigin) {
++      this.candidatesByClassName.computeIfAbsent(className, ignored -> new ArrayList<>()).add(unit);
++      DecompilerContext.getLogger().writeMessage("    " + className, IFernflowerLogger.Severity.TRACE);
++    }
++
++    for (final IContextSource child : unit.getChildContexts()) {
++      this.addSpace(child, unit.isOwn(), false);
++    }
++  }
++
++  private void clearResolutionState() {
++    this.classes.clear();
++    this.selections.clear();
++    this.missingSelections.clear();
++    this.classBytes.clear();
++    this.lazyProbes.clear();
++    this.familyRoots.clear();
++    this.familyTriggers.clear();
++    this.familyAnchors.clear();
++    this.familyIndexInitialized = false;
++  }
++
++  private @Nullable ContextUnit selectOrigin(String className) {
++    ContextUnit cached = this.selections.get(className);
++    if (cached != null) {
++      return cached;
++    }
++    if (this.missingSelections.contains(className)) {
++      return null;
++    }
++
++    List<ContextUnit> candidates = eligibleCandidates(className);
++    if (candidates.isEmpty()) {
++      this.missingSelections.add(className);
++      return null;
++    }
++
++    List<ContextUnit> ownCandidates = candidates.stream().filter(ContextUnit::isOwn).toList();
++    if (!ownCandidates.isEmpty()) {
++      ensureFamilyIndex();
++      String familyRoot = this.familyRoots.get(className);
++      if (familyRoot != null) {
++        ContextUnit anchor = ensureFamilyAnchor(familyRoot);
++        ContextUnit anchorSelection = this.selections.get(className);
++        if (anchorSelection != null) {
++          return anchorSelection;
++        }
++        validateDuplicateBytes(className, ownCandidates, familyRoot);
++        if (ownCandidates.contains(anchor)) {
++          this.selections.put(className, anchor);
++          warnIfDiffering(className, ownCandidates, anchor, familyRoot);
++          return anchor;
++        }
++        throw familyConflict(familyRoot, className, anchor, ownCandidates);
+       }
++      ContextUnit selected = selectByStrategy(className, ownCandidates, null);
++      this.selections.put(className, selected);
++      return selected;
++    }
++
++    ContextUnit selected = selectByStrategy(className, candidates, null);
++    this.selections.put(className, selected);
++    return selected;
++  }
+ 
+-      DecompilerContext.getLogger().writeMessage("    " + clazz, IFernflowerLogger.Severity.TRACE);
+-      if (isOwn) { // pre-load classes
+-        this.getClass(clazz);
++  private List<ContextUnit> eligibleCandidates(String className) {
++    List<ContextUnit> registered = this.candidatesByClassName.getOrDefault(className, List.of());
++    if (registered.stream().anyMatch(ContextUnit::isOwn)) {
++      return registered.stream().filter(ContextUnit::isOwn).sorted(Comparator.comparingInt(ContextUnit::getOriginIndex)).toList();
++    }
++
++    List<ContextUnit> libraries = new ArrayList<>(registered);
++    for (ContextUnit unit : this.lazyUnits) {
++      if (probeLazy(unit, className) && !libraries.contains(unit)) {
++        libraries.add(unit);
+       }
+     }
++    libraries.sort(Comparator.comparingInt(ContextUnit::getOriginIndex));
++    return libraries;
++  }
+ 
+-    for (final IContextSource child : unit.getChildContexts()) {
+-      this.addSpace(child, isOwn, false);
++  private boolean probeLazy(ContextUnit unit, String className) {
++    Map<String, byte[]> probes = this.lazyProbes.computeIfAbsent(unit, ignored -> new HashMap<>());
++    byte[] cached = probes.get(className);
++    if (cached != null) {
++      return cached != MISSING_BYTES;
++    }
++    try {
++      byte[] bytes = unit.getClassBytes(className);
++      probes.put(className, bytes == null ? MISSING_BYTES : bytes);
++      if (bytes != null) {
++        this.classBytes.computeIfAbsent(unit, ignored -> new HashMap<>()).put(className, bytes);
++      }
++      return bytes != null;
++    } catch (IOException ex) {
++      String message = "Failed to probe class " + className + " in " + originName(unit);
++      DecompilerContext.getLogger().writeMessage(message, IFernflowerLogger.Severity.ERROR, ex);
++      throw new UncheckedIOException(message, ex);
++    }
++  }
++
++  private ContextUnit selectByStrategy(String className, List<ContextUnit> candidates, @Nullable String familyRoot) {
++    DuplicateClassStrategy strategy = duplicateClassStrategy();
++    boolean differing = validateDuplicateBytes(className, candidates, familyRoot);
++    ContextUnit selected = strategy == DuplicateClassStrategy.LAST ? candidates.get(candidates.size() - 1) : candidates.get(0);
++    if (differing) {
++      warnDuplicate(className, candidates, selected, familyRoot);
++    }
++    return selected;
++  }
++
++  private boolean validateDuplicateBytes(String className, List<ContextUnit> candidates, @Nullable String familyRoot) {
++    if (candidates.size() < 2) {
++      return false;
++    }
++    byte[] first = requireClassBytes(candidates.get(0), className);
++    boolean differing = false;
++    for (int i = 1; i < candidates.size(); i++) {
++      if (!Arrays.equals(first, requireClassBytes(candidates.get(i), className))) {
++        differing = true;
++      }
++    }
++    if (differing && duplicateClassStrategy() == DuplicateClassStrategy.ERROR) {
++      throw new IllegalStateException("Conflicting duplicate class " + className + " for strategy error in highest-precedence origins: " +
++        joinOrigins(candidates) + "; metadata family root: " + displayFamilyRoot(familyRoot));
++    }
++    return differing;
++  }
++
++  private void warnIfDiffering(String className, List<ContextUnit> candidates, ContextUnit selected, String familyRoot) {
++    if (duplicateClassStrategy() != DuplicateClassStrategy.ERROR && validateDuplicateBytes(className, candidates, familyRoot)) {
++      warnDuplicate(className, candidates, selected, familyRoot);
++    }
++  }
++
++  private void warnDuplicate(String className, List<ContextUnit> candidates, ContextUnit selected, @Nullable String familyRoot) {
++    List<ContextUnit> ignored = candidates.stream().filter(candidate -> candidate != selected).toList();
++    DecompilerContext.getLogger().writeMessage(
++      "Duplicate class " + className + " resolved with strategy " + duplicateClassStrategy().name().toLowerCase(Locale.ROOT) +
++        "; selected origin: " + originName(selected) + "; ignored origins: " + joinOrigins(ignored) +
++        "; metadata family root: " + displayFamilyRoot(familyRoot),
++      IFernflowerLogger.Severity.WARN);
++  }
++
++  private void ensureFamilyIndex() {
++    if (this.familyIndexInitialized) {
++      return;
++    }
++    this.familyIndexInitialized = true;
++
++    Map<String, String> parents = new LinkedHashMap<>();
++    Map<String, Set<String>> graph = new LinkedHashMap<>();
++    for (Map.Entry<String, List<ContextUnit>> entry : this.candidatesByClassName.entrySet()) {
++      for (ContextUnit unit : entry.getValue()) {
++        if (!unit.isOwn()) {
++          continue;
++        }
++        StructClass metadataClass;
++        try {
++          metadataClass = StructClass.create(new DataInputFullStream(requireClassBytes(unit, entry.getKey())), true);
++        } catch (IOException ex) {
++          throw new UncheckedIOException("Failed to inspect family metadata for " + entry.getKey() + " from " + originName(unit), ex);
++        }
++        StructInnerClassesAttribute innerClasses = metadataClass.getAttribute(StructGeneralAttribute.ATTRIBUTE_INNER_CLASSES);
++        if (innerClasses != null) {
++          for (StructInnerClassesAttribute.Entry inner : innerClasses.getEntries()) {
++            if (inner.enclosingName != null) {
++              addFamilyEdge(graph, parents, inner.innerName, inner.enclosingName);
++            }
++          }
++        }
++        StructEnclosingMethodAttribute enclosingMethod = metadataClass.getAttribute(StructGeneralAttribute.ATTRIBUTE_ENCLOSING_METHOD);
++        if (enclosingMethod != null && enclosingMethod.getClassName() != null) {
++          addFamilyEdge(graph, parents, metadataClass.qualifiedName, enclosingMethod.getClassName());
++        }
++      }
++    }
++
++    for (Map.Entry<String, List<ContextUnit>> entry : this.candidatesByClassName.entrySet()) {
++      List<ContextUnit> own = entry.getValue().stream().filter(ContextUnit::isOwn).distinct().toList();
++      if (own.size() < 2) {
++        continue;
++      }
++      Set<String> family = connectedFamily(graph, entry.getKey());
++      String root = findFamilyRoot(entry.getKey(), parents);
++      for (String member : family) {
++        this.familyRoots.putIfAbsent(member, root);
++        this.familyTriggers.putIfAbsent(root, entry.getKey());
++      }
+     }
+   }
+ 
++  private static void addFamilyEdge(Map<String, Set<String>> graph, Map<String, String> parents, String child, String parent) {
++    graph.computeIfAbsent(child, ignored -> new LinkedHashSet<>()).add(parent);
++    graph.computeIfAbsent(parent, ignored -> new LinkedHashSet<>()).add(child);
++    parents.putIfAbsent(child, parent);
++  }
++
++  private static Set<String> connectedFamily(Map<String, Set<String>> graph, String start) {
++    Set<String> result = new LinkedHashSet<>();
++    Deque<String> pending = new ArrayDeque<>();
++    pending.add(start);
++    while (!pending.isEmpty()) {
++      String current = pending.removeFirst();
++      if (result.add(current)) {
++        pending.addAll(graph.getOrDefault(current, Set.of()));
++      }
++    }
++    return result;
++  }
++
++  private static String findFamilyRoot(String member, Map<String, String> parents) {
++    Set<String> seen = new HashSet<>();
++    String current = member;
++    while (seen.add(current)) {
++      String parent = parents.get(current);
++      if (parent == null) {
++        return current;
++      }
++      current = parent;
++    }
++    return member;
++  }
++
++  private ContextUnit ensureFamilyAnchor(String familyRoot) {
++    ContextUnit cached = this.familyAnchors.get(familyRoot);
++    if (cached != null) {
++      return cached;
++    }
++    String anchorName = familyRoot;
++    List<ContextUnit> rootCandidates = this.candidatesByClassName.getOrDefault(familyRoot, List.of()).stream()
++      .filter(ContextUnit::isOwn).sorted(Comparator.comparingInt(ContextUnit::getOriginIndex)).toList();
++    List<ContextUnit> anchorCandidates = rootCandidates;
++    if (anchorCandidates.isEmpty()) {
++      anchorName = Objects.requireNonNull(this.familyTriggers.get(familyRoot));
++      anchorCandidates = this.candidatesByClassName.getOrDefault(anchorName, List.of()).stream()
++        .filter(ContextUnit::isOwn).sorted(Comparator.comparingInt(ContextUnit::getOriginIndex)).toList();
++    }
++    ContextUnit anchor = selectByStrategy(anchorName, anchorCandidates, familyRoot);
++    this.familyAnchors.put(familyRoot, anchor);
++    this.selections.put(anchorName, anchor);
++    return anchor;
++  }
++
++  private IllegalStateException familyConflict(String familyRoot, String member, ContextUnit anchor, List<ContextUnit> alternatives) {
++    return new IllegalStateException("Class family origin conflict; family root: " + familyRoot + "; member: " + member +
++      "; anchored origin: " + originName(anchor) + "; alternative origins: " + joinOrigins(alternatives));
++  }
++
++  private byte[] requireClassBytes(ContextUnit unit, String className) {
++    byte[] bytes = getClassBytes(unit, className);
++    if (bytes == null) {
++      throw new IllegalStateException("Class " + className + " disappeared from " + originName(unit));
++    }
++    return bytes;
++  }
++
++  private @Nullable byte[] getClassBytes(ContextUnit unit, String className) {
++    Map<String, byte[]> byName = this.classBytes.computeIfAbsent(unit, ignored -> new HashMap<>());
++    byte[] cached = byName.get(className);
++    if (cached != null) {
++      return cached == MISSING_BYTES ? null : cached;
++    }
++    try {
++      byte[] bytes = unit.getClassBytes(className);
++      byName.put(className, bytes == null ? MISSING_BYTES : bytes);
++      return bytes;
++    } catch (IOException ex) {
++      String message = "Failed to read class " + className + " from " + originName(unit);
++      DecompilerContext.getLogger().writeMessage(message, IFernflowerLogger.Severity.ERROR, ex);
++      throw new UncheckedIOException(message, ex);
++    }
++  }
++
++  private DuplicateClassStrategy duplicateClassStrategy() {
++    Object value = DecompilerContext.getProperty(IFernflowerPreferences.DUPLICATE_CLASS_STRATEGY);
++    return validateDuplicateClassStrategy(value);
++  }
++
++  private static String displayFamilyRoot(@Nullable String familyRoot) {
++    return familyRoot == null ? "<none>" : familyRoot;
++  }
++
++  private static String joinOrigins(List<ContextUnit> origins) {
++    return origins.stream().map(StructContext::originName).reduce((left, right) -> left + ", " + right).orElse("<none>");
++  }
++
++  private static String originName(ContextUnit unit) {
++    return unit.getName() + " [origin " + (unit.getOriginIndex() + 1) + "]";
++  }
++
+   // return (valclass instanceof reflcass)
+   public boolean instanceOf(String valclass, String refclass) {
+     if (refclass == null || valclass == null) {
+@@ -376,9 +664,12 @@ public class StructContext {
+         DecompilerContext.getLogger().writeMessage("Failed to close context unit " + unit.getName(), IFernflowerLogger.Severity.ERROR, ex);
+       }
+     }
+-    this.units.clear();
+-    this.unitsByClassName.clear();
+-    this.classes.clear();
++    synchronized (this.resolutionLock) {
++      this.units.clear();
++      this.lazyUnits.clear();
++      this.candidatesByClassName.clear();
++      clearResolutionState();
++    }
+   }
+ 
+   public List<ContextUnit> getUnits() {
+diff --git a/test/org/jetbrains/java/decompiler/SingleClassesTest.java b/test/org/jetbrains/java/decompiler/SingleClassesTest.java
+index 2d27082..a757491 100644
+--- a/test/org/jetbrains/java/decompiler/SingleClassesTest.java
++++ b/test/org/jetbrains/java/decompiler/SingleClassesTest.java
+@@ -686,7 +686,7 @@ public class SingleClassesTest extends SingleClassesTestBase {
+ 
+     // TODO: when in different classes, these two decompile incorrectly to super(outer, s)
+     register(JAVA_8, "TestInnerClassExtend");
+-    register(JAVA_8, "TestInnerClassReference", "ext/SomeOuterClass", "ext/SomeOuterClass$SomeInner");
++    register(JAVA_8, "TestInnerClassReference", "ext/SomeOuterClass");
+     register(JAVA_17, "TestInnerClassExtendJ17");
+ 
+     // TODO: include scala stdlibs to avoid "import scala.runtime.ScalaRunTime."
+diff --git a/test/org/jetbrains/java/decompiler/struct/DuplicateClassResolutionTest.java b/test/org/jetbrains/java/decompiler/struct/DuplicateClassResolutionTest.java
+new file mode 100644
+index 0000000..b0c6c71
+--- /dev/null
++++ b/test/org/jetbrains/java/decompiler/struct/DuplicateClassResolutionTest.java
+@@ -0,0 +1,253 @@
++package org.jetbrains.java.decompiler.struct;
++
++import org.jetbrains.java.decompiler.main.ClassesProcessor;
++import org.jetbrains.java.decompiler.main.DecompilerContext;
++import org.jetbrains.java.decompiler.main.Init;
++import org.jetbrains.java.decompiler.main.extern.IContextSource;
++import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
++import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
++import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
++import org.jetbrains.java.decompiler.struct.attr.StructSourceFileAttribute;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Test;
++
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++class DuplicateClassResolutionTest {
++  private static final String SAMPLE = "pkg/TestPatternMatchingLoops$Holder";
++
++  @AfterEach
++  void tearDown() {
++    DecompilerContext.setCurrentContext(null);
++  }
++
++  @Test
++  void firstAndLastUseRegistrationOrderAndWarnOnce() throws IOException {
++    byte[] firstBytes = classBytes("java17", SAMPLE);
++    byte[] lastBytes = changeSourceFile(firstBytes);
++
++    CapturingLogger firstLogger = setup("first");
++    StructContext firstContext = DecompilerContext.getStructContext();
++    firstContext.addSpace(new MemorySource("same", Map.of(SAMPLE, firstBytes), false), false);
++    firstContext.addSpace(new MemorySource("same", Map.of(SAMPLE, lastBytes), false), false);
++    assertEquals("TestPatternMatchingLoops.java", sourceFile(firstContext.getClass(SAMPLE)));
++    assertEquals(1, firstLogger.warnings.size());
++    assertTrue(firstLogger.warnings.get(0).contains("strategy first"));
++    assertTrue(firstLogger.warnings.get(0).contains("same [origin 1]"));
++    assertTrue(firstLogger.warnings.get(0).contains("same [origin 2]"));
++    assertTrue(firstLogger.warnings.get(0).contains("metadata family root: <none>"));
++    firstContext.getClass(SAMPLE);
++    assertEquals(1, firstLogger.warnings.size());
++
++    setup("last");
++    StructContext lastContext = DecompilerContext.getStructContext();
++    lastContext.addSpace(new MemorySource("same", Map.of(SAMPLE, firstBytes), false), false);
++    lastContext.addSpace(new MemorySource("same", Map.of(SAMPLE, lastBytes), false), false);
++    assertEquals("UestPatternMatchingLoops.java", sourceFile(lastContext.getClass(SAMPLE)));
++  }
++
++  @Test
++  void errorRejectsOnlyDifferingHighestTierCandidates() throws IOException {
++    byte[] bytes = classBytes("java17", SAMPLE);
++    byte[] different = changeSourceFile(bytes);
++
++    setup("error");
++    StructContext differingContext = DecompilerContext.getStructContext();
++    differingContext.addSpace(new MemorySource("duplicate", Map.of(SAMPLE, bytes), false), false);
++    differingContext.addSpace(new MemorySource("duplicate", Map.of(SAMPLE, different), false), false);
++    IllegalStateException conflict = assertThrows(IllegalStateException.class, () -> differingContext.getClass(SAMPLE));
++    assertTrue(conflict.getMessage().contains("duplicate [origin 1]"));
++    assertTrue(conflict.getMessage().contains("duplicate [origin 2]"));
++
++    setup("error");
++    StructContext identicalContext = DecompilerContext.getStructContext();
++    identicalContext.addSpace(new MemorySource("duplicate", Map.of(SAMPLE, bytes), false), false);
++    identicalContext.addSpace(new MemorySource("duplicate", Map.of(SAMPLE, bytes), false), false);
++    assertNotNull(identicalContext.getClass(SAMPLE));
++  }
++
++  @Test
++  void ownCandidateOutranksEveryLibrary() throws IOException {
++    byte[] ownBytes = classBytes("java17", SAMPLE);
++    byte[] libraryBytes = changeSourceFile(ownBytes);
++
++    setup("last");
++    StructContext context = DecompilerContext.getStructContext();
++    context.addSpace(new MemorySource("own", Map.of(SAMPLE, ownBytes), false), true);
++    context.addSpace(new MemorySource("library", Map.of(SAMPLE, libraryBytes), false), false);
++
++    assertEquals("TestPatternMatchingLoops.java", sourceFile(context.getClass(SAMPLE)));
++  }
++
++  @Test
++  void lazyProbesAreDeferredCachedAndContextLocal() throws IOException {
++    byte[] bytes = classBytes("java17", SAMPLE);
++    MemorySource lazy = new MemorySource("lazy", Map.of(SAMPLE, bytes), true);
++
++    setup("first");
++    StructContext first = DecompilerContext.getStructContext();
++    first.addSpace(lazy, false);
++    assertEquals(0, lazy.reads.get());
++    assertTrue(first.hasClass(SAMPLE));
++    assertNotNull(first.getClass(SAMPLE));
++    assertFalse(first.hasClass("missing/Class"));
++    assertFalse(first.hasClass("missing/Class"));
++    assertEquals(2, lazy.reads.get());
++
++    setup("first");
++    StructContext second = DecompilerContext.getStructContext();
++    second.addSpace(lazy, false);
++    assertTrue(second.hasClass(SAMPLE));
++    assertEquals(3, lazy.reads.get());
++  }
++
++  @Test
++  void duplicateInnerAnchorsToAvailableFamilyRoot() throws IOException {
++    String root = "pkg/TestTypeAnnotationsTokens";
++    String member = root + "$InnerStatic";
++    String deepMember = member + "$Inner2";
++    byte[] rootBytes = classBytes("java21", root);
++    byte[] memberBytes = classBytes("java21", member);
++    byte[] deepBytes = classBytes("java21", deepMember);
++
++    setup("last");
++    StructContext context = DecompilerContext.getStructContext();
++    context.addSpace(new MemorySource("root-origin", Map.of(root, rootBytes, member, memberBytes), false), true);
++    context.addSpace(new MemorySource("member-origin", Map.of(member, memberBytes, deepMember, deepBytes), false), true);
++
++    IllegalStateException conflict = assertThrows(IllegalStateException.class, () -> context.getClass(deepMember));
++    assertTrue(conflict.getMessage().contains("family root: " + root));
++    assertTrue(conflict.getMessage().contains("member: " + deepMember));
++    assertTrue(conflict.getMessage().contains("anchored origin: root-origin [origin 1]"));
++    assertTrue(conflict.getMessage().contains("alternative origins: member-origin [origin 2]"));
++  }
++
++  @Test
++  void metadataWithoutExactDuplicateDoesNotCombineOrigins() throws IOException {
++    String root = "pkg/TestTypeAnnotationsTokens";
++    String member = root + "$InnerStatic";
++
++    setup("first");
++    StructContext context = DecompilerContext.getStructContext();
++    context.addSpace(new MemorySource("root-origin", Map.of(root, classBytes("java21", root)), false), true);
++    context.addSpace(new MemorySource("member-origin", Map.of(member, classBytes("java21", member)), false), true);
++
++    assertNotNull(context.getClass(root));
++    assertNotNull(context.getClass(member));
++  }
++
++  @Test
++  void invalidStrategyNamesAcceptedValues() {
++    IllegalArgumentException exception = assertThrows(IllegalArgumentException.class,
++      () -> StructContext.validateDuplicateClassStrategy("middle"));
++    assertTrue(exception.getMessage().contains("first, last, error"));
++  }
++
++  private static CapturingLogger setup(String strategy) {
++    Init.init();
++    Map<String, Object> properties = new HashMap<>(IFernflowerPreferences.DEFAULTS);
++    properties.put(IFernflowerPreferences.DUPLICATE_CLASS_STRATEGY, strategy);
++    CapturingLogger logger = new CapturingLogger();
++    StructContext context = new StructContext(null, null);
++    DecompilerContext.setCurrentContext(new DecompilerContext(properties, logger, context, new ClassesProcessor(context), null));
++    return logger;
++  }
++
++  private static byte[] classBytes(String version, String binaryName) throws IOException {
++    return Files.readAllBytes(Path.of("testData/classes", version, binaryName + ".class"));
++  }
++
++  private static byte[] changeSourceFile(byte[] original) {
++    byte[] changed = original.clone();
++    byte[] sourceName = "TestPatternMatchingLoops.java".getBytes(StandardCharsets.UTF_8);
++    outer:
++    for (int i = 0; i <= changed.length - sourceName.length; i++) {
++      for (int j = 0; j < sourceName.length; j++) {
++        if (changed[i + j] != sourceName[j]) {
++          continue outer;
++        }
++      }
++      changed[i] = 'U';
++      return changed;
++    }
++    throw new AssertionError("SourceFile constant not found");
++  }
++
++  private static String sourceFile(StructClass clazz) {
++    StructSourceFileAttribute attribute = clazz.getAttribute(StructGeneralAttribute.ATTRIBUTE_SOURCE_FILE);
++    return attribute.getSourceFile(clazz.getPool());
++  }
++
++  private static final class MemorySource implements IContextSource {
++    private final String name;
++    private final Map<String, byte[]> classes;
++    private final boolean lazy;
++    private final AtomicInteger reads = new AtomicInteger();
++
++    private MemorySource(String name, Map<String, byte[]> classes, boolean lazy) {
++      this.name = name;
++      this.classes = new LinkedHashMap<>(classes);
++      this.lazy = lazy;
++    }
++
++    @Override
++    public String getName() {
++      return this.name;
++    }
++
++    @Override
++    public Entries getEntries() {
++      if (this.lazy) {
++        return Entries.EMPTY;
++      }
++      return new Entries(this.classes.keySet().stream().map(Entry::atBase).toList(), List.of(), List.of());
++    }
++
++    @Override
++    public boolean isLazy() {
++      return this.lazy;
++    }
++
++    @Override
++    public byte[] getClassBytes(String className) {
++      this.reads.incrementAndGet();
++      return this.classes.get(className);
++    }
++
++    @Override
++    public InputStream getInputStream(String resource) {
++      String className = resource.endsWith(CLASS_SUFFIX) ? resource.substring(0, resource.length() - CLASS_SUFFIX.length()) : resource;
++      byte[] bytes = this.classes.get(className);
++      return bytes == null ? null : new ByteArrayInputStream(bytes);
++    }
++  }
++
++  private static final class CapturingLogger extends IFernflowerLogger {
++    private final List<String> warnings = new ArrayList<>();
++
++    @Override
++    public void writeMessage(String message, Severity severity) {
++      if (severity == Severity.WARN) {
++        this.warnings.add(message);
++      }
++    }
++
++    @Override
++    public void writeMessage(String message, Severity severity, Throwable throwable) {
++      writeMessage(message, severity);
++    }
++  }
++}

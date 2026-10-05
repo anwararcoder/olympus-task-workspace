@@ -1,0 +1,606 @@
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/BeanMappingMethod.java b/processor/src/main/java/org/mapstruct/ap/internal/model/BeanMappingMethod.java
+index 080eab1e..a8abcaf4 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/BeanMappingMethod.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/BeanMappingMethod.java
+@@ -191,6 +191,9 @@ public BeanMappingMethod build() {
+                     if ( methodReturnType.isOptionalType() ) {
+                         returnTypeImpl = methodReturnType.getOptionalBaseType();
+                     }
++                    else if ( methodReturnType.isMapEntryType() && methodReturnType.getImplementationType() != null ) {
++                        returnTypeImpl = methodReturnType.getImplementationType();
++                    }
+                     else {
+                         returnTypeImpl = methodReturnType;
+                     }
+@@ -948,6 +951,34 @@ private ConstructorAccessor getConstructorAccessor(Type type) {
+                 return null;
+             }
+ 
++            if ( "java.util.AbstractMap.SimpleEntry".equals( type.getFullyQualifiedName() ) ) {
++                for ( ExecutableElement constructor : ElementFilter.constructorsIn(
++                    type.getTypeElement().getEnclosedElements()
++                ) ) {
++                    if ( constructor.getParameters().size() == 2 ) {
++                        List<Parameter> constructorParameters = ctx.getTypeFactory()
++                            .getParameters( (DeclaredType) type.getTypeMirror(), constructor );
++                        List<ParameterBinding> parameterBindings = new ArrayList<>( 2 );
++                        Map<String, Accessor> constructorAccessors = new LinkedHashMap<>();
++                        String[] propertyNames = { "key", "value" };
++                        for ( int i = 0; i < propertyNames.length; i++ ) {
++                            Parameter constructorParameter = constructorParameters.get( i );
++                            Accessor constructorAccessor = createConstructorAccessor(
++                                constructorParameter.getElement(),
++                                constructorParameter.getType().getTypeMirror(),
++                                propertyNames[i]
++                            );
++                            constructorAccessors.put( propertyNames[i], constructorAccessor );
++                            parameterBindings.add( ParameterBinding.fromTypeAndName(
++                                constructorParameter.getType(),
++                                constructorAccessor.getSimpleName()
++                            ) );
++                        }
++                        return new ConstructorAccessor( parameterBindings, constructorAccessors );
++                    }
++                }
++            }
++
+             if ( type.isRecord() ) {
+ 
+                 List<ExecutableElement> constructors = ElementFilter.constructorsIn( type.getTypeElement()
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/ContainerMappingMethodBuilder.java b/processor/src/main/java/org/mapstruct/ap/internal/model/ContainerMappingMethodBuilder.java
+index 598db971..ade1ece8 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/ContainerMappingMethodBuilder.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/ContainerMappingMethodBuilder.java
+@@ -41,6 +41,9 @@
+     private String errorMessagePart;
+     private String callingContextTargetPropertyName;
+     private AnnotationMirror positionHint;
++    private Type sourceElementType;
++    private Type targetElementType;
++    private Type mappedElementType;
+ 
+     ContainerMappingMethodBuilder(Class<B> selfType, String errorMessagePart) {
+         super( selfType );
+@@ -72,8 +75,8 @@ public final M build() {
+         Type sourceParameterType = first( method.getSourceParameters() ).getType();
+         Type resultType = method.getResultType();
+ 
+-        Type sourceElementType = getElementType( sourceParameterType );
+-        Type targetElementType = getElementType( resultType );
++        sourceElementType = getElementType( sourceParameterType );
++        targetElementType = getElementType( resultType );
+ 
+         String loopVariableName =
+             Strings.getSafeVariableName( sourceElementType.getName(), method.getParameterNames() );
+@@ -124,6 +127,7 @@ public final M build() {
+                 forgedMethod.addThrownTypes( assignment.getThrownTypes() );
+             }
+         }
++        mappedElementType = getMappedElementType( assignment, targetElementType );
+         assignment = getWrapper( assignment, method );
+ 
+         // mapNullToDefault — a JSpecify @NonNull return forces RETURN_DEFAULT to avoid generating `return null`.
+@@ -199,6 +203,28 @@ protected abstract M instantiateMappingMethod(Method method, Collection<String>
+ 
+     protected abstract Assignment getWrapper(Assignment assignment, Method method);
+ 
++    protected Type getMappedElementType() {
++        return mappedElementType;
++    }
++
++    protected Type getSourceElementType() {
++        return sourceElementType;
++    }
++
++    protected Type getTargetElementType() {
++        return targetElementType;
++    }
++
++    private Type getMappedElementType(Assignment assignment, Type targetElementType) {
++        if ( assignment instanceof MethodReference ) {
++            Type returnType = ( (MethodReference) assignment ).getReturnType();
++            if ( returnType != null && !returnType.isVoid() ) {
++                return returnType;
++            }
++        }
++        return targetElementType;
++    }
++
+     @Override
+     protected boolean shouldUsePropertyNamesInHistory() {
+         return false;
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/IterableMappingMethod.java b/processor/src/main/java/org/mapstruct/ap/internal/model/IterableMappingMethod.java
+index 220466f8..e88609e9 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/IterableMappingMethod.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/IterableMappingMethod.java
+@@ -16,6 +16,7 @@
+ import org.mapstruct.ap.internal.model.common.Type;
+ import org.mapstruct.ap.internal.model.source.Method;
+ import org.mapstruct.ap.internal.model.source.SelectionParameters;
++import org.mapstruct.ap.internal.util.Strings;
+ 
+ import static org.mapstruct.ap.internal.util.Collections.first;
+ 
+@@ -27,6 +28,11 @@
+  */
+ public class IterableMappingMethod extends ContainerMappingMethod {
+ 
++    private final Type sourceElementType;
++    private final Type resultElementType;
++    private final Type mappedElementType;
++    private final String entryVariableName;
++
+     public static class Builder extends ContainerMappingMethodBuilder<Builder, IterableMappingMethod> {
+ 
+         public Builder() {
+@@ -35,16 +41,23 @@ public Builder() {
+ 
+         @Override
+         protected Type getElementType(Type parameterType) {
+-            return parameterType.isArrayType() ? parameterType.getComponentType() : first(
+-                parameterType.determineTypeArguments( Iterable.class ) ).getTypeBound();
++            if ( parameterType.isArrayType() ) {
++                return parameterType.getComponentType();
++            }
++            else if ( parameterType.isMapType() ) {
++                return ctx.getTypeFactory().getMapEntryType( parameterType );
++            }
++            else {
++                return first( parameterType.determineTypeArguments( Iterable.class ) ).getTypeBound();
++            }
+         }
+ 
+         @Override
+         protected Assignment getWrapper(Assignment assignment, Method method) {
+             Type resultType = method.getResultType();
+             // target accessor is setter, so decorate assignment as setter
+-            if ( resultType.isArrayType() ) {
+-                return new LocalVarWrapper( assignment, method.getThrownTypes(), resultType, false );
++            if ( resultType.isArrayType() || resultType.isMapType() ) {
++                return new LocalVarWrapper( assignment, method.getThrownTypes(), getMappedElementType(), false );
+             }
+             else {
+                 return new SetterWrapper( assignment, method.getThrownTypes(), false );
+@@ -65,6 +78,9 @@ protected IterableMappingMethod instantiateMappingMethod(Method method, Collecti
+                 factoryMethod,
+                 mapNullToDefault,
+                 loopVariableName,
++                getSourceElementType(),
++                getTargetElementType(),
++                getMappedElementType(),
+                 beforeMappingMethods,
+                 afterMappingMethods,
+                 selectionParameters,
+@@ -77,6 +93,7 @@ protected IterableMappingMethod instantiateMappingMethod(Method method, Collecti
+     private IterableMappingMethod(Method method, List<Annotation> annotations,
+                                   Collection<String> existingVariables, Assignment parameterAssignment,
+                                   MethodReference factoryMethod, boolean mapNullToDefault, String loopVariableName,
++                                  Type sourceElementType, Type resultElementType, Type mappedElementType,
+                                   List<LifecycleCallbackMethodReference> beforeMappingReferences,
+                                   List<LifecycleCallbackMethodReference> afterMappingReferences,
+         SelectionParameters selectionParameters, PresenceCheck sourceParameterPresenceCheck) {
+@@ -94,34 +111,35 @@ private IterableMappingMethod(Method method, List<Annotation> annotations,
+             selectionParameters,
+             sourceParameterPresenceCheck
+         );
++        this.sourceElementType = sourceElementType;
++        this.resultElementType = resultElementType;
++        this.mappedElementType = mappedElementType;
++        this.entryVariableName = Strings.getSafeVariableName( "entry", existingVariables );
+     }
+ 
+     @Override
+     public Set<Type> getImportTypes() {
+         Set<Type> types = super.getImportTypes();
+ 
+-        types.add( getSourceElementType() );
++        types.add( sourceElementType );
++        types.add( mappedElementType );
+         return types;
+     }
+ 
+     public Type getSourceElementType() {
+-        Type sourceParameterType = getSourceParameter().getType();
+-
+-        if ( sourceParameterType.isArrayType() ) {
+-            return sourceParameterType.getComponentType();
+-        }
+-        else {
+-            return first( sourceParameterType.determineTypeArguments( Iterable.class ) ).getTypeBound();
+-        }
++        return sourceElementType;
+     }
+ 
+     @Override
+     public Type getResultElementType() {
+-        if ( getResultType().isArrayType() ) {
+-            return getResultType().getComponentType();
+-        }
+-        else {
+-            return first( getResultType().determineTypeArguments( Iterable.class ) );
+-        }
++        return resultElementType;
++    }
++
++    public Type getMappedElementType() {
++        return mappedElementType;
++    }
++
++    public String getEntryVariableName() {
++        return entryVariableName;
+     }
+ }
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/PropertyMapping.java b/processor/src/main/java/org/mapstruct/ap/internal/model/PropertyMapping.java
+index f105c71d..1d536559 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/PropertyMapping.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/PropertyMapping.java
+@@ -336,8 +336,9 @@ else if ( targetType.isArrayType() && sourceType.isArrayType() && assignment.get
+         private Assignment forge( ) {
+             Assignment assignment;
+             Type sourceType = rightHandSide.getSourceType();
+-            if ( ( sourceType.isCollectionType() || sourceType.isArrayType()) && targetType.isIterableType()
+-                    || ( sourceType.isIterableType() && targetType.isCollectionType() ) ) {
++            if ( ( sourceType.isIterableType() || sourceType.isMapType() )
++                && ( targetType.isIterableType() || targetType.isMapType() )
++                && !( sourceType.isMapType() && targetType.isMapType() ) ) {
+                 assignment = forgeIterableMapping( sourceType, targetType, rightHandSide );
+             }
+             else if ( sourceType.isMapType() && targetType.isMapType() ) {
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/common/Type.java b/processor/src/main/java/org/mapstruct/ap/internal/model/common/Type.java
+index 0c028703..65f858fe 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/common/Type.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/common/Type.java
+@@ -424,6 +424,10 @@ public boolean isMapType() {
+         return isMapType;
+     }
+ 
++    public boolean isMapEntryType() {
++        return Map.Entry.class.getCanonicalName().equals( getFullyQualifiedName() );
++    }
++
+     private boolean hasStringMapSignature() {
+         if ( isMapType() ) {
+             List<Type> typeParameters = getTypeParameters();
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java b/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java
+index 8d79780d..d6693410 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java
+@@ -5,6 +5,7 @@
+  */
+ package org.mapstruct.ap.internal.model.common;
+ 
++import java.util.AbstractMap;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+@@ -158,6 +159,10 @@ public TypeFactory(ElementUtils elementUtils, TypeUtils typeUtils, FormattingMes
+             JavaCollectionConstants.SEQUENCED_MAP_FQN,
+             withFactoryMethod( getType( LinkedHashMap.class ), LINKED_HASH_MAP_FACTORY_METHOD_NAME )
+         );
++        implementationTypes.put(
++            Map.Entry.class.getCanonicalName(),
++            withDefaultConstructor( getType( AbstractMap.SimpleEntry.class ) )
++        );
+ 
+         this.loggingVerbose = loggingVerbose;
+     }
+@@ -218,6 +223,15 @@ public Type getType(TypeMirror mirror) {
+         return getType( mirror, false );
+     }
+ 
++    public Type getMapEntryType(Type mapType) {
++        List<Type> typeArguments = mapType.determineTypeArguments( Map.class );
++        TypeMirror[] typeArgumentMirrors = typeArguments.stream()
++            .map( Type::getTypeMirror )
++            .toArray( TypeMirror[]::new );
++        TypeElement entryType = elementUtils.getTypeElement( Map.Entry.class.getCanonicalName() );
++        return getType( typeUtils.getDeclaredType( entryType, typeArgumentMirrors ) );
++    }
++
+     /**
+      * Return a type that is always going to be imported.
+      * This is useful when using it in {@code Mapper#imports}
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/source/SourceMethod.java b/processor/src/main/java/org/mapstruct/ap/internal/model/source/SourceMethod.java
+index 8427dd3e..6af64309 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/source/SourceMethod.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/source/SourceMethod.java
+@@ -393,8 +393,9 @@ public Parameter getTargetPropertyNameParameter() {
+     public boolean isIterableMapping() {
+         if ( isIterableMapping == null ) {
+             isIterableMapping = getSourceParameters().size() == 1
+-                && getMappingSourceType().isIterableType()
+-                && getResultType().isIterableType();
++                && ( getMappingSourceType().isIterableType() || getMappingSourceType().isMapType() )
++                && ( getResultType().isIterableType() || getResultType().isMapType() )
++                && !( getMappingSourceType().isMapType() && getResultType().isMapType() );
+         }
+         return isIterableMapping;
+     }
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java b/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
+index d7a0329a..a5f63aac 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/processor/MethodRetrievalProcessor.java
+@@ -555,18 +555,22 @@ private boolean checkParameterAndReturnType(ExecutableElement method, List<Param
+ 
+         if ( sourceParameters.size() == 1 ) {
+             Type parameterType = sourceParameters.get( 0 ).getType();
++            boolean isMapEntryMapping = parameterType.isMapType() && resultType.isIterableType()
++                || parameterType.isIterableType() && resultType.isMapType();
+ 
+-            if ( isStreamTypeOrIterableFromJavaStdLib( parameterType ) && !resultType.isIterableOrStreamType() ) {
++            if ( !isMapEntryMapping && isStreamTypeOrIterableFromJavaStdLib( parameterType )
++                && !resultType.isIterableOrStreamType() ) {
+                 messager.printMessage( method, Message.RETRIEVAL_ITERABLE_TO_NON_ITERABLE );
+                 return false;
+             }
+ 
+-            if ( !parameterType.isIterableOrStreamType() && isStreamTypeOrIterableFromJavaStdLib( resultType ) ) {
++            if ( !isMapEntryMapping && !parameterType.isIterableOrStreamType()
++                && isStreamTypeOrIterableFromJavaStdLib( resultType ) ) {
+                 messager.printMessage( method, Message.RETRIEVAL_NON_ITERABLE_TO_ITERABLE );
+                 return false;
+             }
+ 
+-            if ( !parameterType.isIterableOrStreamType() && resultType.isArrayType() ) {
++            if ( !isMapEntryMapping && !parameterType.isIterableOrStreamType() && resultType.isArrayType() ) {
+                 messager.printMessage( method, Message.RETRIEVAL_NON_ITERABLE_TO_ARRAY );
+                 return false;
+             }
+diff --git a/processor/src/main/resources/org/mapstruct/ap/internal/model/IterableMappingMethod.ftl b/processor/src/main/resources/org/mapstruct/ap/internal/model/IterableMappingMethod.ftl
+index 6268366f..e49c7cf2 100644
+--- a/processor/src/main/resources/org/mapstruct/ap/internal/model/IterableMappingMethod.ftl
++++ b/processor/src/main/resources/org/mapstruct/ap/internal/model/IterableMappingMethod.ftl
+@@ -62,9 +62,14 @@
+ 
+     	</#if>
+     </#list>
+-    <#if resultType.arrayType>
++    <#if resultType.mapType>
++        for ( <@includeModel object=sourceElementType/> ${loopVariableName} : <@sourceIterable/> ) {
++            <@includeModel object=elementAssignment targetWriteAccessorName=entryVariableName targetType=mappedElementType/>
++            ${resultName}.put( ${entryVariableName}.getKey(), ${entryVariableName}.getValue() );
++        }
++    <#elseif resultType.arrayType>
+         int ${index1Name} = 0;
+-        for ( <@includeModel object=sourceElementType/> ${loopVariableName} : ${sourceParameter.name} ) {
++        for ( <@includeModel object=sourceElementType/> ${loopVariableName} : <@sourceIterable/> ) {
+             <#if existingInstanceMapping>
+             if ( ( ${index1Name} >= ${resultName}.length ) || ( ${index1Name} >= ${iterableSize()} ) ) {
+                 break;
+@@ -74,7 +79,7 @@
+             ${index1Name}++;
+         }
+     <#else>
+-        for ( <@includeModel object=sourceElementType/> ${loopVariableName} : ${sourceParameter.name} ) {
++        for ( <@includeModel object=sourceElementType/> ${loopVariableName} : <@sourceIterable/> ) {
+             <@includeModel object=elementAssignment targetBeanName=resultName targetWriteAccessorName="add" targetType=resultElementType/>
+         }
+     </#if>
+@@ -104,6 +109,13 @@
+         <#return sourceParameter.name + ".size()">
+     </#if>
+ </#function>
++<#macro sourceIterable><#compress>
++    <#if sourceParameter.type.mapType>
++        ${sourceParameter.name}.entrySet()
++    <#else>
++        ${sourceParameter.name}
++    </#if>
++</#compress></#macro>
+ <#macro iterableLocalVarDef>
+     <@compress single_line=true>
+         <#if resultType.fullyQualifiedName == "java.lang.Iterable">
+@@ -112,4 +124,4 @@
+             <@includeModel object=resultType/>
+         </#if>
+     </@compress>
+-</#macro>
+\ No newline at end of file
++</#macro>
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/collection/mapentry/MapEntryMapper.java b/processor/src/test/java/org/mapstruct/ap/test/collection/mapentry/MapEntryMapper.java
+new file mode 100644
+index 00000000..ff5400ab
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/collection/mapentry/MapEntryMapper.java
+@@ -0,0 +1,112 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.collection.mapentry;
++
++import java.util.AbstractMap;
++import java.util.List;
++import java.util.Map;
++
++import org.mapstruct.IterableMapping;
++import org.mapstruct.Mapper;
++import org.mapstruct.Mapping;
++import org.mapstruct.Named;
++import org.mapstruct.factory.Mappers;
++
++@Mapper
++public interface MapEntryMapper {
++
++    MapEntryMapper INSTANCE = Mappers.getMapper( MapEntryMapper.class );
++
++    List<FlatEntry> map(Map<String, Integer> source);
++
++    FlatEntry[] mapToArray(Map<String, Integer> source);
++
++    Map<String, Long> map(List<FlatEntry> source);
++
++    Map<String, Long> map(FlatEntry[] source);
++
++    TargetContainer map(SourceContainer source);
++
++    @IterableMapping(qualifiedByName = "formattedEntry")
++    List<String> mapFormatted(Map<String, Integer> source);
++
++    @IterableMapping(qualifiedByName = "concreteEntry")
++    Map<? super String, ? super Long> mapLowerBounded(List<FlatEntry> source);
++
++    @Mapping(target = "day", source = "key")
++    @Mapping(target = "amount", source = "value")
++    FlatEntry map(Map.Entry<String, Integer> source);
++
++    @Mapping(target = "key", source = "day")
++    @Mapping(target = "value", source = "amount")
++    Map.Entry<String, Long> map(FlatEntry source);
++
++    @Named("formattedEntry")
++    default String formatEntry(Map.Entry<String, Integer> source) {
++        return source.getKey() + "=" + Integer.toHexString( source.getValue() );
++    }
++
++    @Named("concreteEntry")
++    default AbstractMap.SimpleImmutableEntry<String, Long> concreteEntry(FlatEntry source) {
++        return new AbstractMap.SimpleImmutableEntry<>( source.getDay(), source.getAmount() );
++    }
++
++    class FlatEntry {
++
++        private String day;
++        private long amount;
++
++        public FlatEntry() {
++        }
++
++        public FlatEntry(String day, long amount) {
++            this.day = day;
++            this.amount = amount;
++        }
++
++        public String getDay() {
++            return day;
++        }
++
++        public void setDay(String day) {
++            this.day = day;
++        }
++
++        public long getAmount() {
++            return amount;
++        }
++
++        public void setAmount(long amount) {
++            this.amount = amount;
++        }
++    }
++
++    class SourceContainer {
++
++        private Map<String, Integer> entries;
++
++        public Map<String, Integer> getEntries() {
++            return entries;
++        }
++
++        public void setEntries(Map<String, Integer> entries) {
++            this.entries = entries;
++        }
++    }
++
++    class TargetContainer {
++
++        private List<FlatEntry> entries;
++
++        public List<FlatEntry> getEntries() {
++            return entries;
++        }
++
++        public void setEntries(List<FlatEntry> entries) {
++            this.entries = entries;
++        }
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/collection/mapentry/MapEntryMappingTest.java b/processor/src/test/java/org/mapstruct/ap/test/collection/mapentry/MapEntryMappingTest.java
+new file mode 100644
+index 00000000..765882d1
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/collection/mapentry/MapEntryMappingTest.java
+@@ -0,0 +1,83 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.collection.mapentry;
++
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.mapstruct.ap.test.collection.mapentry.MapEntryMapper.FlatEntry;
++import org.mapstruct.ap.test.collection.mapentry.MapEntryMapper.SourceContainer;
++import org.mapstruct.ap.test.collection.mapentry.MapEntryMapper.TargetContainer;
++import org.mapstruct.ap.testutil.ProcessorTest;
++import org.mapstruct.ap.testutil.WithClasses;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.entry;
++
++@WithClasses(MapEntryMapper.class)
++public class MapEntryMappingTest {
++
++    @ProcessorTest
++    public void shouldMapMapToIterableAndArrayInIterationOrder() {
++        Map<String, Integer> source = new LinkedHashMap<>();
++        source.put( "monday", 11 );
++        source.put( "wednesday", 19 );
++
++        List<FlatEntry> list = MapEntryMapper.INSTANCE.map( source );
++        FlatEntry[] array = MapEntryMapper.INSTANCE.mapToArray( source );
++
++        assertThat( list ).extracting( FlatEntry::getDay ).containsExactly( "monday", "wednesday" );
++        assertThat( list ).extracting( FlatEntry::getAmount ).containsExactly( 11L, 19L );
++        assertThat( array ).extracting( FlatEntry::getDay ).containsExactly( "monday", "wednesday" );
++    }
++
++    @ProcessorTest
++    public void shouldMapIterableAndArrayToMapEntries() {
++        FlatEntry monday = new FlatEntry( "monday", 11 );
++        FlatEntry wednesday = new FlatEntry( "wednesday", 19 );
++
++        Map<String, Long> fromList = MapEntryMapper.INSTANCE.map( Arrays.asList( monday, wednesday ) );
++        Map<String, Long> fromArray = MapEntryMapper.INSTANCE.map( new FlatEntry[] { monday, wednesday } );
++
++        assertThat( fromList ).containsExactly( entry( "monday", 11L ), entry( "wednesday", 19L ) );
++        assertThat( fromArray ).containsExactly( entry( "monday", 11L ), entry( "wednesday", 19L ) );
++    }
++
++    @ProcessorTest
++    public void shouldUseIterableMappingQualifiersForMapEntries() {
++        Map<String, Integer> source = new LinkedHashMap<>();
++        source.put( "first", 15 );
++        source.put( "second", 16 );
++
++        assertThat( MapEntryMapper.INSTANCE.mapFormatted( source ) )
++            .containsExactly( "first=f", "second=10" );
++    }
++
++    @ProcessorTest
++    public void shouldForgeMapAndIterablePropertyMappings() {
++        SourceContainer source = new SourceContainer();
++        Map<String, Integer> entries = new LinkedHashMap<>();
++        entries.put( "monday", 11 );
++        entries.put( "wednesday", 19 );
++        source.setEntries( entries );
++
++        TargetContainer target = MapEntryMapper.INSTANCE.map( source );
++
++        assertThat( target.getEntries() ).extracting( FlatEntry::getDay )
++            .containsExactly( "monday", "wednesday" );
++    }
++
++    @ProcessorTest
++    public void shouldUseConcreteEntryTypeForLowerBoundedMap() {
++        Map<? super String, ? super Long> result = MapEntryMapper.INSTANCE.mapLowerBounded(
++            Arrays.asList( new FlatEntry( "monday", 11 ) )
++        );
++
++        assertThat( result ).containsEntry( "monday", 11L );
++    }
++}

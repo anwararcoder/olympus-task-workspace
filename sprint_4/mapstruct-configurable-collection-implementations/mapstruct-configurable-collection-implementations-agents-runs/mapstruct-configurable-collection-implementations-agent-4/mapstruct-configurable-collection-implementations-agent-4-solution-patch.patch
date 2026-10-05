@@ -1,0 +1,1287 @@
+diff --git a/NEXT_RELEASE_CHANGELOG.md b/NEXT_RELEASE_CHANGELOG.md
+index e0f4cd3..43df68c 100644
+--- a/NEXT_RELEASE_CHANGELOG.md
++++ b/NEXT_RELEASE_CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ### Enhancements
+ 
++* Allow configuring concrete implementations for supported collection and map interface results.
++
+ ### Bugs
+ 
+ ### Documentation
+diff --git a/documentation/src/main/asciidoc/chapter-2-set-up.asciidoc b/documentation/src/main/asciidoc/chapter-2-set-up.asciidoc
+index 31479f8..54fd971 100644
+--- a/documentation/src/main/asciidoc/chapter-2-set-up.asciidoc
++++ b/documentation/src/main/asciidoc/chapter-2-set-up.asciidoc
+@@ -204,6 +204,11 @@ suppressGeneratorTimestamp`
+ |If set to `true`, MapStruct in which MapStruct logs its major decisions. Note, at the moment of writing in Maven, also `showWarnings` needs to be added due to a problem in the maven-compiler-plugin configuration.
+ |`false`
+ 
++|`mapstruct.configurationFile`
++|The relative path of a Java properties resource on the mapping compilation classpath that configures MapStruct.
++The resource must exist when this option is specified. If the option is not specified, MapStruct reads an optional `mapstruct.properties` resource from the root of that classpath.
++|`mapstruct.properties`
++
+ |`mapstruct.
+ suppressGeneratorVersionInfoComment`
+ |If set to `true`, the creation of the `comment` attribute in the `@Generated` annotation in the generated mapper classes is suppressed. The comment contains information about the version of MapStruct and about the compiler used for the annotation processing.
+diff --git a/documentation/src/main/asciidoc/chapter-6-mapping-collections.asciidoc b/documentation/src/main/asciidoc/chapter-6-mapping-collections.asciidoc
+index 4510c82..ec0c549 100644
+--- a/documentation/src/main/asciidoc/chapter-6-mapping-collections.asciidoc
++++ b/documentation/src/main/asciidoc/chapter-6-mapping-collections.asciidoc
+@@ -228,4 +228,25 @@ When an iterable or map mapping method declares an interface type as return type
+ 
+ |`ConcurrentMap`|`ConcurrentHashMap`
+ |`ConcurrentNavigableMap`|`ConcurrentSkipListMap`
+-|===
+\ No newline at end of file
++|===
++
++These defaults can be replaced with entries in the configured MapStruct properties resource:
++
++[source, properties]
++----
++mapstruct.collectionImplementation.java.util.List=com.example.MyList
++mapstruct.collectionImplementation.java.util.Map=com.example.MyMap
++----
++
++The default resource is `mapstruct.properties` at the root of the mapping compilation classpath.
++The `mapstruct.configurationFile` annotation processor option selects a different resource by relative path on the same classpath.
++MapStruct does not resolve either resource from the annotation processor's own classloader.
++
++The configured type can be part of the current compilation or generated in a later annotation processing round.
++It must be a publicly accessible concrete class assignable to the configured interface, preserve the interface's unbounded type parameters, and provide a public no-argument constructor that declares no checked exceptions.
++If it also provides a usable public `int` constructor, MapStruct passes the source size as the initial capacity.
++An applicable object factory continues to take precedence over the configured implementation.
++
++Unknown properties, unsupported interfaces, empty values, conflicting duplicate entries, and invalid or unresolved implementation types cause compilation to fail.
++Equal duplicate entries are permitted.
++The configured implementation applies whenever MapStruct constructs that exact supported interface result, including bean properties and stream mappings.
+\ No newline at end of file
+diff --git a/processor/src/main/java/org/mapstruct/ap/MappingProcessor.java b/processor/src/main/java/org/mapstruct/ap/MappingProcessor.java
+index 50831a8..6283df1 100644
+--- a/processor/src/main/java/org/mapstruct/ap/MappingProcessor.java
++++ b/processor/src/main/java/org/mapstruct/ap/MappingProcessor.java
+@@ -35,6 +35,8 @@
+ 
+ import org.mapstruct.ap.internal.gem.MapperGem;
+ import org.mapstruct.ap.internal.model.Mapper;
++import org.mapstruct.ap.internal.option.CollectionImplementationConfiguration;
++import org.mapstruct.ap.internal.option.ConfiguredImplementationUnavailableException;
+ import org.mapstruct.ap.internal.option.MappingOption;
+ import org.mapstruct.ap.internal.option.Options;
+ import org.mapstruct.ap.internal.processor.DefaultModelElementProcessorContext;
+@@ -122,6 +124,7 @@ public class MappingProcessor extends AbstractProcessor {
+     private Options options;
+ 
+     private AnnotationProcessorContext annotationProcessorContext;
++    private CollectionImplementationConfiguration collectionImplementationConfiguration;
+ 
+     /**
+      * Any mappers for which an implementation cannot be generated in the current round because they have source/target
+@@ -154,6 +157,11 @@ public synchronized void init(ProcessingEnvironment processingEnv) {
+         super.init( processingEnv );
+ 
+         options = new Options( processingEnv.getOptions() );
++        collectionImplementationConfiguration = CollectionImplementationConfiguration.load(
++            processingEnv.getFiler(),
++            processingEnv.getMessager(),
++            options.getConfigurationFile()
++        );
+         annotationProcessorContext = new AnnotationProcessorContext(
+             processingEnv.getElementUtils(),
+             processingEnv.getTypeUtils(),
+@@ -161,7 +169,8 @@ public synchronized void init(ProcessingEnvironment processingEnv) {
+             options.isDisableBuilders(),
+             options.isDisableJSpecify(),
+             options.isVerbose(),
+-            resolveAdditionalOptions( processingEnv.getOptions() )
++            resolveAdditionalOptions( processingEnv.getOptions() ),
++            collectionImplementationConfiguration
+         );
+ 
+         if ( additionalSupportedOptionsError != null ) {
+@@ -178,6 +187,11 @@ public SourceVersion getSupportedSourceVersion() {
+     public boolean process(final Set<? extends TypeElement> annotations, final RoundEnvironment roundEnvironment) {
+         // nothing to do in the last round
+         if ( !roundEnvironment.processingOver() ) {
++            collectionImplementationConfiguration.validate(
++                processingEnv.getElementUtils(),
++                processingEnv.getTypeUtils(),
++                processingEnv.getMessager()
++            );
+             RoundContext roundContext = new RoundContext( annotationProcessorContext );
+ 
+             // process any mappers left over from previous rounds
+@@ -188,10 +202,14 @@ public boolean process(final Set<? extends TypeElement> annotations, final Round
+             Set<TypeElement> mappers = getMappers( annotations, roundEnvironment );
+             processMapperElements( mappers, roundContext );
+         }
+-        else if ( !deferredMappers.isEmpty() ) {
++        else {
++            collectionImplementationConfiguration.reportUnavailable( processingEnv.getMessager() );
+             // If the processing is over and there are deferred mappers it means something wrong occurred and
+             // MapStruct didn't generate implementations for those
+             for ( DeferredMapper deferredMapper : deferredMappers ) {
++                if ( deferredMapper.configurationImplementationUnavailable ) {
++                    continue;
++                }
+ 
+                 TypeElement deferredMapperElement = deferredMapper.deferredMapperElement;
+                 Element erroneousElement = deferredMapper.erroneousElement;
+@@ -312,7 +330,11 @@ private void processMapperElements(Set<TypeElement> mapperElements, RoundContext
+                         Kind.NOTE, "MapStruct: referred types not available (yet), deferring mapper: "
+                             + mapperElement );
+                 }
+-                deferredMappers.add( new DeferredMapper( mapperElement, erroneousElement ) );
++                deferredMappers.add( new DeferredMapper(
++                    mapperElement,
++                    erroneousElement,
++                    thie instanceof ConfiguredImplementationUnavailableException
++                ) );
+             }
+             catch ( Throwable t ) {
+                 handleUncaughtError( mapperElement, t );
+@@ -459,10 +481,13 @@ private static class DeferredMapper {
+ 
+         private final TypeElement deferredMapperElement;
+         private final Element erroneousElement;
++        private final boolean configurationImplementationUnavailable;
+ 
+-        private DeferredMapper(TypeElement deferredMapperElement, Element erroneousElement) {
++        private DeferredMapper(TypeElement deferredMapperElement, Element erroneousElement,
++                               boolean configurationImplementationUnavailable) {
+             this.deferredMapperElement = deferredMapperElement;
+             this.erroneousElement = erroneousElement;
++            this.configurationImplementationUnavailable = configurationImplementationUnavailable;
+         }
+     }
+ 
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java b/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java
+index 8d79780..54d277b 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/model/common/TypeFactory.java
+@@ -40,6 +40,8 @@
+ import javax.lang.model.type.WildcardType;
+ 
+ import org.mapstruct.ap.internal.gem.BuilderGem;
++import org.mapstruct.ap.internal.option.CollectionImplementationConfiguration;
++import org.mapstruct.ap.internal.option.CollectionImplementationConfiguration.ConfiguredImplementation;
+ import org.mapstruct.ap.internal.util.AnnotationProcessingException;
+ import org.mapstruct.ap.internal.util.Collections;
+ import org.mapstruct.ap.internal.util.ElementUtils;
+@@ -103,15 +105,18 @@ public class TypeFactory {
+     private final Map<String, String> notToBeImportedTypes;
+ 
+     private final boolean loggingVerbose;
++    private final CollectionImplementationConfiguration collectionImplementationConfiguration;
+ 
+     public TypeFactory(ElementUtils elementUtils, TypeUtils typeUtils, FormattingMessager messager,
+                        RoundContext roundContext, Map<String, String> notToBeImportedTypes, boolean loggingVerbose,
+-                       VersionInformation versionInformation) {
++                       VersionInformation versionInformation,
++                       CollectionImplementationConfiguration collectionImplementationConfiguration) {
+         this.elementUtils = elementUtils;
+         this.typeUtils = typeUtils;
+         this.messager = messager;
+         this.roundContext = roundContext;
+         this.notToBeImportedTypes = notToBeImportedTypes;
++        this.collectionImplementationConfiguration = collectionImplementationConfiguration;
+ 
+         iterableType = typeUtils.erasure( elementUtils.getTypeElement( Iterable.class.getCanonicalName() ).asType() );
+         collectionType =
+@@ -555,11 +560,15 @@ private ImplementationType getImplementationType(TypeMirror mirror) {
+         }
+ 
+         DeclaredType declaredType = (DeclaredType) mirror;
++        String interfaceName = ( (TypeElement) declaredType.asElement() ).getQualifiedName().toString();
+ 
+-        ImplementationType implementation = implementationTypes.get(
+-            ( (TypeElement) declaredType.asElement() ).getQualifiedName()
+-                .toString()
+-        );
++        ConfiguredImplementation configuredImplementation = collectionImplementationConfiguration.get( interfaceName );
++
++        ImplementationType implementation = configuredImplementation == null
++            ? implementationTypes.get( interfaceName )
++            : configuredImplementation.hasInitialCapacityConstructor()
++                ? withInitialCapacity( getType( configuredImplementation.getName() ) )
++                : withDefaultConstructor( getType( configuredImplementation.getName() ) );
+ 
+         if ( implementation != null ) {
+             Type implementationType = implementation.getType();
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/option/CollectionImplementationConfiguration.java b/processor/src/main/java/org/mapstruct/ap/internal/option/CollectionImplementationConfiguration.java
+new file mode 100644
+index 0000000..37e8086
+--- /dev/null
++++ b/processor/src/main/java/org/mapstruct/ap/internal/option/CollectionImplementationConfiguration.java
+@@ -0,0 +1,384 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.internal.option;
++
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Properties;
++import java.util.Set;
++import javax.annotation.processing.Filer;
++import javax.annotation.processing.Messager;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.ElementKind;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.Modifier;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.element.TypeParameterElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.ElementFilter;
++import javax.lang.model.util.Elements;
++import javax.lang.model.util.Types;
++import javax.tools.Diagnostic;
++import javax.tools.FileObject;
++import javax.tools.StandardLocation;
++
++/**
++ * Configured concrete implementations for supported collection and map interfaces.
++ */
++public class CollectionImplementationConfiguration {
++
++    public static final String DEFAULT_RESOURCE = "mapstruct.properties";
++    public static final String PROPERTY_PREFIX = "mapstruct.collectionImplementation.";
++
++    private static final Set<String> SUPPORTED_INTERFACES = Collections.unmodifiableSet( new HashSet<>( Arrays.asList(
++        "java.lang.Iterable",
++        "java.util.Collection",
++        "java.util.List",
++        "java.util.Set",
++        "java.util.SortedSet",
++        "java.util.NavigableSet",
++        "java.util.Map",
++        "java.util.SortedMap",
++        "java.util.NavigableMap",
++        "java.util.concurrent.ConcurrentMap",
++        "java.util.concurrent.ConcurrentNavigableMap",
++        "java.util.SequencedSet",
++        "java.util.SequencedMap"
++    ) ) );
++
++    private final Map<String, String> implementations;
++    private final Map<String, ConfiguredImplementation> resolvedImplementations = new HashMap<>();
++    private final Set<String> invalidImplementations = new HashSet<>();
++
++    private CollectionImplementationConfiguration(Map<String, String> implementations) {
++        this.implementations = implementations;
++    }
++
++    public static CollectionImplementationConfiguration load(Filer filer, Messager messager,
++                                                             String configuredResource) {
++        String resourceName = configuredResource == null ? DEFAULT_RESOURCE : configuredResource;
++        boolean required = configuredResource != null;
++        DuplicateDetectingProperties properties = new DuplicateDetectingProperties();
++
++        try {
++            FileObject resource = filer.getResource( StandardLocation.CLASS_PATH, "", resourceName );
++            try ( InputStream inputStream = resource.openInputStream() ) {
++                properties.load( inputStream );
++            }
++        }
++        catch ( FileNotFoundException e ) {
++            if ( required ) {
++                reportUnreadableResource( messager, resourceName, e );
++            }
++            return new CollectionImplementationConfiguration( Collections.emptyMap() );
++        }
++        catch ( IOException e ) {
++            reportUnreadableResource( messager, resourceName, e );
++            return new CollectionImplementationConfiguration( Collections.emptyMap() );
++        }
++        catch ( IllegalArgumentException e ) {
++            if ( required || !isMissingResource( e ) ) {
++                reportUnreadableResource( messager, resourceName, e );
++            }
++            return new CollectionImplementationConfiguration( Collections.emptyMap() );
++        }
++
++        Map<String, String> implementations = new LinkedHashMap<>();
++        for ( Map.Entry<Object, Object> property : properties.entrySet() ) {
++            String key = (String) property.getKey();
++            String value = (String) property.getValue();
++            if ( !key.startsWith( PROPERTY_PREFIX ) ) {
++                messager.printMessage(
++                    Diagnostic.Kind.ERROR,
++                    "Invalid MapStruct collection implementation property '" + key + "': unknown property"
++                );
++                continue;
++            }
++
++            String interfaceName = key.substring( PROPERTY_PREFIX.length() );
++            if ( !SUPPORTED_INTERFACES.contains( interfaceName ) ) {
++                messager.printMessage(
++                    Diagnostic.Kind.ERROR,
++                    "Invalid MapStruct collection implementation property '" + key
++                        + "': unsupported collection or map interface '" + interfaceName + "'"
++                );
++                continue;
++            }
++            if ( value.trim().isEmpty() ) {
++                messager.printMessage(
++                    Diagnostic.Kind.ERROR,
++                    "Invalid value for MapStruct collection implementation property '" + key
++                        + "': implementation type is empty"
++                );
++                continue;
++            }
++
++            String conflictingValue = properties.getConflictingValue( key, value );
++            if ( conflictingValue != null ) {
++                messager.printMessage(
++                    Diagnostic.Kind.ERROR,
++                    "Invalid duplicate MapStruct collection implementation property '" + key + "': values '"
++                        + value + "' and '" + conflictingValue + "' conflict"
++                );
++                continue;
++            }
++            implementations.put( interfaceName, value.trim() );
++        }
++
++        return new CollectionImplementationConfiguration( implementations );
++    }
++
++    private static void reportUnreadableResource(Messager messager, String resourceName, Exception exception) {
++        messager.printMessage(
++            Diagnostic.Kind.ERROR,
++            "Configured MapStruct collection implementation resource '" + resourceName
++                + "' could not be read: " + exception.getMessage()
++        );
++    }
++
++    private static boolean isMissingResource(IllegalArgumentException exception) {
++        return exception.getMessage() != null && exception.getMessage().contains( "Resource does not exist" );
++    }
++
++    public void validate(Elements elements, Types types, Messager messager) {
++        for ( String interfaceName : implementations.keySet() ) {
++            resolve( interfaceName, elements, types, messager );
++        }
++    }
++
++    public ConfiguredImplementation get(String interfaceName) {
++        if ( !implementations.containsKey( interfaceName ) ) {
++            return null;
++        }
++
++        ConfiguredImplementation implementation = resolvedImplementations.get( interfaceName );
++        if ( implementation == null && !invalidImplementations.contains( interfaceName ) ) {
++            throw new ConfiguredImplementationUnavailableException(
++                interfaceName,
++                implementations.get( interfaceName )
++            );
++        }
++        return implementation;
++    }
++
++    public void reportUnavailable(Messager messager) {
++        for ( Map.Entry<String, String> implementation : implementations.entrySet() ) {
++            if ( !resolvedImplementations.containsKey( implementation.getKey() )
++                && !invalidImplementations.contains( implementation.getKey() ) ) {
++                messager.printMessage(
++                    Diagnostic.Kind.ERROR,
++                    invalidValueMessage(
++                        implementation.getKey(),
++                        implementation.getValue(),
++                        "implementation type could not be resolved"
++                    )
++                );
++            }
++        }
++    }
++
++    private ConfiguredImplementation resolve(String interfaceName, Elements elements, Types types, Messager messager) {
++        ConfiguredImplementation resolved = resolvedImplementations.get( interfaceName );
++        if ( resolved != null || invalidImplementations.contains( interfaceName ) ) {
++            return resolved;
++        }
++
++        TypeElement interfaceElement = elements.getTypeElement( interfaceName );
++        if ( interfaceElement == null ) {
++            reportInvalid( interfaceName, messager, "configured interface is not available in this compilation" );
++            return null;
++        }
++
++        String implementationName = implementations.get( interfaceName );
++        TypeElement implementationElement = elements.getTypeElement( implementationName );
++        if ( implementationElement == null ) {
++            return null;
++        }
++
++        String validationError = validateImplementation( interfaceElement, implementationElement, elements, types );
++        if ( validationError != null ) {
++            reportInvalid( interfaceName, messager, validationError );
++            return null;
++        }
++
++        boolean initialCapacityConstructor = hasUsableConstructor(
++            implementationElement,
++            types,
++            elements,
++            true
++        );
++        resolved = new ConfiguredImplementation( implementationName, initialCapacityConstructor );
++        resolvedImplementations.put( interfaceName, resolved );
++        return resolved;
++    }
++
++    private String validateImplementation(TypeElement interfaceElement, TypeElement implementationElement,
++                                          Elements elements, Types types) {
++        if ( implementationElement.getKind() != ElementKind.CLASS
++            || implementationElement.getModifiers().contains( Modifier.ABSTRACT ) ) {
++            return "implementation type must be a concrete class";
++        }
++        if ( !isPubliclyAccessible( implementationElement ) ) {
++            return "implementation type must be publicly accessible";
++        }
++        if ( !types.isAssignable(
++            types.erasure( implementationElement.asType() ),
++            types.erasure( interfaceElement.asType() )
++        ) ) {
++            return "implementation type is not assignable to '" + interfaceElement.getQualifiedName() + "'";
++        }
++
++        List<? extends TypeParameterElement> interfaceParameters = interfaceElement.getTypeParameters();
++        List<? extends TypeParameterElement> implementationParameters = implementationElement.getTypeParameters();
++        if ( implementationParameters.size() != interfaceParameters.size() ) {
++            return "implementation type must declare the same number of type parameters as the interface";
++        }
++        for ( TypeParameterElement parameter : implementationParameters ) {
++            if ( !isUnbounded( parameter, elements, types ) ) {
++                return "implementation type parameters must be unbounded";
++            }
++        }
++        if ( !preservesTypeParameters( interfaceElement, implementationElement, types ) ) {
++            return "implementation type must preserve the interface type parameters";
++        }
++        if ( !hasUsableConstructor( implementationElement, types, elements, false ) ) {
++            return "implementation type must expose a public no-argument constructor that declares no checked "
++                + "exceptions";
++        }
++        return null;
++    }
++
++    private boolean isPubliclyAccessible(TypeElement type) {
++        Element current = type;
++        while ( current instanceof TypeElement ) {
++            if ( !current.getModifiers().contains( Modifier.PUBLIC ) ) {
++                return false;
++            }
++            current = current.getEnclosingElement();
++        }
++        return true;
++    }
++
++    private boolean isUnbounded(TypeParameterElement parameter, Elements elements, Types types) {
++        List<? extends TypeMirror> bounds = parameter.getBounds();
++        TypeElement objectElement = elements.getTypeElement( Object.class.getCanonicalName() );
++        return bounds.size() == 1
++            && types.isSameType( types.erasure( bounds.get( 0 ) ), types.erasure( objectElement.asType() ) );
++    }
++
++    private boolean preservesTypeParameters(TypeElement interfaceElement, TypeElement implementationElement,
++                                            Types types) {
++        List<? extends TypeParameterElement> parameters = implementationElement.getTypeParameters();
++        TypeMirror[] arguments = new TypeMirror[parameters.size()];
++        for ( int i = 0; i < parameters.size(); i++ ) {
++            arguments[i] = parameters.get( i ).asType();
++        }
++        DeclaredType implementationType = types.getDeclaredType( implementationElement, arguments );
++        DeclaredType interfaceType = types.getDeclaredType( interfaceElement, arguments );
++        return types.isAssignable( implementationType, interfaceType );
++    }
++
++    private boolean hasUsableConstructor(TypeElement implementationElement, Types types, Elements elements,
++                                         boolean initialCapacity) {
++        TypeMirror runtimeException = elements.getTypeElement( RuntimeException.class.getCanonicalName() ).asType();
++        TypeMirror error = elements.getTypeElement( Error.class.getCanonicalName() ).asType();
++        List<ExecutableElement> constructors = ElementFilter.constructorsIn(
++            implementationElement.getEnclosedElements()
++        );
++        for ( ExecutableElement constructor : constructors ) {
++            if ( !constructor.getModifiers().contains( Modifier.PUBLIC ) ) {
++                continue;
++            }
++            if ( initialCapacity ) {
++                if ( constructor.getParameters().size() != 1
++                    || constructor.getParameters().get( 0 ).asType().getKind() != javax.lang.model.type.TypeKind.INT ) {
++                    continue;
++                }
++            }
++            else if ( !constructor.getParameters().isEmpty() ) {
++                continue;
++            }
++
++            boolean checkedException = false;
++            for ( TypeMirror thrownType : constructor.getThrownTypes() ) {
++                if ( !types.isSubtype( thrownType, runtimeException ) && !types.isSubtype( thrownType, error ) ) {
++                    checkedException = true;
++                    break;
++                }
++            }
++            if ( !checkedException ) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private void reportInvalid(String interfaceName, Messager messager, String cause) {
++        invalidImplementations.add( interfaceName );
++        messager.printMessage(
++            Diagnostic.Kind.ERROR,
++            invalidValueMessage( interfaceName, implementations.get( interfaceName ), cause )
++        );
++    }
++
++    private String invalidValueMessage(String interfaceName, String implementationName, String cause) {
++        return "Invalid value '" + implementationName + "' for MapStruct collection implementation property '"
++            + PROPERTY_PREFIX + interfaceName + "': " + cause;
++    }
++
++    public static class ConfiguredImplementation {
++
++        private final String name;
++        private final boolean initialCapacityConstructor;
++
++        private ConfiguredImplementation(String name, boolean initialCapacityConstructor) {
++            this.name = name;
++            this.initialCapacityConstructor = initialCapacityConstructor;
++        }
++
++        public String getName() {
++            return name;
++        }
++
++        public boolean hasInitialCapacityConstructor() {
++            return initialCapacityConstructor;
++        }
++    }
++
++    private static class DuplicateDetectingProperties extends Properties {
++
++        private final Map<String, List<String>> values = new HashMap<>();
++
++        @Override
++        public synchronized Object put(Object key, Object value) {
++            values.computeIfAbsent( (String) key, ignored -> new ArrayList<>() ).add( (String) value );
++            return super.put( key, value );
++        }
++
++        private String getConflictingValue(String key, String currentValue) {
++            List<String> propertyValues = values.get( key );
++            if ( propertyValues == null || propertyValues.size() < 2 ) {
++                return null;
++            }
++            for ( String propertyValue : propertyValues ) {
++                if ( !currentValue.equals( propertyValue ) ) {
++                    return propertyValue;
++                }
++            }
++            return null;
++        }
++    }
++}
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/option/ConfiguredImplementationUnavailableException.java b/processor/src/main/java/org/mapstruct/ap/internal/option/ConfiguredImplementationUnavailableException.java
+new file mode 100644
+index 0000000..9e3645e
+--- /dev/null
++++ b/processor/src/main/java/org/mapstruct/ap/internal/option/ConfiguredImplementationUnavailableException.java
+@@ -0,0 +1,33 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.internal.option;
++
++import org.mapstruct.ap.spi.TypeHierarchyErroneousException;
++
++/**
++ * Signals that a configured collection implementation may be generated in a later processing round.
++ */
++public class ConfiguredImplementationUnavailableException extends TypeHierarchyErroneousException {
++
++    private static final long serialVersionUID = 1L;
++
++    private final String interfaceName;
++    private final String implementationName;
++
++    public ConfiguredImplementationUnavailableException(String interfaceName, String implementationName) {
++        super( (javax.lang.model.type.TypeMirror) null );
++        this.interfaceName = interfaceName;
++        this.implementationName = implementationName;
++    }
++
++    public String getInterfaceName() {
++        return interfaceName;
++    }
++
++    public String getImplementationName() {
++        return implementationName;
++    }
++}
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/option/MappingOption.java b/processor/src/main/java/org/mapstruct/ap/internal/option/MappingOption.java
+index 4607fc1..336172e 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/option/MappingOption.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/option/MappingOption.java
+@@ -26,6 +26,7 @@ public enum MappingOption {
+     NULL_VALUE_MAP_MAPPING_STRATEGY("mapstruct.nullValueMapMappingStrategy"),
+     DISABLE_LIFECYCLE_OVERLOAD_DEDUPLICATE_SELECTOR("mapstruct.disableLifecycleOverloadDeduplicateSelector"),
+     DISABLE_JSPECIFY("mapstruct.disableJSpecify"),
++    CONFIGURATION_FILE("mapstruct.configurationFile"),
+     ;
+     // CHECKSTYLE:ON
+ 
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/option/Options.java b/processor/src/main/java/org/mapstruct/ap/internal/option/Options.java
+index 1fd3585..d66f731 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/option/Options.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/option/Options.java
+@@ -78,6 +78,10 @@ public boolean isDisableJSpecify() {
+         return parseBoolean( MappingOption.DISABLE_JSPECIFY );
+     }
+ 
++    public String getConfigurationFile() {
++        return options.get( MappingOption.CONFIGURATION_FILE.getOptionName() );
++    }
++
+     private boolean parseBoolean(MappingOption option) {
+         if ( options.isEmpty() ) {
+             return false;
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/processor/DefaultModelElementProcessorContext.java b/processor/src/main/java/org/mapstruct/ap/internal/processor/DefaultModelElementProcessorContext.java
+index 7a0596d..cc0b2c0 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/processor/DefaultModelElementProcessorContext.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/processor/DefaultModelElementProcessorContext.java
+@@ -66,7 +66,8 @@ public DefaultModelElementProcessorContext(ProcessingEnvironment processingEnvir
+             roundContext,
+             notToBeImported,
+             options.isVerbose(),
+-            versionInformation
++            versionInformation,
++            roundContext.getAnnotationProcessorContext().getCollectionImplementationConfiguration()
+         );
+         this.options = options;
+     }
+diff --git a/processor/src/main/java/org/mapstruct/ap/internal/util/AnnotationProcessorContext.java b/processor/src/main/java/org/mapstruct/ap/internal/util/AnnotationProcessorContext.java
+index 9f8523e..305071c 100644
+--- a/processor/src/main/java/org/mapstruct/ap/internal/util/AnnotationProcessorContext.java
++++ b/processor/src/main/java/org/mapstruct/ap/internal/util/AnnotationProcessorContext.java
+@@ -18,6 +18,7 @@
+ import javax.lang.model.util.Types;
+ import javax.tools.Diagnostic;
+ 
++import org.mapstruct.ap.internal.option.CollectionImplementationConfiguration;
+ import org.mapstruct.ap.spi.AccessorNamingStrategy;
+ import org.mapstruct.ap.spi.AstModifyingAnnotationProcessor;
+ import org.mapstruct.ap.spi.BuilderProvider;
+@@ -57,9 +58,11 @@ public class AnnotationProcessorContext implements MapStructProcessingEnvironmen
+     private boolean verbose;
+ 
+     private Map<String, String> options;
++    private CollectionImplementationConfiguration collectionImplementationConfiguration;
+ 
+     public AnnotationProcessorContext(Elements elementUtils, Types typeUtils, Messager messager, boolean disableBuilder,
+-                                      boolean disableJSpecify, boolean verbose, Map<String, String> options) {
++                                      boolean disableJSpecify, boolean verbose, Map<String, String> options,
++                                      CollectionImplementationConfiguration collectionImplementationConfiguration) {
+         astModifyingAnnotationProcessors = java.util.Collections.unmodifiableList(
+             findAstModifyingAnnotationProcessors( messager ) );
+         this.elementUtils = elementUtils;
+@@ -69,6 +72,7 @@ public AnnotationProcessorContext(Elements elementUtils, Types typeUtils, Messag
+         this.disableJSpecify = disableJSpecify;
+         this.verbose = verbose;
+         this.options = java.util.Collections.unmodifiableMap( options );
++        this.collectionImplementationConfiguration = collectionImplementationConfiguration;
+     }
+ 
+     /**
+@@ -285,4 +289,8 @@ public Map<String, EnumTransformationStrategy> getEnumTransformationStrategies()
+     public Map<String, String> getOptions() {
+         return this.options;
+     }
++
++    public CollectionImplementationConfiguration getCollectionImplementationConfiguration() {
++        return collectionImplementationConfiguration;
++    }
+ }
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/CapacityList.java b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/CapacityList.java
+new file mode 100644
+index 0000000..7daf15a
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/CapacityList.java
+@@ -0,0 +1,26 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.collection.configurable;
++
++import java.util.ArrayList;
++
++public class CapacityList<E> extends ArrayList<E> {
++
++    private final int initialCapacity;
++
++    public CapacityList() {
++        initialCapacity = -1;
++    }
++
++    public CapacityList(int initialCapacity) {
++        super( initialCapacity );
++        this.initialCapacity = initialCapacity;
++    }
++
++    public int getInitialCapacity() {
++        return initialCapacity;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/ConfigurableCollectionImplementationTest.java b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/ConfigurableCollectionImplementationTest.java
+new file mode 100644
+index 0000000..931fddb
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/ConfigurableCollectionImplementationTest.java
+@@ -0,0 +1,131 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.collection.configurable;
++
++import java.util.Arrays;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.stream.Stream;
++
++import org.mapstruct.ap.testutil.ProcessorTest;
++import org.mapstruct.ap.testutil.WithClasses;
++import org.mapstruct.ap.testutil.WithClasspathResource;
++import org.mapstruct.ap.testutil.compilation.annotation.CompilationResult;
++import org.mapstruct.ap.testutil.compilation.annotation.Diagnostic;
++import org.mapstruct.ap.testutil.compilation.annotation.ExpectedCompilationOutcome;
++import org.mapstruct.ap.testutil.compilation.annotation.ProcessorOption;
++import org.mapstruct.ap.testutil.runner.Compiler;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++@WithClasses({
++    CapacityList.class,
++    Source.class,
++    Target.class,
++    ConfigurableCollectionMapper.class
++})
++public class ConfigurableCollectionImplementationTest {
++
++    private static final String CONFIGURATION_FILE = "mapstruct-test/configurable-collections.properties";
++    private static final String CONFIGURATION_PROPERTY =
++        "mapstruct.collectionImplementation.java.util.List="
++            + "org.mapstruct.ap.test.collection.configurable.CapacityList";
++
++    @ProcessorTest
++    @ProcessorOption(name = "mapstruct.configurationFile", value = CONFIGURATION_FILE)
++    @WithClasspathResource(
++        path = CONFIGURATION_FILE,
++        value = { CONFIGURATION_PROPERTY, CONFIGURATION_PROPERTY }
++    )
++    public void shouldUseConfiguredImplementationAcrossMappingForms() {
++        List<String> source = Arrays.asList( "one", "two", "three" );
++
++        List<String> mapped = ConfigurableCollectionMapper.INSTANCE.map( source );
++        Target target = ConfigurableCollectionMapper.INSTANCE.map( source( source ) );
++        List<String> streamMapped = ConfigurableCollectionMapper.INSTANCE.map( Stream.of( "one", "two" ) );
++
++        assertThat( mapped ).isInstanceOf( CapacityList.class );
++        assertThat( ( (CapacityList<?>) mapped ).getInitialCapacity() ).isEqualTo( source.size() );
++        assertThat( target.getValues() ).isInstanceOf( CapacityList.class );
++        assertThat( streamMapped ).isInstanceOf( CapacityList.class );
++    }
++
++    @ProcessorTest
++    @WithClasspathResource(path = "mapstruct.properties", value = CONFIGURATION_PROPERTY)
++    public void shouldReadDefaultConfigurationResource() {
++        List<String> mapped = ConfigurableCollectionMapper.INSTANCE.map( Arrays.asList( "one", "two" ) );
++
++        assertThat( mapped ).isInstanceOf( CapacityList.class );
++    }
++
++    @ProcessorTest
++    @ProcessorOption(name = "mapstruct.configurationFile", value = CONFIGURATION_FILE)
++    @WithClasspathResource(path = CONFIGURATION_FILE, value = CONFIGURATION_PROPERTY)
++    public void shouldPreferApplicableObjectFactory() {
++        List<String> mapped = ConfigurableCollectionMapper.INSTANCE.mapWithFactory(
++            new ConfigurableCollectionMapper.FactoryContext(),
++            Arrays.asList( "one", "two" )
++        );
++
++        assertThat( mapped ).isInstanceOf( LinkedList.class );
++    }
++
++    @ProcessorTest(Compiler.JDK)
++    @WithClasses(ConfigurableCollectionMapper.class)
++    @ProcessorOption(name = "mapstruct.configurationFile", value = "mapstruct-test/missing.properties")
++    @ExpectedCompilationOutcome(
++        value = CompilationResult.FAILED,
++        diagnostics = @Diagnostic(
++            kind = javax.tools.Diagnostic.Kind.ERROR,
++            messageRegExp = "Configured MapStruct collection implementation resource.*missing.properties.*"
++                + "could not be read.*"
++        )
++    )
++    public void shouldFailForMissingExplicitConfiguration() {
++    }
++
++    @ProcessorTest(Compiler.JDK)
++    @ProcessorOption(name = "mapstruct.configurationFile", value = "mapstruct-test/invalid-implementation.properties")
++    @WithClasspathResource(
++        path = "mapstruct-test/invalid-implementation.properties",
++        value = "mapstruct.collectionImplementation.java.util.List=java.lang.String"
++    )
++    @ExpectedCompilationOutcome(
++        value = CompilationResult.FAILED,
++        diagnostics = @Diagnostic(
++            kind = javax.tools.Diagnostic.Kind.ERROR,
++            messageRegExp = "Invalid value 'java.lang.String'.*not assignable to 'java.util.List'.*"
++        )
++    )
++    public void shouldRejectInvalidImplementation() {
++    }
++
++    @ProcessorTest(Compiler.JDK)
++    @ProcessorOption(name = "mapstruct.configurationFile", value = "mapstruct-test/conflicting.properties")
++    @WithClasspathResource(
++        path = "mapstruct-test/conflicting.properties",
++        value = {
++            "mapstruct.collectionImplementation.java.util.List=java.util.ArrayList",
++            "mapstruct.collectionImplementation.java.util.List=java.util.LinkedList"
++        }
++    )
++    @ExpectedCompilationOutcome(
++        value = CompilationResult.FAILED,
++        diagnostics = @Diagnostic(
++            kind = javax.tools.Diagnostic.Kind.ERROR,
++            messageRegExp = "Invalid duplicate.*java.util.List.*"
++                + "(ArrayList.*LinkedList|LinkedList.*ArrayList).*conflict.*"
++        )
++    )
++    public void shouldRejectConflictingDuplicate() {
++    }
++
++    private Source source(List<String> values) {
++        Source source = new Source();
++        source.setValues( values );
++        return source;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/ConfigurableCollectionMapper.java b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/ConfigurableCollectionMapper.java
+new file mode 100644
+index 0000000..c7cb6c3
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/ConfigurableCollectionMapper.java
+@@ -0,0 +1,37 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.collection.configurable;
++
++import java.util.LinkedList;
++import java.util.List;
++import java.util.stream.Stream;
++
++import org.mapstruct.Context;
++import org.mapstruct.Mapper;
++import org.mapstruct.ObjectFactory;
++import org.mapstruct.factory.Mappers;
++
++@Mapper
++public interface ConfigurableCollectionMapper {
++
++    ConfigurableCollectionMapper INSTANCE = Mappers.getMapper( ConfigurableCollectionMapper.class );
++
++    List<String> map(List<String> source);
++
++    Target map(Source source);
++
++    List<String> map(Stream<String> source);
++
++    List<String> mapWithFactory(@Context FactoryContext context, List<String> source);
++
++    class FactoryContext {
++
++        @ObjectFactory
++        public List<String> create() {
++            return new LinkedList<>();
++        }
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/Source.java b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/Source.java
+new file mode 100644
+index 0000000..03c107d
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/Source.java
+@@ -0,0 +1,21 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.collection.configurable;
++
++import java.util.List;
++
++public class Source {
++
++    private List<String> values;
++
++    public List<String> getValues() {
++        return values;
++    }
++
++    public void setValues(List<String> values) {
++        this.values = values;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/Target.java b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/Target.java
+new file mode 100644
+index 0000000..7bc724e
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/test/collection/configurable/Target.java
+@@ -0,0 +1,21 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.test.collection.configurable;
++
++import java.util.List;
++
++public class Target {
++
++    private List<String> values;
++
++    public List<String> getValues() {
++        return values;
++    }
++
++    public void setValues(List<String> values) {
++        this.values = values;
++    }
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/testutil/WithClasspathResource.java b/processor/src/test/java/org/mapstruct/ap/testutil/WithClasspathResource.java
+new file mode 100644
+index 0000000..cc2c252
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/testutil/WithClasspathResource.java
+@@ -0,0 +1,22 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.testutil;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Repeatable;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++@Retention(RetentionPolicy.RUNTIME)
++@Target({ ElementType.TYPE, ElementType.METHOD })
++@Repeatable(WithClasspathResources.class)
++public @interface WithClasspathResource {
++
++    String path();
++
++    String[] value();
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/testutil/WithClasspathResources.java b/processor/src/test/java/org/mapstruct/ap/testutil/WithClasspathResources.java
+new file mode 100644
+index 0000000..9114553
+--- /dev/null
++++ b/processor/src/test/java/org/mapstruct/ap/testutil/WithClasspathResources.java
+@@ -0,0 +1,18 @@
++/*
++ * Copyright MapStruct Authors.
++ *
++ * Licensed under the Apache License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
++ */
++package org.mapstruct.ap.testutil;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++@Retention(RetentionPolicy.RUNTIME)
++@Target({ ElementType.TYPE, ElementType.METHOD })
++public @interface WithClasspathResources {
++
++    WithClasspathResource[] value();
++}
+diff --git a/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilationRequest.java b/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilationRequest.java
+index 466f0f9..951a2ce 100644
+--- a/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilationRequest.java
++++ b/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilationRequest.java
+@@ -22,12 +22,13 @@ public class CompilationRequest {
+     private final Collection<String> processorDependencies;
+     private final Collection<String> kotlinSources;
+     private final Set<String> packageInfoPackages;
++    private final Map<String, String> classpathResources;
+ 
+     CompilationRequest(Compiler compiler, Set<Class<?>> sourceClasses, Map<Class<?>, Class<?>> services,
+                        List<String> processorOptions, Collection<String> testDependencies,
+                        Collection<String> processorDependencies,
+                        Collection<String> kotlinSources,
+-                       Set<String> packageInfoPackages) {
++                       Set<String> packageInfoPackages, Map<String, String> classpathResources) {
+         this.compiler = compiler;
+         this.sourceClasses = sourceClasses;
+         this.services = services;
+@@ -36,6 +37,7 @@ public class CompilationRequest {
+         this.processorDependencies = processorDependencies;
+         this.kotlinSources = kotlinSources;
+         this.packageInfoPackages = packageInfoPackages;
++        this.classpathResources = classpathResources;
+     }
+ 
+     @Override
+@@ -48,6 +50,7 @@ public int hashCode() {
+         result = prime * result + ( ( sourceClasses == null ) ? 0 : sourceClasses.hashCode() );
+         result = prime * result + ( ( testDependencies == null ) ? 0 : testDependencies.hashCode() );
+         result = prime * result + ( ( packageInfoPackages == null ) ? 0 : packageInfoPackages.hashCode() );
++        result = prime * result + ( ( classpathResources == null ) ? 0 : classpathResources.hashCode() );
+         return result;
+     }
+ 
+@@ -71,7 +74,8 @@ public boolean equals(Object obj) {
+             && processorDependencies.equals( other.processorDependencies )
+             && sourceClasses.equals( other.sourceClasses )
+             && kotlinSources.equals( other.kotlinSources )
+-            && packageInfoPackages.equals( other.packageInfoPackages );
++            && packageInfoPackages.equals( other.packageInfoPackages )
++            && classpathResources.equals( other.classpathResources );
+     }
+ 
+     public Set<Class<?>> getSourceClasses() {
+@@ -105,4 +109,8 @@ public Compiler getCompiler() {
+     public Set<String> getPackageInfoPackages() {
+         return packageInfoPackages;
+     }
++
++    public Map<String, String> getClasspathResources() {
++        return classpathResources;
++    }
+ }
+diff --git a/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilingExtension.java b/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilingExtension.java
+index eb18615..c97d832 100644
+--- a/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilingExtension.java
++++ b/processor/src/test/java/org/mapstruct/ap/testutil/runner/CompilingExtension.java
+@@ -11,6 +11,7 @@
+ import java.io.IOException;
+ import java.lang.reflect.Method;
+ import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -41,6 +42,7 @@
+ import org.junit.jupiter.api.extension.BeforeEachCallback;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.mapstruct.ap.testutil.WithClasses;
++import org.mapstruct.ap.testutil.WithClasspathResource;
+ import org.mapstruct.ap.testutil.WithKotlinSources;
+ import org.mapstruct.ap.testutil.WithPackageInfo;
+ import org.mapstruct.ap.testutil.WithProcessorDependency;
+@@ -394,6 +396,19 @@ private Map<Class<?>, Class<?>> getServices(Method testMethod, Class<?> testClas
+         return services;
+     }
+ 
++    private Map<String, String> getClasspathResources(Method testMethod, Class<?> testClass) {
++        Map<String, String> resources = new HashMap<>();
++        addClasspathResources( resources, findRepeatableAnnotations( testClass, WithClasspathResource.class ) );
++        addClasspathResources( resources, findRepeatableAnnotations( testMethod, WithClasspathResource.class ) );
++        return resources;
++    }
++
++    private void addClasspathResources(Map<String, String> resources, List<WithClasspathResource> annotations) {
++        for ( WithClasspathResource annotation : annotations ) {
++            resources.put( annotation.path(), String.join( System.lineSeparator(), annotation.value() ) );
++        }
++    }
++
+     private Collection<String> getAdditionalTestDependencies(Method testMethod, Class<?> testClass) {
+         Collection<String> testDependencies = new HashSet<>();
+         findRepeatableAnnotations( testMethod, WithTestDependency.class )
+@@ -541,7 +556,8 @@ private CompilationOutcomeDescriptor compile(ExtensionContext context) {
+             getAdditionalTestDependencies( testMethod, testClass ),
+             getAdditionalProcessorDependencies( testMethod, testClass ),
+             getKotlinSources( context ),
+-            getPackageInfoPackages( testMethod, testClass )
++            getPackageInfoPackages( testMethod, testClass ),
++            getClasspathResources( testMethod, testClass )
+         );
+ 
+         ExtensionContext.Store rootStore = context.getRoot().getStore( NAMESPACE );
+@@ -558,7 +574,7 @@ private CompilationOutcomeDescriptor compile(ExtensionContext context) {
+         setupDirectories( testMethod, testClass );
+         compilationCache.setLastSourceOutputDir( sourceOutputDir );
+ 
+-        boolean needsAdditionalCompilerClasspath = prepareServices( compilationRequest );
++        boolean needsAdditionalCompilerClasspath = prepareAdditionalCompilerClasspath( compilationRequest );
+         CompilationOutcomeDescriptor resultHolder;
+ 
+         resultHolder = compile(
+@@ -712,7 +728,8 @@ private void deleteDirectory(File path) {
+         path.delete();
+     }
+ 
+-    private boolean prepareServices(CompilationRequest compilationRequest) {
++    private boolean prepareAdditionalCompilerClasspath(CompilationRequest compilationRequest) {
++        boolean prepared = false;
+         if ( !compilationRequest.getServices().isEmpty() ) {
+             String servicesDir =
+                 additionalCompilerClasspath + File.separator + "META-INF" + File.separator + "services";
+@@ -732,10 +749,22 @@ private boolean prepareServices(CompilationRequest compilationRequest) {
+                 }
+             }
+ 
+-            return true;
++            prepared = true;
++        }
++
++        for ( Map.Entry<String, String> resource : compilationRequest.getClasspathResources().entrySet() ) {
++            File file = new File( additionalCompilerClasspath, resource.getKey() );
++            file.getParentFile().mkdirs();
++            try {
++                Files.write( file.toPath(), resource.getValue().getBytes( StandardCharsets.ISO_8859_1 ) );
++            }
++            catch ( IOException e ) {
++                throw new RuntimeException( e );
++            }
++            prepared = true;
+         }
+ 
+-        return false;
++        return prepared;
+     }
+ 
+     private static class DiagnosticDescriptorComparator implements Comparator<DiagnosticDescriptor> {
+diff --git a/processor/src/test/java/org/mapstruct/ap/testutil/runner/EclipseCompilingExtension.java b/processor/src/test/java/org/mapstruct/ap/testutil/runner/EclipseCompilingExtension.java
+index 60a4fa1..6d328b7 100644
+--- a/processor/src/test/java/org/mapstruct/ap/testutil/runner/EclipseCompilingExtension.java
++++ b/processor/src/test/java/org/mapstruct/ap/testutil/runner/EclipseCompilingExtension.java
+@@ -48,7 +48,7 @@ protected CompilationOutcomeDescriptor compileWithSpecificCompiler(CompilationRe
+                                                                        String additionalCompilerClasspath) {
+         Collection<String> processorClassPaths = getProcessorClasspathDependencies(
+             compilationRequest,
+-            additionalCompilerClasspath
++            compilationRequest.getServices().isEmpty() ? null : additionalCompilerClasspath
+         );
+         ClassLoader compilerClassloader;
+         if ( processorClassPaths.isEmpty() ) {
+@@ -71,18 +71,20 @@ protected CompilationOutcomeDescriptor compileWithSpecificCompiler(CompilationRe
+ 
+         return clHelper.compileInOtherClassloader(
+             compilationRequest,
+-            getTestCompilationClasspath( compilationRequest, classOutputDir ),
++            getTestCompilationClasspath( compilationRequest, classOutputDir, additionalCompilerClasspath ),
+             getSourceFiles( compilationRequest ),
+             SOURCE_DIR,
+             sourceOutputDir,
+             classOutputDir );
+     }
+ 
+-    private static List<String> getTestCompilationClasspath(CompilationRequest request, String classOutputDir) {
++    private static List<String> getTestCompilationClasspath(CompilationRequest request, String classOutputDir,
++                                                             String additionalCompilerClasspath) {
+         Collection<String> testDependencies = request.getTestDependencies();
+         Collection<String> processorDependencies = request.getProcessorDependencies();
+         Collection<String> kotlinSources = request.getKotlinSources();
+-        if ( testDependencies.isEmpty() && processorDependencies.isEmpty() && kotlinSources.isEmpty() ) {
++        if ( testDependencies.isEmpty() && processorDependencies.isEmpty() && kotlinSources.isEmpty()
++            && additionalCompilerClasspath == null ) {
+             return TEST_COMPILATION_CLASSPATH;
+         }
+ 
+@@ -95,6 +97,9 @@ private static List<String> getTestCompilationClasspath(CompilationRequest reque
+         if ( !kotlinSources.isEmpty() ) {
+             testCompilationPaths.add( classOutputDir );
+         }
++        if ( additionalCompilerClasspath != null ) {
++            testCompilationPaths.add( additionalCompilerClasspath );
++        }
+         return testCompilationPaths;
+     }
+ 
+diff --git a/processor/src/test/java/org/mapstruct/ap/testutil/runner/JdkCompilingExtension.java b/processor/src/test/java/org/mapstruct/ap/testutil/runner/JdkCompilingExtension.java
+index fff51f0..0f24466 100644
+--- a/processor/src/test/java/org/mapstruct/ap/testutil/runner/JdkCompilingExtension.java
++++ b/processor/src/test/java/org/mapstruct/ap/testutil/runner/JdkCompilingExtension.java
+@@ -57,7 +57,7 @@ protected CompilationOutcomeDescriptor compileWithSpecificCompiler(CompilationRe
+         try {
+             fileManager.setLocation(
+                 StandardLocation.CLASS_PATH,
+-                getCompilerClasspathFiles( compilationRequest, classOutputDir )
++                getCompilerClasspathFiles( compilationRequest, classOutputDir, additionalCompilerClasspath )
+             );
+             fileManager.setLocation( StandardLocation.CLASS_OUTPUT, Arrays.asList( new File( classOutputDir ) ) );
+             fileManager.setLocation( StandardLocation.SOURCE_OUTPUT, Arrays.asList( new File( sourceOutputDir ) ) );
+@@ -68,7 +68,7 @@ protected CompilationOutcomeDescriptor compileWithSpecificCompiler(CompilationRe
+ 
+         Collection<String> processorClassPaths = getProcessorClasspathDependencies(
+             compilationRequest,
+-            additionalCompilerClasspath
++            compilationRequest.getServices().isEmpty() ? null : additionalCompilerClasspath
+         );
+         ClassLoader processorClassloader;
+         if ( processorClassPaths.isEmpty() ) {
+@@ -104,11 +104,13 @@ protected CompilationOutcomeDescriptor compileWithSpecificCompiler(CompilationRe
+             diagnostics.getDiagnostics() );
+     }
+ 
+-    private static List<File> getCompilerClasspathFiles(CompilationRequest request, String classOutputDir) {
++    private static List<File> getCompilerClasspathFiles(CompilationRequest request, String classOutputDir,
++                                                         String additionalCompilerClasspath) {
+         Collection<String> testDependencies = request.getTestDependencies();
+         Collection<String> processorDependencies = request.getProcessorDependencies();
+         Collection<String> kotlinSources = request.getKotlinSources();
+-        if ( testDependencies.isEmpty() && processorDependencies.isEmpty() && kotlinSources.isEmpty() ) {
++        if ( testDependencies.isEmpty() && processorDependencies.isEmpty() && kotlinSources.isEmpty()
++            && additionalCompilerClasspath == null ) {
+             return COMPILER_CLASSPATH_FILES;
+         }
+ 
+@@ -123,6 +125,9 @@ private static List<File> getCompilerClasspathFiles(CompilationRequest request,
+         if ( !kotlinSources.isEmpty() ) {
+             compilerClasspathFiles.add( new File( classOutputDir ) );
+         }
++        if ( additionalCompilerClasspath != null ) {
++            compilerClasspathFiles.add( new File( additionalCompilerClasspath ) );
++        }
+ 
+         return compilerClasspathFiles;
+     }

@@ -1,0 +1,616 @@
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassWriter.java b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+index 0a6b7a9..ac245de 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassWriter.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+@@ -371,17 +371,48 @@ public class ClassWriter implements StatementWriter {
+   }
+ 
+   public void writeClass(ClassNode node, TextBuffer buffer, int indent) {
++    if (DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION) && node.type == ClassNode.Type.ROOT) {
++      ReferenceAwareSyntheticRetention retention =
++        DecompilerContext.getContextProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION);
++      if (retention != null && retention.getRoot() != node) {
++        DecompilerContext.setProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION, null);
++        retention = null;
++      }
++
++      if (retention == null) {
++        retention = ReferenceAwareSyntheticRetention.prepare(this, node);
++        if (retention != null) {
++          DecompilerContext.setProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION, retention);
++        }
++      }
++    }
++
++    writeClassInternal(node, buffer, indent);
++  }
++
++  void writeClassInternal(ClassNode node, TextBuffer buffer, int indent) {
+     ClassNode outerNode = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+     DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
+ 
+-    try {
++    ReferenceAwareSyntheticRetention retention =
++      DecompilerContext.getContextProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION);
++
++    boolean ok;
++    if (retention == null || retention.markProcessed(node)) {
+       // last minute processing
+-      boolean ok = invokeProcessors(buffer, node);
++      ok = invokeProcessors(buffer, node);
++    }
++    else {
++      ok = true;
++    }
+ 
+-      if (!ok) {
+-        return;
+-      }
++    if (!ok) {
++      DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, outerNode);
++      return;
++    }
+ 
++    ReferenceAwareSyntheticRetention.Candidate previousOwner = retention == null ? null : retention.enterClass(node);
++    try {
+       ClassWrapper wrapper = node.getWrapper();
+       StructClass cl = wrapper.getClassStruct();
+ 
+@@ -403,7 +434,12 @@ public class ClassWriter implements StatementWriter {
+       }
+ 
+       // write class definition
+-      writeClassDefinition(node, buffer, indent);
++      TextBuffer classDefinitionBuffer = new TextBuffer();
++      writeClassDefinition(node, classDefinitionBuffer, indent);
++      if (retention != null) {
++        retention.record(classDefinitionBuffer);
++      }
++      buffer.append(classDefinitionBuffer);
+ 
+       final AtomicBoolean hasContent = new AtomicBoolean(false);
+       // writeClassDefinition will skip adding a trailing newline for anonymous classes.
+@@ -454,6 +490,9 @@ public class ClassWriter implements StatementWriter {
+         for (StructField fd : nonEnumFields) {
+           boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+             wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
++          if (hide && retention != null && retention.shouldWrite(node, fd)) {
++            hide = false;
++          }
+           if (hide) continue;
+ 
+           if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
+@@ -482,6 +521,9 @@ public class ClassWriter implements StatementWriter {
+           hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                  mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
+                  wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
++          if (hide && retention != null && retention.shouldWrite(node, mt)) {
++            hide = false;
++          }
+         } else {
+           hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
+                  (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
+@@ -489,7 +531,19 @@ public class ClassWriter implements StatementWriter {
+         if (hide) continue;
+ 
+         TextBuffer methodBuffer = new TextBuffer();
+-        boolean methodSkipped = !writeMethod(node, mt, i, methodBuffer, indent + 1);
++        ReferenceAwareSyntheticRetention.Candidate previousMethodOwner = retention == null ? null : retention.enterMethod(node, mt);
++        boolean methodSkipped;
++        try {
++          methodSkipped = !writeMethod(node, mt, i, methodBuffer, indent + 1);
++          if (!methodSkipped && retention != null) {
++            retention.record(methodBuffer);
++          }
++        }
++        finally {
++          if (retention != null) {
++            retention.exit(previousMethodOwner);
++          }
++        }
+         if (!methodSkipped) {
+           if (hasContent.get()) {
+             buffer.appendLineSeparator();
+@@ -508,6 +562,9 @@ public class ClassWriter implements StatementWriter {
+             boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
+             hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                    wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
++            if (hide && retention != null && retention.shouldWrite(inner)) {
++              hide = false;
++            }
+           } else {
+             hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+           }
+@@ -534,6 +591,9 @@ public class ClassWriter implements StatementWriter {
+       }
+     }
+     finally {
++      if (retention != null) {
++        retention.exit(previousOwner);
++      }
+       DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, outerNode);
+     }
+ 
+@@ -842,7 +902,21 @@ public class ClassWriter implements StatementWriter {
+ 
+   private void writeField(TextBuffer buffer, int indent, StructField fd, ClassWrapper wrapper) {
+     TextBuffer fieldBuffer = new TextBuffer();
+-    writeField(wrapper, wrapper.getClassStruct(), fd, fieldBuffer, indent + 1);
++    ReferenceAwareSyntheticRetention retention =
++      DecompilerContext.getContextProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION);
++    ClassNode node = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
++    ReferenceAwareSyntheticRetention.Candidate previousOwner = retention == null ? null : retention.enterField(node, fd);
++    try {
++      writeField(wrapper, wrapper.getClassStruct(), fd, fieldBuffer, indent + 1);
++      if (retention != null) {
++        retention.record(fieldBuffer);
++      }
++    }
++    finally {
++      if (retention != null) {
++        retention.exit(previousOwner);
++      }
++    }
+     String initializer = fd.hasModifier(CodeConstants.ACC_STATIC) ? "<clinit> ()V" : "<init> ()V";
+     buffer.append(fieldBuffer, wrapper.getClassStruct().qualifiedName, initializer);
+   }
+@@ -1843,7 +1917,9 @@ public class ClassWriter implements StatementWriter {
+       StructAnnotationAttribute attribute = mb.getAttribute((Key<StructAnnotationAttribute>)key);
+       if (attribute != null) {
+         for (AnnotationExprent annotation : attribute.getAnnotations()) {
+-          annotation.setDidWriteAlready(true);
++          if (!ReferenceAwareSyntheticRetention.isAnalyzing()) {
++            annotation.setDidWriteAlready(true);
++          }
+           buffer.appendIndent(indent);
+           filter.add(annotation.toJava(-1).convertToStringAndAllowDataDiscard());
+           buffer.append(annotation.toJava(indent));
+diff --git a/src/org/jetbrains/java/decompiler/main/DecompilerContext.java b/src/org/jetbrains/java/decompiler/main/DecompilerContext.java
+index 7a580e4..be6e2d6 100644
+--- a/src/org/jetbrains/java/decompiler/main/DecompilerContext.java
++++ b/src/org/jetbrains/java/decompiler/main/DecompilerContext.java
+@@ -26,6 +26,7 @@ public class DecompilerContext {
+   public static final Key<ClassesProcessor.ClassNode> CURRENT_CLASS_NODE = Key.of("CURRENT_CLASS_NODE");
+   public static final Key<MethodWrapper> CURRENT_METHOD_WRAPPER = Key.of("CURRENT_METHOD_WRAPPER");
+   public static final Key<VarProcessor> CURRENT_VAR_PROCESSOR = Key.of("CURRENT_VAR_PROCESSOR");
++  static final Key<ReferenceAwareSyntheticRetention> REFERENCE_AWARE_SYNTHETIC_RETENTION = Key.of("REFERENCE_AWARE_SYNTHETIC_RETENTION");
+ 
+   public final Map<Key<?>, Object> staticProps = new HashMap<>();
+   public final Map<String, Object> properties;
+diff --git a/src/org/jetbrains/java/decompiler/main/ReferenceAwareSyntheticRetention.java b/src/org/jetbrains/java/decompiler/main/ReferenceAwareSyntheticRetention.java
+new file mode 100644
+index 0000000..56d33cd
+--- /dev/null
++++ b/src/org/jetbrains/java/decompiler/main/ReferenceAwareSyntheticRetention.java
+@@ -0,0 +1,365 @@
++// Copyright 2000-2026 the Vineflower contributors
++package org.jetbrains.java.decompiler.main;
++
++import org.jetbrains.java.decompiler.code.CodeConstants;
++import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
++import org.jetbrains.java.decompiler.main.collectors.ImportCollector;
++import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
++import org.jetbrains.java.decompiler.struct.StructField;
++import org.jetbrains.java.decompiler.struct.StructMethod;
++import org.jetbrains.java.decompiler.util.TextBuffer;
++import org.jetbrains.java.decompiler.util.token.ClassTextToken;
++import org.jetbrains.java.decompiler.util.token.FieldTextToken;
++import org.jetbrains.java.decompiler.util.token.MethodTextToken;
++import org.jetbrains.java.decompiler.util.token.TextToken;
++
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Deque;
++import java.util.IdentityHashMap;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Finds the generated declarations which are still needed by the Java emitted for one class file.
++ *
++ * <p>The analysis deliberately works on the TextBuffer tokens rather than on rendered text. This
++ * makes comments and literal contents non-references and preserves the exact member descriptor
++ * used by the writer.</p>
++ */
++public final class ReferenceAwareSyntheticRetention {
++  private final ClassNode root;
++
++  private final IdentityHashMap<ClassNode, Candidate> classCandidates = new IdentityHashMap<>();
++  private final Map<String, Candidate> classCandidatesByName = new LinkedHashMap<>();
++  private final Map<String, Candidate> fieldCandidates = new LinkedHashMap<>();
++  private final Map<String, Candidate> methodCandidates = new LinkedHashMap<>();
++  private final List<Candidate> candidates = new ArrayList<>();
++
++  private final Set<Candidate> emittedCandidates = new LinkedHashSet<>();
++  private final Set<Candidate> rootReferences = new LinkedHashSet<>();
++  private final Map<Candidate, Set<Candidate>> references = new LinkedHashMap<>();
++  private final Set<Candidate> retained = new LinkedHashSet<>();
++  private final Set<ClassNode> processed = Collections.newSetFromMap(new IdentityHashMap<>());
++
++  private Candidate currentOwner;
++  private boolean analyzing;
++
++  private ReferenceAwareSyntheticRetention(ClassNode root) {
++    this.root = root;
++    registerNode(root, null);
++  }
++
++  static ReferenceAwareSyntheticRetention prepare(ClassWriter writer, ClassNode root) {
++    ReferenceAwareSyntheticRetention retention = new ReferenceAwareSyntheticRetention(root);
++    if (retention.candidates.isEmpty()) {
++      return null;
++    }
++
++    ImportCollector originalImports = DecompilerContext.getImportCollector();
++    DecompilerContext.setProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION, retention);
++    retention.analyzing = true;
++
++    try {
++      // The first rendering is only an analysis. Keep all names/import decisions isolated from the
++      // final rendering, whose imports must describe only the declarations that survive.
++      if (originalImports != null) {
++        DecompilerContext.setImportCollector(new ImportCollector(originalImports));
++      }
++
++      TextBuffer analysisBuffer = new TextBuffer(ClassesProcessor.AVERAGE_CLASS_SIZE);
++      writer.writeClassInternal(root, analysisBuffer, 0);
++      analysisBuffer.convertToStringAndAllowDataDiscard();
++      retention.finishAnalysis();
++      return retention;
++    }
++    catch (RuntimeException | Error e) {
++      DecompilerContext.setProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION, null);
++      throw e;
++    }
++    finally {
++      retention.analyzing = false;
++      if (originalImports != null) {
++        DecompilerContext.setImportCollector(originalImports);
++      }
++    }
++  }
++
++  public static boolean isAnalyzing() {
++    DecompilerContext context = DecompilerContext.getCurrentContext();
++    if (context == null) {
++      return false;
++    }
++
++    ReferenceAwareSyntheticRetention retention =
++      DecompilerContext.getContextProperty(DecompilerContext.REFERENCE_AWARE_SYNTHETIC_RETENTION);
++    return retention != null && retention.analyzing;
++  }
++
++  ClassNode getRoot() {
++    return root;
++  }
++
++  boolean markProcessed(ClassNode node) {
++    return processed.add(node);
++  }
++
++  boolean isAnalyzingPhase() {
++    return analyzing;
++  }
++
++  boolean isCandidate(ClassNode node, StructField field) {
++    return fieldCandidates.containsKey(fieldKey(node.classStruct.qualifiedName, field.getName(), field.getDescriptor()));
++  }
++
++  boolean isCandidate(ClassNode node, StructMethod method) {
++    return methodCandidates.containsKey(methodKey(node.classStruct.qualifiedName, method.getName(), method.getDescriptor()));
++  }
++
++  boolean isCandidate(ClassNode node) {
++    return classCandidates.containsKey(node);
++  }
++
++  boolean shouldWrite(Candidate candidate) {
++    return candidate != null && (analyzing || retained.contains(candidate));
++  }
++
++  boolean shouldWrite(ClassNode node, StructField field) {
++    return shouldWrite(fieldCandidates.get(fieldKey(node.classStruct.qualifiedName, field.getName(), field.getDescriptor())));
++  }
++
++  boolean shouldWrite(ClassNode node, StructMethod method) {
++    return shouldWrite(methodCandidates.get(methodKey(node.classStruct.qualifiedName, method.getName(), method.getDescriptor())));
++  }
++
++  boolean shouldWrite(ClassNode node) {
++    return shouldWrite(classCandidates.get(node));
++  }
++
++  Candidate enterClass(ClassNode node) {
++    Candidate previous = currentOwner;
++    Candidate candidate = classCandidates.get(node);
++    if (candidate != null) {
++      currentOwner = candidate;
++    }
++    return previous;
++  }
++
++  Candidate enterField(ClassNode node, StructField field) {
++    Candidate previous = currentOwner;
++    Candidate candidate = fieldCandidates.get(fieldKey(node.classStruct.qualifiedName, field.getName(), field.getDescriptor()));
++    if (candidate != null) {
++      currentOwner = candidate;
++    }
++    return previous;
++  }
++
++  Candidate enterMethod(ClassNode node, StructMethod method) {
++    Candidate previous = currentOwner;
++    Candidate candidate = methodCandidates.get(methodKey(node.classStruct.qualifiedName, method.getName(), method.getDescriptor()));
++    if (candidate != null) {
++      currentOwner = candidate;
++    }
++    return previous;
++  }
++
++  void exit(Candidate previous) {
++    currentOwner = previous;
++  }
++
++  void record(TextBuffer buffer) {
++    record(buffer, currentOwner);
++  }
++
++  void record(TextBuffer buffer, Candidate owner) {
++    if (!analyzing || buffer.length() == 0) {
++      return;
++    }
++
++    if (owner != null) {
++      emittedCandidates.add(owner);
++    }
++
++    for (TextToken token : buffer.getTokens()) {
++      if (token.isDeclaration()) {
++        continue;
++      }
++
++      if (token instanceof ClassTextToken classToken) {
++        addReference(owner, classCandidatesByName.get(normalizeClassName(classToken.qualifiedName)));
++      }
++      else if (token instanceof FieldTextToken fieldToken) {
++        addReference(owner, classCandidatesByName.get(normalizeClassName(fieldToken.className)));
++        addReference(owner, fieldCandidates.get(fieldKey(fieldToken.className, fieldToken.name, fieldToken.descriptor.descriptorString)));
++      }
++      else if (token instanceof MethodTextToken methodToken) {
++        addReference(owner, classCandidatesByName.get(normalizeClassName(methodToken.className)));
++        addReference(owner, methodCandidates.get(methodKey(methodToken.className, methodToken.name, methodToken.descriptor.toString())));
++      }
++    }
++  }
++
++  private void addReference(Candidate owner, Candidate target) {
++    if (target == null) {
++      return;
++    }
++
++    if (owner == null) {
++      rootReferences.add(target);
++    }
++    else {
++      references.computeIfAbsent(owner, ignored -> new LinkedHashSet<>()).add(target);
++    }
++  }
++
++  private void finishAnalysis() {
++    Deque<Candidate> work = new ArrayDeque<>();
++    for (Candidate target : rootReferences) {
++      retain(target, work);
++    }
++
++    while (!work.isEmpty()) {
++      Candidate source = work.removeFirst();
++      for (Candidate target : references.getOrDefault(source, Collections.emptySet())) {
++        retain(target, work);
++      }
++    }
++  }
++
++  private void retain(Candidate candidate, Deque<Candidate> work) {
++    if (!emittedCandidates.contains(candidate)) {
++      return;
++    }
++
++    if (candidate.parentClass != null) {
++      retain(candidate.parentClass, work);
++    }
++
++    if (retained.add(candidate)) {
++      work.addLast(candidate);
++    }
++  }
++
++  private void registerNode(ClassNode node, Candidate parentClass) {
++    Candidate currentClass = parentClass;
++
++    if (node.type == ClassNode.Type.MEMBER && isSyntheticClassCandidate(node)) {
++      Candidate candidate = new Candidate(Candidate.Kind.CLASS, node.classStruct.qualifiedName, node.classStruct.qualifiedName, null, parentClass);
++      classCandidates.put(node, candidate);
++      classCandidatesByName.put(normalizeClassName(node.classStruct.qualifiedName), candidate);
++      candidates.add(candidate);
++      currentClass = candidate;
++    }
++
++    for (StructField field : node.classStruct.getFields()) {
++      if (isSyntheticField(field, node)) {
++        Candidate candidate = new Candidate(
++          Candidate.Kind.FIELD,
++          node.classStruct.qualifiedName,
++          field.getName(),
++          field.getDescriptor(),
++          currentClass
++        );
++        fieldCandidates.put(fieldKey(node.classStruct.qualifiedName, field.getName(), field.getDescriptor()), candidate);
++        candidates.add(candidate);
++      }
++    }
++
++    for (StructMethod method : node.classStruct.getMethods()) {
++      if (isSyntheticMethod(method, node)) {
++        Candidate candidate = new Candidate(
++          Candidate.Kind.METHOD,
++          node.classStruct.qualifiedName,
++          method.getName(),
++          method.getDescriptor(),
++          currentClass
++        );
++        methodCandidates.put(methodKey(node.classStruct.qualifiedName, method.getName(), method.getDescriptor()), candidate);
++        candidates.add(candidate);
++      }
++    }
++
++    for (ClassNode child : node.nested) {
++      registerNode(child, currentClass);
++    }
++  }
++
++  private static boolean isSyntheticClass(ClassNode node) {
++    return (node.access & CodeConstants.ACC_SYNTHETIC) != 0 || node.classStruct.isSynthetic();
++  }
++
++  private static boolean isSyntheticClassCandidate(ClassNode node) {
++    if (!isSyntheticClass(node)) {
++      return false;
++    }
++
++    if (DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC)) {
++      return true;
++    }
++
++    return node.getWrapper() != null && node.getWrapper().getHiddenMembers().contains(node.classStruct.qualifiedName);
++  }
++
++  private static boolean isSyntheticField(StructField field, ClassNode node) {
++    if (!field.isSynthetic()) {
++      return false;
++    }
++
++    if (DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC)) {
++      return true;
++    }
++
++    return node.getWrapper() != null && node.getWrapper().getHiddenMembers()
++      .contains(org.jetbrains.java.decompiler.util.InterpreterUtil.makeUniqueKey(field.getName(), field.getDescriptor()));
++  }
++
++  private static boolean isSyntheticMethod(StructMethod method, ClassNode node) {
++    boolean generated = method.isSynthetic() || method.hasModifier(CodeConstants.ACC_BRIDGE);
++    if (!generated) {
++      return false;
++    }
++
++    boolean removed = method.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++                      method.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE);
++    if (removed) {
++      return true;
++    }
++
++    return node.getWrapper() != null && node.getWrapper().getHiddenMembers()
++      .contains(org.jetbrains.java.decompiler.util.InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
++  }
++
++  private static String fieldKey(String className, String name, String descriptor) {
++    return className + '\0' + name + '\0' + descriptor;
++  }
++
++  private static String methodKey(String className, String name, String descriptor) {
++    return className + '\0' + name + '\0' + descriptor;
++  }
++
++  private static String normalizeClassName(String className) {
++    return className.replace('.', '/');
++  }
++
++  static final class Candidate {
++    enum Kind { CLASS, FIELD, METHOD }
++
++    final Kind kind;
++    final String className;
++    final String name;
++    final String descriptor;
++    final Candidate parentClass;
++
++    Candidate(Kind kind, String className, String name, String descriptor, Candidate parentClass) {
++      this.kind = kind;
++      this.className = className;
++      this.name = name;
++      this.descriptor = descriptor;
++      this.parentClass = parentClass;
++    }
++  }
++}
+diff --git a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+index 5353261..bddcb61 100644
+--- a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
++++ b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+@@ -21,6 +21,12 @@ public interface IFernflowerPreferences {
+   @Type(DecompilerOption.Type.BOOLEAN)
+   String REMOVE_SYNTHETIC = "remove-synthetic";
+ 
++  @Name("Reference-Aware Synthetic Retention")
++  @Description("Retains removed synthetic and bridge declarations when the emitted Java still refers to them.")
++  @ShortName("rasr")
++  @Type(DecompilerOption.Type.BOOLEAN)
++  String REFERENCE_AWARE_SYNTHETIC_RETENTION = "reference-aware-synthetic-retention";
++
+   @Name("Decompile Inner Classes")
+   @Description("Process inner classes and add them to the decompiled output.")
+   @ShortName("din")
+@@ -425,6 +431,7 @@ public interface IFernflowerPreferences {
+ 
+     defaults.put(REMOVE_BRIDGE, "1");
+     defaults.put(REMOVE_SYNTHETIC, "1");
++    defaults.put(REFERENCE_AWARE_SYNTHETIC_RETENTION, "0");
+     defaults.put(DECOMPILE_INNER, "1");
+     defaults.put(DECOMPILE_CLASS_1_4, "1");
+     defaults.put(DECOMPILE_ASSERTIONS, "1");
+diff --git a/src/org/jetbrains/java/decompiler/modules/decompiler/exps/TypeAnnotation.java b/src/org/jetbrains/java/decompiler/modules/decompiler/exps/TypeAnnotation.java
+index 0f1b276..d0903a7 100644
+--- a/src/org/jetbrains/java/decompiler/modules/decompiler/exps/TypeAnnotation.java
++++ b/src/org/jetbrains/java/decompiler/modules/decompiler/exps/TypeAnnotation.java
+@@ -4,6 +4,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.exps;
+ import org.jetbrains.java.decompiler.code.CodeConstants;
+ import org.jetbrains.java.decompiler.main.ClassesProcessor;
+ import org.jetbrains.java.decompiler.main.DecompilerContext;
++import org.jetbrains.java.decompiler.main.ReferenceAwareSyntheticRetention;
+ import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+ import org.jetbrains.java.decompiler.struct.gen.CodeType;
+ import org.jetbrains.java.decompiler.struct.gen.VarType;
+@@ -258,7 +259,9 @@ public class TypeAnnotation {
+     for (Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent> anno : typeAnnotations) {
+       if (anno.a.isEmpty()) {
+         if (!anno.b.didWriteAlready()) {
+-          anno.b.setDidWriteAlready(true);
++          if (!ReferenceAwareSyntheticRetention.isAnalyzing()) {
++            anno.b.setDidWriteAlready(true);
++          }
+ 
+           TextBuffer annoJava = anno.b.toJava(-1);
+           if (filter.contains(annoJava.convertToStringAndAllowDataDiscard())) {
+@@ -291,7 +294,9 @@ public class TypeAnnotation {
+           any = true;
+         }
+ 
+-        anno.b.setDidWriteAlready(true);
++        if (!ReferenceAwareSyntheticRetention.isAnalyzing()) {
++          anno.b.setDidWriteAlready(true);
++        }
+         buffer.append(anno.b.toJava(-1));
+       }
+     }
+@@ -300,4 +305,4 @@ public class TypeAnnotation {
+       buffer.append(" */");
+     }
+   }
+-}
+\ No newline at end of file
++}

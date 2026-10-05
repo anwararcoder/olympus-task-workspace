@@ -1,0 +1,1938 @@
+diff --git a/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/JspMigrationPlan.java b/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/JspMigrationPlan.java
+new file mode 100644
+index 00000000..abab428f
+--- /dev/null
++++ b/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/JspMigrationPlan.java
+@@ -0,0 +1,272 @@
++package gg.jte.convert.jsp;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.LinkOption;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.nio.file.StandardOpenOption;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++public final class JspMigrationPlan {
++    private static final Comparator<Path> PATH_ORDER = Comparator.comparing(Path::toString);
++
++    private final List<Path> conversionOrder;
++    private final Map<Path, String> writes;
++    private final List<Path> deletes;
++    private final Map<Path, byte[]> contentSnapshots;
++    private final Set<Path> absentSnapshots;
++    private boolean committed;
++
++    JspMigrationPlan(
++            List<Path> conversionOrder,
++            Map<Path, String> writes,
++            List<Path> deletes,
++            Map<Path, byte[]> contentSnapshots,
++            Set<Path> absentSnapshots
++    ) {
++        this.conversionOrder = Collections.unmodifiableList(new ArrayList<>(conversionOrder));
++        this.writes = Collections.unmodifiableMap(new LinkedHashMap<>(writes));
++        this.deletes = Collections.unmodifiableList(new ArrayList<>(deletes));
++
++        Map<Path, byte[]> snapshotCopies = new LinkedHashMap<>();
++        contentSnapshots.forEach((path, content) -> snapshotCopies.put(path, content.clone()));
++        this.contentSnapshots = Collections.unmodifiableMap(snapshotCopies);
++        this.absentSnapshots = Collections.unmodifiableSet(new LinkedHashSet<>(absentSnapshots));
++    }
++
++    public List<Path> getConversionOrder() {
++        return conversionOrder;
++    }
++
++    public Map<Path, String> getWrites() {
++        return writes;
++    }
++
++    public List<Path> getDeletes() {
++        return deletes;
++    }
++
++    public synchronized void commit() throws IOException {
++        if (committed) {
++            throw new IllegalStateException("This JSP migration plan has already been committed.");
++        }
++
++        List<Path> changedPaths = findChangedPaths();
++        if (!changedPaths.isEmpty()) {
++            throw new StaleJspMigrationPlanException(changedPaths);
++        }
++
++        new Transaction(writes, deletes, contentSnapshots).commit();
++        committed = true;
++    }
++
++    private List<Path> findChangedPaths() {
++        List<Path> changed = new ArrayList<>();
++
++        for (Map.Entry<Path, byte[]> snapshot : contentSnapshots.entrySet()) {
++            Path path = snapshot.getKey();
++            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
++                changed.add(path);
++                continue;
++            }
++
++            try {
++                if (!Arrays.equals(snapshot.getValue(), Files.readAllBytes(path))) {
++                    changed.add(path);
++                }
++            } catch (IOException e) {
++                changed.add(path);
++            }
++        }
++
++        for (Path path : absentSnapshots) {
++            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
++                changed.add(path);
++            }
++        }
++
++        changed.sort(PATH_ORDER);
++        return changed;
++    }
++
++    private static final class Transaction {
++        private final Map<Path, byte[]> writeBytes = new LinkedHashMap<>();
++        private final List<Path> deletes;
++        private final Map<Path, byte[]> originals;
++        private final Map<Path, Path> staged = new LinkedHashMap<>();
++        private final List<Path> createdDirectories = new ArrayList<>();
++        private final List<Path> mutatedPaths = new ArrayList<>();
++
++        private Transaction(Map<Path, String> writes, List<Path> deletes, Map<Path, byte[]> originals) {
++            writes.forEach((path, content) -> writeBytes.put(path, content.getBytes(StandardCharsets.UTF_8)));
++            this.deletes = deletes;
++            this.originals = originals;
++        }
++
++        private void commit() throws IOException {
++            try {
++                stageWrites();
++                installWrites();
++                deleteSources();
++                IOException cleanupFailure = cleanupTemporaryFiles();
++                if (cleanupFailure != null) {
++                    throw cleanupFailure;
++                }
++            } catch (IOException failure) {
++                IOException rollbackFailure = rollback();
++                if (rollbackFailure != null) {
++                    failure.addSuppressed(rollbackFailure);
++                }
++                IOException cleanupFailure = cleanupTemporaryFiles();
++                if (cleanupFailure != null) {
++                    failure.addSuppressed(cleanupFailure);
++                }
++                throw failure;
++            }
++        }
++
++        private void stageWrites() throws IOException {
++            for (Map.Entry<Path, byte[]> write : writeBytes.entrySet()) {
++                Path stage = createTemporarySibling(write.getKey(), ".stage");
++                staged.put(write.getKey(), stage);
++                Files.write(stage, write.getValue(), StandardOpenOption.TRUNCATE_EXISTING);
++            }
++        }
++
++        private void installWrites() throws IOException {
++            for (Map.Entry<Path, Path> stage : staged.entrySet()) {
++                mutatedPaths.add(stage.getKey());
++                createParentDirectories(stage.getKey());
++                Files.move(stage.getValue(), stage.getKey(), StandardCopyOption.REPLACE_EXISTING);
++            }
++        }
++
++        private void deleteSources() throws IOException {
++            for (Path path : deletes) {
++                mutatedPaths.add(path);
++                Files.delete(path);
++            }
++        }
++
++        private IOException rollback() {
++            IOException failure = null;
++            List<Path> affected = new ArrayList<>(mutatedPaths);
++            Collections.reverse(affected);
++
++            for (Path path : affected) {
++                try {
++                    byte[] original = originals.get(path);
++                    if (original == null) {
++                        Files.deleteIfExists(path);
++                    } else {
++                        createParentDirectories(path);
++                        Files.write(
++                                path,
++                                original,
++                                StandardOpenOption.CREATE,
++                                StandardOpenOption.TRUNCATE_EXISTING
++                        );
++                    }
++                } catch (IOException rollbackFailure) {
++                    if (failure == null) {
++                        failure = new IOException("Failed to roll back JSP migration.");
++                    }
++                    failure.addSuppressed(rollbackFailure);
++                }
++            }
++
++            IOException directoryFailure = removeCreatedDirectories();
++            if (directoryFailure != null) {
++                if (failure == null) {
++                    failure = new IOException("Failed to roll back JSP migration.");
++                }
++                failure.addSuppressed(directoryFailure);
++            }
++            return failure;
++        }
++
++        private Path createTemporarySibling(Path target, String suffix) throws IOException {
++            Path directory = nearestExistingDirectory(target.toAbsolutePath().normalize().getParent());
++            return Files.createTempFile(directory, ".jte-migration-", suffix);
++        }
++
++        private Path nearestExistingDirectory(Path directory) throws IOException {
++            Path current = directory;
++            while (current != null && !Files.isDirectory(current)) {
++                current = current.getParent();
++            }
++            if (current == null) {
++                throw new IOException("No existing directory for migration path " + directory);
++            }
++            return current;
++        }
++
++        private void createParentDirectories(Path path) throws IOException {
++            Path parent = path.getParent();
++            if (parent == null || Files.isDirectory(parent)) {
++                return;
++            }
++
++            List<Path> missing = new ArrayList<>();
++            Path current = parent;
++            while (current != null && !Files.exists(current)) {
++                missing.add(current);
++                current = current.getParent();
++            }
++
++            try {
++                Files.createDirectories(parent);
++            } finally {
++                Collections.reverse(missing);
++                for (Path directory : missing) {
++                    if (Files.isDirectory(directory) && !createdDirectories.contains(directory)) {
++                        createdDirectories.add(directory);
++                    }
++                }
++            }
++        }
++
++        private IOException cleanupTemporaryFiles() {
++            IOException failure = null;
++            for (Path path : staged.values()) {
++                try {
++                    Files.deleteIfExists(path);
++                } catch (IOException cleanupFailure) {
++                    if (failure == null) {
++                        failure = new IOException("Failed to clean up JSP migration temporary files.");
++                    }
++                    failure.addSuppressed(cleanupFailure);
++                }
++            }
++            return failure;
++        }
++
++        private IOException removeCreatedDirectories() {
++            IOException failure = null;
++            List<Path> reverse = new ArrayList<>(createdDirectories);
++            Collections.reverse(reverse);
++            for (Path path : reverse) {
++                try {
++                    Files.delete(path);
++                } catch (IOException cleanupFailure) {
++                    if (failure == null) {
++                        failure = new IOException("Failed to restore pre-commit directory state.");
++                    }
++                    failure.addSuppressed(cleanupFailure);
++                }
++            }
++            return failure;
++        }
++
++    }
++}
+diff --git a/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java b/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java
+index db30e9ea..5a269263 100644
+--- a/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java
++++ b/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java
+@@ -9,8 +9,11 @@ import org.apache.jasper.compiler.JtpConverter;
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+ import java.net.MalformedURLException;
++import java.net.URISyntaxException;
+ import java.net.URL;
++import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
++import java.nio.file.LinkOption;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+ import java.util.*;
+@@ -22,6 +25,8 @@ import java.util.stream.Stream;
+ public class JspToJteConverter {
+ 
+     private static final Pattern UNCONVERTED_TAG_REFERENCES = Pattern.compile("<[a-zA-Z0-9\\-]+:[a-zA-Z0-9\\-]+\\b");
++    private static final Pattern JSP_COMMENTS = Pattern.compile("<%--.*?--%>", Pattern.DOTALL);
++    private static final Comparator<Path> PATH_ORDER = Comparator.comparing(Path::toString);
+ 
+     public static void convertFromIntelliJPlugin(String[] commandLineArgs, JspToJteConverter converter, Consumer<Converter> parserSetup) {
+         if (commandLineArgs.length < 1) {
+@@ -48,12 +53,318 @@ public class JspToJteConverter {
+         Path jspTagFile = jspRoot.resolve(jspTag);
+ 
+         String relativeFilePath = jspRoot.relativize(jspTagFile).toString();
+-        Converter converter = new JtpConverter(
++        String jte = createConverter(relativeFilePath, readFile(jspTagFile), parserSetup).convert();
++
++        System.out.println(jte);
++
++        checkDependencies(jte);
++
++        String jteTemplate = suggestJteFile(jspTag.replace('\\', '/'));
++        Path jteTemplateFile = jteRoot.resolve(jteTemplate);
++        IoUtils.writeFile(jteTemplateFile, jte);
++
++        replaceUsages(jspTagFile, jteTemplateFile);
++    }
++
++    public JspMigrationPlan planTags(Collection<String> jspTags, Consumer<Converter> parserSetup) {
++        if (jspTags == null || jspTags.isEmpty()) {
++            throw new IllegalArgumentException("At least one JSP tag is required.");
++        }
++
++        Path normalizedJspRoot = jspRoot.toAbsolutePath().normalize();
++        Path normalizedJteRoot = jteRoot.toAbsolutePath().normalize();
++        List<Path> selectedTags = normalizeSelectedTags(jspTags, normalizedJspRoot);
++        Map<Path, Path> destinations = preflightDestinations(selectedTags, normalizedJspRoot, normalizedJteRoot);
++
++        Map<Path, byte[]> snapshots = new LinkedHashMap<>();
++        Map<Path, String> virtualFiles = scanJspFiles(normalizedJspRoot, snapshots);
++        Set<Path> usageScannedFiles = new LinkedHashSet<>(virtualFiles.keySet());
++        for (Path selectedTag : selectedTags) {
++            snapshots.put(selectedTag, readBytes(selectedTag));
++            virtualFiles.put(selectedTag, readFile(selectedTag));
++        }
++
++        Map<String, Path> tagsByName = indexSelectedTagNames(selectedTags);
++        Map<Path, Set<Path>> dependencies = new LinkedHashMap<>();
++        for (Path selectedTag : selectedTags) {
++            String relativePath = normalizedJspRoot.relativize(selectedTag).toString();
++            JtpConverter converter = createConverter(relativePath, virtualFiles.get(selectedTag), parserSetup);
++
++            Set<Path> selectedDependencies = new TreeSet<>(PATH_ORDER);
++            for (String customTag : converter.findCustomTagReferences()) {
++                Path dependency = tagsByName.get(customTag);
++                if (dependency != null) {
++                    selectedDependencies.add(dependency);
++                }
++            }
++            dependencies.put(selectedTag, selectedDependencies);
++
++            for (URL includedResource : converter.findIncludedFileReferences()) {
++                Path includedPath = resolveIncludedFile(includedResource, normalizedJspRoot);
++                byte[] includedContent = snapshots.get(includedPath);
++                if (includedContent == null) {
++                    includedContent = readBytes(includedPath);
++                    snapshots.put(includedPath, includedContent);
++                }
++                virtualFiles.putIfAbsent(includedPath, new String(includedContent, StandardCharsets.UTF_8));
++            }
++        }
++
++        List<Path> conversionOrder = orderByDependencies(dependencies, normalizedJspRoot);
++        Map<Path, String> writes = new LinkedHashMap<>();
++        for (Path selectedTag : conversionOrder) {
++            String relativePath = normalizedJspRoot.relativize(selectedTag).toString();
++            String jte = createConverter(
++                    relativePath,
++                    virtualFiles.get(selectedTag),
++                    parserSetup,
++                    createVirtualResources(virtualFiles)
++            ).convert();
++            checkBatchDependencies(jte);
++            writes.put(destinations.get(selectedTag), jte);
++
++            virtualFiles.remove(selectedTag);
++            Path destination = destinations.get(selectedTag);
++            for (Map.Entry<Path, String> virtualFile : virtualFiles.entrySet()) {
++                virtualFile.setValue(rewriteUsages(selectedTag, destination, virtualFile.getValue()));
++            }
++        }
++
++        for (Path usageScannedFile : usageScannedFiles) {
++            String finalContent = virtualFiles.get(usageScannedFile);
++            if (finalContent == null) {
++                continue;
++            }
++
++            String original = new String(snapshots.get(usageScannedFile), StandardCharsets.UTF_8);
++            if (!original.equals(finalContent)) {
++                writes.put(usageScannedFile, finalContent);
++            }
++        }
++
++        Set<Path> absentDestinations = new LinkedHashSet<>(destinations.values());
++        return new JspMigrationPlan(conversionOrder, writes, conversionOrder, snapshots, absentDestinations);
++    }
++
++    private List<Path> normalizeSelectedTags(Collection<String> jspTags, Path normalizedJspRoot) {
++        Set<Path> unique = new HashSet<>();
++        List<Path> result = new ArrayList<>();
++
++        for (String jspTag : jspTags) {
++            if (jspTag == null || jspTag.trim().isEmpty()) {
++                throw new IllegalArgumentException("JSP tag paths must not be null or blank.");
++            }
++
++            Path input = jspRoot.getFileSystem().getPath(jspTag);
++            if (input.isAbsolute()) {
++                throw new IllegalArgumentException("JSP tag paths must be relative to the configured JSP root: " + jspTag);
++            }
++
++            Path selected = normalizedJspRoot.resolve(input).normalize();
++            if (!selected.startsWith(normalizedJspRoot)) {
++                throw new IllegalArgumentException("JSP tag path escapes the configured JSP root: " + jspTag);
++            }
++            if (!unique.add(selected)) {
++                throw new IllegalArgumentException("Duplicate JSP tag path: " + jspTag);
++            }
++            if (!selected.getFileName().toString().endsWith(".tag")) {
++                throw new IllegalArgumentException("Only JSP tag files can be planned: " + jspTag);
++            }
++            if (!Files.isRegularFile(selected, LinkOption.NOFOLLOW_LINKS)) {
++                throw new IllegalArgumentException("JSP tag is missing, non-regular, or symbolic: " + jspTag);
++            }
++
++            result.add(selected);
++        }
++
++        result.sort(PATH_ORDER);
++        return result;
++    }
++
++    private Map<Path, Path> preflightDestinations(List<Path> selectedTags, Path normalizedJspRoot, Path normalizedJteRoot) {
++        Map<Path, Path> result = new LinkedHashMap<>();
++        Map<Path, Path> sourcesByDestination = new HashMap<>();
++
++        for (Path selectedTag : selectedTags) {
++            String relativePath = normalizedJspRoot.relativize(selectedTag).toString().replace('\\', '/');
++            Path destination = normalizedJteRoot.resolve(suggestJteFile(relativePath)).normalize();
++            if (!destination.startsWith(normalizedJteRoot)) {
++                throw new IllegalArgumentException("Generated JTE path escapes the configured JTE root: " + destination);
++            }
++
++            Path previous = sourcesByDestination.put(destination, selectedTag);
++            if (previous != null) {
++                throw new IllegalArgumentException("JSP tags generate the same JTE destination: " + previous + " and " + selectedTag);
++            }
++            if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
++                throw new IllegalArgumentException("Generated JTE destination already exists: " + destination);
++            }
++            result.put(selectedTag, destination);
++        }
++        return result;
++    }
++
++    private Map<Path, String> scanJspFiles(Path normalizedJspRoot, Map<Path, byte[]> snapshots) {
++        Map<Path, String> result = new LinkedHashMap<>();
++        try (Stream<Path> stream = Files.walk(normalizedJspRoot)) {
++            stream
++                    .filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
++                    .filter(this::isJspSource)
++                    .map(path -> path.toAbsolutePath().normalize())
++                    .sorted(PATH_ORDER)
++                    .forEach(path -> {
++                        byte[] content = readBytes(path);
++                        snapshots.put(path, content);
++                        result.put(path, new String(content, StandardCharsets.UTF_8));
++                    });
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++        return result;
++    }
++
++    private boolean isJspSource(Path path) {
++        String fileName = path.toString();
++        return fileName.endsWith(".jsp") || fileName.endsWith(".jsp.inc") || fileName.endsWith(".tag");
++    }
++
++    private Map<String, Path> indexSelectedTagNames(List<Path> selectedTags) {
++        Map<String, Path> result = new HashMap<>();
++        for (Path selectedTag : selectedTags) {
++            String tagName = extractTagPrefix(selectedTag).substring(1);
++            Path previous = result.put(tagName, selectedTag);
++            if (previous != null) {
++                throw new IllegalArgumentException("Selected JSP tags have the same invocation name: " + previous + " and " + selectedTag);
++            }
++        }
++        return result;
++    }
++
++    private List<Path> orderByDependencies(Map<Path, Set<Path>> dependencies, Path normalizedJspRoot) {
++        Map<Path, Set<Path>> remaining = new LinkedHashMap<>();
++        dependencies.forEach((path, values) -> remaining.put(path, new TreeSet<>(values)));
++
++        TreeSet<Path> ready = new TreeSet<>(PATH_ORDER);
++        remaining.forEach((path, values) -> {
++            if (values.isEmpty()) {
++                ready.add(path);
++            }
++        });
++
++        List<Path> result = new ArrayList<>();
++        while (!ready.isEmpty()) {
++            Path converted = ready.pollFirst();
++            result.add(converted);
++            remaining.remove(converted);
++
++            for (Map.Entry<Path, Set<Path>> candidate : remaining.entrySet()) {
++                if (candidate.getValue().remove(converted) && candidate.getValue().isEmpty()) {
++                    ready.add(candidate.getKey());
++                }
++            }
++        }
++
++        if (!remaining.isEmpty()) {
++            throw new IllegalArgumentException("JSP tag dependency cycle: " + findCycle(remaining, normalizedJspRoot));
++        }
++        return result;
++    }
++
++    private String findCycle(Map<Path, Set<Path>> dependencies, Path normalizedJspRoot) {
++        Set<Path> visited = new HashSet<>();
++        List<Path> stack = new ArrayList<>();
++        Set<Path> active = new HashSet<>();
++
++        TreeSet<Path> sortedPaths = new TreeSet<>(PATH_ORDER);
++        sortedPaths.addAll(dependencies.keySet());
++        for (Path path : sortedPaths) {
++            String cycle = findCycle(path, dependencies, normalizedJspRoot, visited, stack, active);
++            if (cycle != null) {
++                return cycle;
++            }
++        }
++        return "unknown";
++    }
++
++    private String findCycle(
++            Path path,
++            Map<Path, Set<Path>> dependencies,
++            Path normalizedJspRoot,
++            Set<Path> visited,
++            List<Path> stack,
++            Set<Path> active
++    ) {
++        if (active.contains(path)) {
++            int start = stack.indexOf(path);
++            List<String> cycle = new ArrayList<>();
++            for (int i = start; i < stack.size(); i++) {
++                cycle.add(normalizedJspRoot.relativize(stack.get(i)).toString().replace('\\', '/'));
++            }
++            cycle.add(normalizedJspRoot.relativize(path).toString().replace('\\', '/'));
++            return String.join(" -> ", cycle);
++        }
++        if (!visited.add(path)) {
++            return null;
++        }
++
++        active.add(path);
++        stack.add(path);
++        Set<Path> sortedDependencies = new TreeSet<>(PATH_ORDER);
++        sortedDependencies.addAll(dependencies.getOrDefault(path, Collections.emptySet()));
++        for (Path dependency : sortedDependencies) {
++            String cycle = findCycle(dependency, dependencies, normalizedJspRoot, visited, stack, active);
++            if (cycle != null) {
++                return cycle;
++            }
++        }
++        stack.remove(stack.size() - 1);
++        active.remove(path);
++        return null;
++    }
++
++    private Path resolveIncludedFile(URL resource, Path normalizedJspRoot) {
++        try {
++            if (!"file".equalsIgnoreCase(resource.getProtocol())) {
++                throw new IllegalArgumentException("Included JSP resources must use file URLs for transactional planning: " + resource);
++            }
++            Path path = Paths.get(resource.toURI()).toAbsolutePath().normalize();
++            if (!path.startsWith(normalizedJspRoot)) {
++                throw new IllegalArgumentException("Included JSP resource is outside the configured JSP root: " + resource);
++            }
++            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
++                throw new IllegalArgumentException("Included JSP resource is missing or non-regular: " + resource);
++            }
++            return path;
++        } catch (URISyntaxException e) {
++            throw new IllegalArgumentException("Invalid included JSP resource: " + resource, e);
++        }
++    }
++
++    private byte[] readBytes(Path path) {
++        try {
++            return Files.readAllBytes(path);
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
++    private JtpConverter createConverter(String relativeFilePath, String input, Consumer<Converter> parserSetup) {
++        return createConverter(relativeFilePath, input, parserSetup, Collections.emptyMap());
++    }
++
++    private JtpConverter createConverter(
++            String relativeFilePath,
++            String input,
++            Consumer<Converter> parserSetup,
++            Map<String, byte[]> virtualResources
++    ) {
++        JtpConverter converter = new JtpConverter(
+                 relativeFilePath,
+-                readFile(jspTagFile).replace("\r", "").getBytes(),
++                input.replace("\r", "").getBytes(StandardCharsets.UTF_8),
+                 getResourceBase(),
+                 relativeFilePath.endsWith(".tag"),
+-                new ConverterOutput()
++                new ConverterOutput(),
++                virtualResources
+         );
+ 
+         converter.register("c:if", new JspIfConverter());
+@@ -62,33 +373,48 @@ public class JspToJteConverter {
+         converter.register("c:when", new JspWhenConverter());
+         converter.register("c:otherwise", new JspOtherwiseConverter());
+         converter.register("c:set", new JspSetConverter());
+-
+         converter.register("fmt:message", new JstlFmtMessageConverter());
+         converter.register("fmt:param", new JstlFmtParamConverter());
++        converter.register(jteTag, new JspJteConverter());
+ 
+-        converter.register(this.jteTag, new gg.jte.convert.jsp.converter.JspJteConverter());
+-
+-        if (getNotConvertedTags() != null) {
+-            for (String notConvertedTag : getNotConvertedTags()) {
++        String[] notConvertedTags = getNotConvertedTags();
++        if (notConvertedTags != null) {
++            for (String notConvertedTag : notConvertedTags) {
+                 converter.register(notConvertedTag, new JspNoopConverter());
+             }
+         }
+-
+         if (parserSetup != null) {
+             parserSetup.accept(converter);
+         }
++        return converter;
++    }
+ 
+-        String jte = converter.convert();
+-
+-        System.out.println(jte);
+-
+-        checkDependencies(jte);
++    private Map<String, byte[]> createVirtualResources(Map<Path, String> virtualFiles) {
++        Map<String, byte[]> result = new HashMap<>();
++        try {
++            URL resourceBase = getResourceBase();
++            if (!"file".equalsIgnoreCase(resourceBase.getProtocol())) {
++                return result;
++            }
+ 
+-        String jteTemplate = suggestJteFile(jspTag.replace('\\', '/'));
+-        Path jteTemplateFile = jteRoot.resolve(jteTemplate);
+-        IoUtils.writeFile(jteTemplateFile, jte);
++            Path resourceRoot = Paths.get(resourceBase.toURI()).toAbsolutePath().normalize();
++            for (Map.Entry<Path, String> virtualFile : virtualFiles.entrySet()) {
++                if (virtualFile.getKey().startsWith(resourceRoot)) {
++                    result.put(
++                            virtualFile.getKey().toUri().toURL().toExternalForm(),
++                            virtualFile.getValue().getBytes(StandardCharsets.UTF_8)
++                    );
++                }
++            }
++            return result;
++        } catch (MalformedURLException | URISyntaxException e) {
++            throw new IllegalArgumentException("Invalid JSP resource base.", e);
++        }
++    }
+ 
+-        replaceUsages(jspTagFile, jteTemplateFile);
++    private void checkBatchDependencies(String jteCode) {
++        String structuralCode = JSP_COMMENTS.matcher(jteCode).replaceAll("");
++        checkDependencies(structuralCode);
+     }
+ 
+     @SuppressWarnings("unused")
+@@ -121,15 +447,29 @@ public class JspToJteConverter {
+     }
+ 
+     private void replaceUsages(Path jspFile, String oldJspTagPrefix, String oldJspTagClosing, String newJteFile) {
+-        boolean modified = false;
++        String original = IoUtils.readFile(jspFile);
++        String rewritten = rewriteUsages(oldJspTagPrefix, oldJspTagClosing, newJteFile, original);
++        if (!original.equals(rewritten)) {
++            IoUtils.writeFile(jspFile, rewritten);
++        }
++    }
+ 
+-        StringBuilder jspContent = new StringBuilder(IoUtils.readFile(jspFile));
++    private String rewriteUsages(Path jspTag, Path jteTag, String jspContent) {
++        String oldJspTagPrefix = extractTagPrefix(jspTag);
++        String oldJspTagClosing = "</" + oldJspTagPrefix.substring(1) + ">";
++        String newJteFile = jteRoot.toAbsolutePath().normalize().relativize(jteTag).toString().replace('\\', '/');
++        return rewriteUsages(oldJspTagPrefix, oldJspTagClosing, newJteFile, jspContent);
++    }
+ 
++    private String rewriteUsages(String oldJspTagPrefix, String oldJspTagClosing, String newJteFile, String content) {
++        boolean modified = false;
++        StringBuilder jspContent = new StringBuilder(content);
+         int lastIndex = 0;
+ 
+         do {
+             lastIndex = jspContent.indexOf(oldJspTagPrefix, lastIndex);
+-            if (lastIndex >= 0 && lastIndex < jspContent.length()) {
++            int afterPrefix = lastIndex + oldJspTagPrefix.length();
++            if (lastIndex >= 0 && afterPrefix < jspContent.length()) {
+                 char character = jspContent.charAt(lastIndex + oldJspTagPrefix.length());
+                 if (Character.isWhitespace(character) || character == '/' || character == '>') {
+                     jspContent.replace(lastIndex, lastIndex + oldJspTagPrefix.length(), "<" + jteTag + " jte=\"" + newJteFile + "\"");
+@@ -154,9 +494,7 @@ public class JspToJteConverter {
+             }
+         } while (true);
+ 
+-        if (modified) {
+-            IoUtils.writeFile(jspFile, jspContent.toString());
+-        }
++        return modified ? jspContent.toString() : content;
+     }
+ 
+     private String extractTagPrefix(Path jspTag) {
+diff --git a/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/StaleJspMigrationPlanException.java b/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/StaleJspMigrationPlanException.java
+new file mode 100644
+index 00000000..8097b1c2
+--- /dev/null
++++ b/jte-jsp-converter-jakarta/src/main/java/gg/jte/convert/jsp/StaleJspMigrationPlanException.java
+@@ -0,0 +1,18 @@
++package gg.jte.convert.jsp;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.List;
++
++public final class StaleJspMigrationPlanException extends IOException {
++    private final List<Path> changedPaths;
++
++    StaleJspMigrationPlanException(List<Path> changedPaths) {
++        super("JSP migration plan is stale: " + changedPaths);
++        this.changedPaths = List.copyOf(changedPaths);
++    }
++
++    public List<Path> getChangedPaths() {
++        return changedPaths;
++    }
++}
+diff --git a/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpConverter.java b/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpConverter.java
+index 5496eb32..2a2f91bb 100644
+--- a/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpConverter.java
++++ b/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpConverter.java
+@@ -24,21 +24,37 @@ public class JtpConverter extends Node.Visitor implements Converter {
+     private final URL resourceBase;
+     private final boolean tagFile;
+     private final ConverterOutput output;
++    private final Map<String, byte[]> virtualResources;
+     private final Map<String, CustomTagConverter> converters = new HashMap<>();
+     private final Set<String> inlinedIncludes = new HashSet<>();
+     private final Map<String, EnumSet<JspElementType>> suppressions = new HashMap<>();
+     private final Set<String> imports = new TreeSet<>();
+     private final Set<String> params = new TreeSet<>();
++    private Node.Nodes parsedNodes;
++    private Set<String> referencedCustomTags;
++    private Set<URL> referencedIncludes;
+ 
+     private String prefix;
+     private String lineSeparator = "\n";
+ 
+     public JtpConverter(String relativeFilePath, byte[] input, URL resourceBase, boolean tagFile, ConverterOutput output) {
++        this(relativeFilePath, input, resourceBase, tagFile, output, Collections.emptyMap());
++    }
++
++    public JtpConverter(
++            String relativeFilePath,
++            byte[] input,
++            URL resourceBase,
++            boolean tagFile,
++            ConverterOutput output,
++            Map<String, byte[]> virtualResources
++    ) {
+         this.relativeFilePath = relativeFilePath;
+         this.input = input;
+         this.resourceBase = resourceBase;
+         this.tagFile = tagFile;
+         this.output = output;
++        this.virtualResources = virtualResources;
+     }
+ 
+     @Override
+@@ -74,9 +90,7 @@ public class JtpConverter extends Node.Visitor implements Converter {
+     @Override
+     public String convert() {
+         try {
+-            Node.Nodes nodes = JtpParser.parse(relativeFilePath, input, resourceBase, tagFile);
+-
+-            nodes.visit(this);
++            getParsedNodes().visit(this);
+ 
+             return cleanResult(output.trim().prepend(createPrefix()).toString());
+         } catch (JasperException | IOException e) {
+@@ -84,6 +98,73 @@ public class JtpConverter extends Node.Visitor implements Converter {
+         }
+     }
+ 
++    public Set<String> findCustomTagReferences() {
++        collectTagReferences();
++        return referencedCustomTags;
++    }
++
++    public Set<URL> findIncludedFileReferences() {
++        collectTagReferences();
++        return referencedIncludes;
++    }
++
++    private void collectTagReferences() {
++        if (referencedCustomTags != null) {
++            return;
++        }
++
++        Set<String> customTags = new LinkedHashSet<>();
++        Set<URL> includedFiles = new LinkedHashSet<>();
++
++        try {
++            getParsedNodes().visit(new Node.Visitor() {
++                @Override
++                public void visit(Node.CustomTag n) throws JasperException {
++                    if (isSuppressed(n)) {
++                        return;
++                    }
++
++                    customTags.add(n.getQName());
++                    super.visit(n);
++                }
++
++                @Override
++                public void visit(Node.IncludeDirective n) throws JasperException {
++                    String file = n.getAttributeValue("file");
++                    if (!inlinedIncludes.contains(file)) {
++                        throw new UnsupportedOperationException("Includes are not supported. You should convert it to a tag first, or suppress with addInlinedInclude(\"" + file + "\")");
++                    }
++
++                    includedFiles.add(resolveIncludedResource(n, file));
++                    super.visit(n);
++                }
++            });
++        } catch (JasperException | IOException e) {
++            throw new RuntimeException(e);
++        }
++
++        referencedCustomTags = Collections.unmodifiableSet(customTags);
++        referencedIncludes = Collections.unmodifiableSet(includedFiles);
++    }
++
++    private URL resolveIncludedResource(Node.IncludeDirective include, String file) {
++        try {
++            if (file.startsWith("/")) {
++                return new URL(resourceBase, file.substring(1));
++            }
++            return new URL(include.getStart().getURL(), file);
++        } catch (IOException e) {
++            throw new IllegalArgumentException("Invalid included JSP resource: " + file, e);
++        }
++    }
++
++    private Node.Nodes getParsedNodes() throws JasperException, IOException {
++        if (parsedNodes == null) {
++            parsedNodes = JtpParser.parse(relativeFilePath, input, resourceBase, tagFile, virtualResources);
++        }
++        return parsedNodes;
++    }
++
+     private String createPrefix() {
+         StringBuilder result = new StringBuilder(prefix == null ? "" : prefix);
+ 
+diff --git a/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpParser.java b/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpParser.java
+index dfe177f4..b1a5f71b 100644
+--- a/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpParser.java
++++ b/jte-jsp-converter-jakarta/src/main/java/org/apache/jasper/compiler/JtpParser.java
+@@ -11,6 +11,10 @@ import org.xml.sax.SAXException;
+ 
+ import java.io.*;
+ import java.net.URL;
++import java.net.URLConnection;
++import java.net.URLStreamHandler;
++import java.nio.charset.StandardCharsets;
++import java.util.Collections;
+ import java.util.Map;
+ 
+ import jakarta.servlet.ServletContext;
+@@ -20,12 +24,22 @@ import jakarta.servlet.jsp.tagext.TagLibraryInfo;
+ 
+ public class JtpParser {
+     public static Node.Nodes parse(String relativeFilePath, byte[] input, URL resourceBase, boolean tag) throws JasperException, IOException {
++        return parse(relativeFilePath, input, resourceBase, tag, Collections.emptyMap());
++    }
++
++    public static Node.Nodes parse(
++            String relativeFilePath,
++            byte[] input,
++            URL resourceBase,
++            boolean tag,
++            Map<String, byte[]> virtualResources
++    ) throws JasperException, IOException {
+         JspC jspc = new JspC();
+ 
+         PrintWriter log = new PrintWriter(System.out);
+ 
+         ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+-        ServletContext context = new JspCServletContext(log, resourceBase, classLoader, jspc.isValidateXml(), jspc.isBlockExternal());
++        ServletContext context = new JspCServletContext(log, overlay(resourceBase, virtualResources), classLoader, jspc.isValidateXml(), jspc.isBlockExternal());
+ 
+         TldScanner scanner = new TldScanner(context, true, jspc.isValidateTld(), jspc.isBlockExternal());
+         scanner.setClassLoader(classLoader);
+@@ -232,4 +246,44 @@ public class JtpParser {
+ 
+         return Parser.parse(parserController, jspReader, null, tag, false, null, "UTF-8", "UTF-8", true, false);
+     }
+-}
+\ No newline at end of file
++
++    private static URL overlay(URL resourceBase, Map<String, byte[]> virtualResources) throws IOException {
++        if (virtualResources.isEmpty()) {
++            return resourceBase;
++        }
++
++        Map<String, byte[]> resources = Collections.unmodifiableMap(virtualResources);
++        return new URL(null, resourceBase.toExternalForm(), new URLStreamHandler() {
++            @Override
++            protected URLConnection openConnection(URL url) throws IOException {
++                byte[] content = resources.get(url.toExternalForm());
++                if (content == null) {
++                    return new URL(url.toExternalForm()).openConnection();
++                }
++
++                return new URLConnection(url) {
++                    @Override
++                    public void connect() {
++                        connected = true;
++                    }
++
++                    @Override
++                    public InputStream getInputStream() {
++                        connect();
++                        return new ByteArrayInputStream(content);
++                    }
++
++                    @Override
++                    public long getContentLengthLong() {
++                        return content.length;
++                    }
++
++                    @Override
++                    public String getContentType() {
++                        return "text/plain; charset=" + StandardCharsets.UTF_8.name();
++                    }
++                };
++            }
++        });
++    }
++}
+diff --git a/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/JspMigrationPlan.java b/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/JspMigrationPlan.java
+new file mode 100644
+index 00000000..abab428f
+--- /dev/null
++++ b/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/JspMigrationPlan.java
+@@ -0,0 +1,272 @@
++package gg.jte.convert.jsp;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.LinkOption;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.nio.file.StandardOpenOption;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++public final class JspMigrationPlan {
++    private static final Comparator<Path> PATH_ORDER = Comparator.comparing(Path::toString);
++
++    private final List<Path> conversionOrder;
++    private final Map<Path, String> writes;
++    private final List<Path> deletes;
++    private final Map<Path, byte[]> contentSnapshots;
++    private final Set<Path> absentSnapshots;
++    private boolean committed;
++
++    JspMigrationPlan(
++            List<Path> conversionOrder,
++            Map<Path, String> writes,
++            List<Path> deletes,
++            Map<Path, byte[]> contentSnapshots,
++            Set<Path> absentSnapshots
++    ) {
++        this.conversionOrder = Collections.unmodifiableList(new ArrayList<>(conversionOrder));
++        this.writes = Collections.unmodifiableMap(new LinkedHashMap<>(writes));
++        this.deletes = Collections.unmodifiableList(new ArrayList<>(deletes));
++
++        Map<Path, byte[]> snapshotCopies = new LinkedHashMap<>();
++        contentSnapshots.forEach((path, content) -> snapshotCopies.put(path, content.clone()));
++        this.contentSnapshots = Collections.unmodifiableMap(snapshotCopies);
++        this.absentSnapshots = Collections.unmodifiableSet(new LinkedHashSet<>(absentSnapshots));
++    }
++
++    public List<Path> getConversionOrder() {
++        return conversionOrder;
++    }
++
++    public Map<Path, String> getWrites() {
++        return writes;
++    }
++
++    public List<Path> getDeletes() {
++        return deletes;
++    }
++
++    public synchronized void commit() throws IOException {
++        if (committed) {
++            throw new IllegalStateException("This JSP migration plan has already been committed.");
++        }
++
++        List<Path> changedPaths = findChangedPaths();
++        if (!changedPaths.isEmpty()) {
++            throw new StaleJspMigrationPlanException(changedPaths);
++        }
++
++        new Transaction(writes, deletes, contentSnapshots).commit();
++        committed = true;
++    }
++
++    private List<Path> findChangedPaths() {
++        List<Path> changed = new ArrayList<>();
++
++        for (Map.Entry<Path, byte[]> snapshot : contentSnapshots.entrySet()) {
++            Path path = snapshot.getKey();
++            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
++                changed.add(path);
++                continue;
++            }
++
++            try {
++                if (!Arrays.equals(snapshot.getValue(), Files.readAllBytes(path))) {
++                    changed.add(path);
++                }
++            } catch (IOException e) {
++                changed.add(path);
++            }
++        }
++
++        for (Path path : absentSnapshots) {
++            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
++                changed.add(path);
++            }
++        }
++
++        changed.sort(PATH_ORDER);
++        return changed;
++    }
++
++    private static final class Transaction {
++        private final Map<Path, byte[]> writeBytes = new LinkedHashMap<>();
++        private final List<Path> deletes;
++        private final Map<Path, byte[]> originals;
++        private final Map<Path, Path> staged = new LinkedHashMap<>();
++        private final List<Path> createdDirectories = new ArrayList<>();
++        private final List<Path> mutatedPaths = new ArrayList<>();
++
++        private Transaction(Map<Path, String> writes, List<Path> deletes, Map<Path, byte[]> originals) {
++            writes.forEach((path, content) -> writeBytes.put(path, content.getBytes(StandardCharsets.UTF_8)));
++            this.deletes = deletes;
++            this.originals = originals;
++        }
++
++        private void commit() throws IOException {
++            try {
++                stageWrites();
++                installWrites();
++                deleteSources();
++                IOException cleanupFailure = cleanupTemporaryFiles();
++                if (cleanupFailure != null) {
++                    throw cleanupFailure;
++                }
++            } catch (IOException failure) {
++                IOException rollbackFailure = rollback();
++                if (rollbackFailure != null) {
++                    failure.addSuppressed(rollbackFailure);
++                }
++                IOException cleanupFailure = cleanupTemporaryFiles();
++                if (cleanupFailure != null) {
++                    failure.addSuppressed(cleanupFailure);
++                }
++                throw failure;
++            }
++        }
++
++        private void stageWrites() throws IOException {
++            for (Map.Entry<Path, byte[]> write : writeBytes.entrySet()) {
++                Path stage = createTemporarySibling(write.getKey(), ".stage");
++                staged.put(write.getKey(), stage);
++                Files.write(stage, write.getValue(), StandardOpenOption.TRUNCATE_EXISTING);
++            }
++        }
++
++        private void installWrites() throws IOException {
++            for (Map.Entry<Path, Path> stage : staged.entrySet()) {
++                mutatedPaths.add(stage.getKey());
++                createParentDirectories(stage.getKey());
++                Files.move(stage.getValue(), stage.getKey(), StandardCopyOption.REPLACE_EXISTING);
++            }
++        }
++
++        private void deleteSources() throws IOException {
++            for (Path path : deletes) {
++                mutatedPaths.add(path);
++                Files.delete(path);
++            }
++        }
++
++        private IOException rollback() {
++            IOException failure = null;
++            List<Path> affected = new ArrayList<>(mutatedPaths);
++            Collections.reverse(affected);
++
++            for (Path path : affected) {
++                try {
++                    byte[] original = originals.get(path);
++                    if (original == null) {
++                        Files.deleteIfExists(path);
++                    } else {
++                        createParentDirectories(path);
++                        Files.write(
++                                path,
++                                original,
++                                StandardOpenOption.CREATE,
++                                StandardOpenOption.TRUNCATE_EXISTING
++                        );
++                    }
++                } catch (IOException rollbackFailure) {
++                    if (failure == null) {
++                        failure = new IOException("Failed to roll back JSP migration.");
++                    }
++                    failure.addSuppressed(rollbackFailure);
++                }
++            }
++
++            IOException directoryFailure = removeCreatedDirectories();
++            if (directoryFailure != null) {
++                if (failure == null) {
++                    failure = new IOException("Failed to roll back JSP migration.");
++                }
++                failure.addSuppressed(directoryFailure);
++            }
++            return failure;
++        }
++
++        private Path createTemporarySibling(Path target, String suffix) throws IOException {
++            Path directory = nearestExistingDirectory(target.toAbsolutePath().normalize().getParent());
++            return Files.createTempFile(directory, ".jte-migration-", suffix);
++        }
++
++        private Path nearestExistingDirectory(Path directory) throws IOException {
++            Path current = directory;
++            while (current != null && !Files.isDirectory(current)) {
++                current = current.getParent();
++            }
++            if (current == null) {
++                throw new IOException("No existing directory for migration path " + directory);
++            }
++            return current;
++        }
++
++        private void createParentDirectories(Path path) throws IOException {
++            Path parent = path.getParent();
++            if (parent == null || Files.isDirectory(parent)) {
++                return;
++            }
++
++            List<Path> missing = new ArrayList<>();
++            Path current = parent;
++            while (current != null && !Files.exists(current)) {
++                missing.add(current);
++                current = current.getParent();
++            }
++
++            try {
++                Files.createDirectories(parent);
++            } finally {
++                Collections.reverse(missing);
++                for (Path directory : missing) {
++                    if (Files.isDirectory(directory) && !createdDirectories.contains(directory)) {
++                        createdDirectories.add(directory);
++                    }
++                }
++            }
++        }
++
++        private IOException cleanupTemporaryFiles() {
++            IOException failure = null;
++            for (Path path : staged.values()) {
++                try {
++                    Files.deleteIfExists(path);
++                } catch (IOException cleanupFailure) {
++                    if (failure == null) {
++                        failure = new IOException("Failed to clean up JSP migration temporary files.");
++                    }
++                    failure.addSuppressed(cleanupFailure);
++                }
++            }
++            return failure;
++        }
++
++        private IOException removeCreatedDirectories() {
++            IOException failure = null;
++            List<Path> reverse = new ArrayList<>(createdDirectories);
++            Collections.reverse(reverse);
++            for (Path path : reverse) {
++                try {
++                    Files.delete(path);
++                } catch (IOException cleanupFailure) {
++                    if (failure == null) {
++                        failure = new IOException("Failed to restore pre-commit directory state.");
++                    }
++                    failure.addSuppressed(cleanupFailure);
++                }
++            }
++            return failure;
++        }
++
++    }
++}
+diff --git a/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java b/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java
+index db30e9ea..5a269263 100644
+--- a/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java
++++ b/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/JspToJteConverter.java
+@@ -9,8 +9,11 @@ import org.apache.jasper.compiler.JtpConverter;
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+ import java.net.MalformedURLException;
++import java.net.URISyntaxException;
+ import java.net.URL;
++import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
++import java.nio.file.LinkOption;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+ import java.util.*;
+@@ -22,6 +25,8 @@ import java.util.stream.Stream;
+ public class JspToJteConverter {
+ 
+     private static final Pattern UNCONVERTED_TAG_REFERENCES = Pattern.compile("<[a-zA-Z0-9\\-]+:[a-zA-Z0-9\\-]+\\b");
++    private static final Pattern JSP_COMMENTS = Pattern.compile("<%--.*?--%>", Pattern.DOTALL);
++    private static final Comparator<Path> PATH_ORDER = Comparator.comparing(Path::toString);
+ 
+     public static void convertFromIntelliJPlugin(String[] commandLineArgs, JspToJteConverter converter, Consumer<Converter> parserSetup) {
+         if (commandLineArgs.length < 1) {
+@@ -48,12 +53,318 @@ public class JspToJteConverter {
+         Path jspTagFile = jspRoot.resolve(jspTag);
+ 
+         String relativeFilePath = jspRoot.relativize(jspTagFile).toString();
+-        Converter converter = new JtpConverter(
++        String jte = createConverter(relativeFilePath, readFile(jspTagFile), parserSetup).convert();
++
++        System.out.println(jte);
++
++        checkDependencies(jte);
++
++        String jteTemplate = suggestJteFile(jspTag.replace('\\', '/'));
++        Path jteTemplateFile = jteRoot.resolve(jteTemplate);
++        IoUtils.writeFile(jteTemplateFile, jte);
++
++        replaceUsages(jspTagFile, jteTemplateFile);
++    }
++
++    public JspMigrationPlan planTags(Collection<String> jspTags, Consumer<Converter> parserSetup) {
++        if (jspTags == null || jspTags.isEmpty()) {
++            throw new IllegalArgumentException("At least one JSP tag is required.");
++        }
++
++        Path normalizedJspRoot = jspRoot.toAbsolutePath().normalize();
++        Path normalizedJteRoot = jteRoot.toAbsolutePath().normalize();
++        List<Path> selectedTags = normalizeSelectedTags(jspTags, normalizedJspRoot);
++        Map<Path, Path> destinations = preflightDestinations(selectedTags, normalizedJspRoot, normalizedJteRoot);
++
++        Map<Path, byte[]> snapshots = new LinkedHashMap<>();
++        Map<Path, String> virtualFiles = scanJspFiles(normalizedJspRoot, snapshots);
++        Set<Path> usageScannedFiles = new LinkedHashSet<>(virtualFiles.keySet());
++        for (Path selectedTag : selectedTags) {
++            snapshots.put(selectedTag, readBytes(selectedTag));
++            virtualFiles.put(selectedTag, readFile(selectedTag));
++        }
++
++        Map<String, Path> tagsByName = indexSelectedTagNames(selectedTags);
++        Map<Path, Set<Path>> dependencies = new LinkedHashMap<>();
++        for (Path selectedTag : selectedTags) {
++            String relativePath = normalizedJspRoot.relativize(selectedTag).toString();
++            JtpConverter converter = createConverter(relativePath, virtualFiles.get(selectedTag), parserSetup);
++
++            Set<Path> selectedDependencies = new TreeSet<>(PATH_ORDER);
++            for (String customTag : converter.findCustomTagReferences()) {
++                Path dependency = tagsByName.get(customTag);
++                if (dependency != null) {
++                    selectedDependencies.add(dependency);
++                }
++            }
++            dependencies.put(selectedTag, selectedDependencies);
++
++            for (URL includedResource : converter.findIncludedFileReferences()) {
++                Path includedPath = resolveIncludedFile(includedResource, normalizedJspRoot);
++                byte[] includedContent = snapshots.get(includedPath);
++                if (includedContent == null) {
++                    includedContent = readBytes(includedPath);
++                    snapshots.put(includedPath, includedContent);
++                }
++                virtualFiles.putIfAbsent(includedPath, new String(includedContent, StandardCharsets.UTF_8));
++            }
++        }
++
++        List<Path> conversionOrder = orderByDependencies(dependencies, normalizedJspRoot);
++        Map<Path, String> writes = new LinkedHashMap<>();
++        for (Path selectedTag : conversionOrder) {
++            String relativePath = normalizedJspRoot.relativize(selectedTag).toString();
++            String jte = createConverter(
++                    relativePath,
++                    virtualFiles.get(selectedTag),
++                    parserSetup,
++                    createVirtualResources(virtualFiles)
++            ).convert();
++            checkBatchDependencies(jte);
++            writes.put(destinations.get(selectedTag), jte);
++
++            virtualFiles.remove(selectedTag);
++            Path destination = destinations.get(selectedTag);
++            for (Map.Entry<Path, String> virtualFile : virtualFiles.entrySet()) {
++                virtualFile.setValue(rewriteUsages(selectedTag, destination, virtualFile.getValue()));
++            }
++        }
++
++        for (Path usageScannedFile : usageScannedFiles) {
++            String finalContent = virtualFiles.get(usageScannedFile);
++            if (finalContent == null) {
++                continue;
++            }
++
++            String original = new String(snapshots.get(usageScannedFile), StandardCharsets.UTF_8);
++            if (!original.equals(finalContent)) {
++                writes.put(usageScannedFile, finalContent);
++            }
++        }
++
++        Set<Path> absentDestinations = new LinkedHashSet<>(destinations.values());
++        return new JspMigrationPlan(conversionOrder, writes, conversionOrder, snapshots, absentDestinations);
++    }
++
++    private List<Path> normalizeSelectedTags(Collection<String> jspTags, Path normalizedJspRoot) {
++        Set<Path> unique = new HashSet<>();
++        List<Path> result = new ArrayList<>();
++
++        for (String jspTag : jspTags) {
++            if (jspTag == null || jspTag.trim().isEmpty()) {
++                throw new IllegalArgumentException("JSP tag paths must not be null or blank.");
++            }
++
++            Path input = jspRoot.getFileSystem().getPath(jspTag);
++            if (input.isAbsolute()) {
++                throw new IllegalArgumentException("JSP tag paths must be relative to the configured JSP root: " + jspTag);
++            }
++
++            Path selected = normalizedJspRoot.resolve(input).normalize();
++            if (!selected.startsWith(normalizedJspRoot)) {
++                throw new IllegalArgumentException("JSP tag path escapes the configured JSP root: " + jspTag);
++            }
++            if (!unique.add(selected)) {
++                throw new IllegalArgumentException("Duplicate JSP tag path: " + jspTag);
++            }
++            if (!selected.getFileName().toString().endsWith(".tag")) {
++                throw new IllegalArgumentException("Only JSP tag files can be planned: " + jspTag);
++            }
++            if (!Files.isRegularFile(selected, LinkOption.NOFOLLOW_LINKS)) {
++                throw new IllegalArgumentException("JSP tag is missing, non-regular, or symbolic: " + jspTag);
++            }
++
++            result.add(selected);
++        }
++
++        result.sort(PATH_ORDER);
++        return result;
++    }
++
++    private Map<Path, Path> preflightDestinations(List<Path> selectedTags, Path normalizedJspRoot, Path normalizedJteRoot) {
++        Map<Path, Path> result = new LinkedHashMap<>();
++        Map<Path, Path> sourcesByDestination = new HashMap<>();
++
++        for (Path selectedTag : selectedTags) {
++            String relativePath = normalizedJspRoot.relativize(selectedTag).toString().replace('\\', '/');
++            Path destination = normalizedJteRoot.resolve(suggestJteFile(relativePath)).normalize();
++            if (!destination.startsWith(normalizedJteRoot)) {
++                throw new IllegalArgumentException("Generated JTE path escapes the configured JTE root: " + destination);
++            }
++
++            Path previous = sourcesByDestination.put(destination, selectedTag);
++            if (previous != null) {
++                throw new IllegalArgumentException("JSP tags generate the same JTE destination: " + previous + " and " + selectedTag);
++            }
++            if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
++                throw new IllegalArgumentException("Generated JTE destination already exists: " + destination);
++            }
++            result.put(selectedTag, destination);
++        }
++        return result;
++    }
++
++    private Map<Path, String> scanJspFiles(Path normalizedJspRoot, Map<Path, byte[]> snapshots) {
++        Map<Path, String> result = new LinkedHashMap<>();
++        try (Stream<Path> stream = Files.walk(normalizedJspRoot)) {
++            stream
++                    .filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
++                    .filter(this::isJspSource)
++                    .map(path -> path.toAbsolutePath().normalize())
++                    .sorted(PATH_ORDER)
++                    .forEach(path -> {
++                        byte[] content = readBytes(path);
++                        snapshots.put(path, content);
++                        result.put(path, new String(content, StandardCharsets.UTF_8));
++                    });
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++        return result;
++    }
++
++    private boolean isJspSource(Path path) {
++        String fileName = path.toString();
++        return fileName.endsWith(".jsp") || fileName.endsWith(".jsp.inc") || fileName.endsWith(".tag");
++    }
++
++    private Map<String, Path> indexSelectedTagNames(List<Path> selectedTags) {
++        Map<String, Path> result = new HashMap<>();
++        for (Path selectedTag : selectedTags) {
++            String tagName = extractTagPrefix(selectedTag).substring(1);
++            Path previous = result.put(tagName, selectedTag);
++            if (previous != null) {
++                throw new IllegalArgumentException("Selected JSP tags have the same invocation name: " + previous + " and " + selectedTag);
++            }
++        }
++        return result;
++    }
++
++    private List<Path> orderByDependencies(Map<Path, Set<Path>> dependencies, Path normalizedJspRoot) {
++        Map<Path, Set<Path>> remaining = new LinkedHashMap<>();
++        dependencies.forEach((path, values) -> remaining.put(path, new TreeSet<>(values)));
++
++        TreeSet<Path> ready = new TreeSet<>(PATH_ORDER);
++        remaining.forEach((path, values) -> {
++            if (values.isEmpty()) {
++                ready.add(path);
++            }
++        });
++
++        List<Path> result = new ArrayList<>();
++        while (!ready.isEmpty()) {
++            Path converted = ready.pollFirst();
++            result.add(converted);
++            remaining.remove(converted);
++
++            for (Map.Entry<Path, Set<Path>> candidate : remaining.entrySet()) {
++                if (candidate.getValue().remove(converted) && candidate.getValue().isEmpty()) {
++                    ready.add(candidate.getKey());
++                }
++            }
++        }
++
++        if (!remaining.isEmpty()) {
++            throw new IllegalArgumentException("JSP tag dependency cycle: " + findCycle(remaining, normalizedJspRoot));
++        }
++        return result;
++    }
++
++    private String findCycle(Map<Path, Set<Path>> dependencies, Path normalizedJspRoot) {
++        Set<Path> visited = new HashSet<>();
++        List<Path> stack = new ArrayList<>();
++        Set<Path> active = new HashSet<>();
++
++        TreeSet<Path> sortedPaths = new TreeSet<>(PATH_ORDER);
++        sortedPaths.addAll(dependencies.keySet());
++        for (Path path : sortedPaths) {
++            String cycle = findCycle(path, dependencies, normalizedJspRoot, visited, stack, active);
++            if (cycle != null) {
++                return cycle;
++            }
++        }
++        return "unknown";
++    }
++
++    private String findCycle(
++            Path path,
++            Map<Path, Set<Path>> dependencies,
++            Path normalizedJspRoot,
++            Set<Path> visited,
++            List<Path> stack,
++            Set<Path> active
++    ) {
++        if (active.contains(path)) {
++            int start = stack.indexOf(path);
++            List<String> cycle = new ArrayList<>();
++            for (int i = start; i < stack.size(); i++) {
++                cycle.add(normalizedJspRoot.relativize(stack.get(i)).toString().replace('\\', '/'));
++            }
++            cycle.add(normalizedJspRoot.relativize(path).toString().replace('\\', '/'));
++            return String.join(" -> ", cycle);
++        }
++        if (!visited.add(path)) {
++            return null;
++        }
++
++        active.add(path);
++        stack.add(path);
++        Set<Path> sortedDependencies = new TreeSet<>(PATH_ORDER);
++        sortedDependencies.addAll(dependencies.getOrDefault(path, Collections.emptySet()));
++        for (Path dependency : sortedDependencies) {
++            String cycle = findCycle(dependency, dependencies, normalizedJspRoot, visited, stack, active);
++            if (cycle != null) {
++                return cycle;
++            }
++        }
++        stack.remove(stack.size() - 1);
++        active.remove(path);
++        return null;
++    }
++
++    private Path resolveIncludedFile(URL resource, Path normalizedJspRoot) {
++        try {
++            if (!"file".equalsIgnoreCase(resource.getProtocol())) {
++                throw new IllegalArgumentException("Included JSP resources must use file URLs for transactional planning: " + resource);
++            }
++            Path path = Paths.get(resource.toURI()).toAbsolutePath().normalize();
++            if (!path.startsWith(normalizedJspRoot)) {
++                throw new IllegalArgumentException("Included JSP resource is outside the configured JSP root: " + resource);
++            }
++            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
++                throw new IllegalArgumentException("Included JSP resource is missing or non-regular: " + resource);
++            }
++            return path;
++        } catch (URISyntaxException e) {
++            throw new IllegalArgumentException("Invalid included JSP resource: " + resource, e);
++        }
++    }
++
++    private byte[] readBytes(Path path) {
++        try {
++            return Files.readAllBytes(path);
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
++    private JtpConverter createConverter(String relativeFilePath, String input, Consumer<Converter> parserSetup) {
++        return createConverter(relativeFilePath, input, parserSetup, Collections.emptyMap());
++    }
++
++    private JtpConverter createConverter(
++            String relativeFilePath,
++            String input,
++            Consumer<Converter> parserSetup,
++            Map<String, byte[]> virtualResources
++    ) {
++        JtpConverter converter = new JtpConverter(
+                 relativeFilePath,
+-                readFile(jspTagFile).replace("\r", "").getBytes(),
++                input.replace("\r", "").getBytes(StandardCharsets.UTF_8),
+                 getResourceBase(),
+                 relativeFilePath.endsWith(".tag"),
+-                new ConverterOutput()
++                new ConverterOutput(),
++                virtualResources
+         );
+ 
+         converter.register("c:if", new JspIfConverter());
+@@ -62,33 +373,48 @@ public class JspToJteConverter {
+         converter.register("c:when", new JspWhenConverter());
+         converter.register("c:otherwise", new JspOtherwiseConverter());
+         converter.register("c:set", new JspSetConverter());
+-
+         converter.register("fmt:message", new JstlFmtMessageConverter());
+         converter.register("fmt:param", new JstlFmtParamConverter());
++        converter.register(jteTag, new JspJteConverter());
+ 
+-        converter.register(this.jteTag, new gg.jte.convert.jsp.converter.JspJteConverter());
+-
+-        if (getNotConvertedTags() != null) {
+-            for (String notConvertedTag : getNotConvertedTags()) {
++        String[] notConvertedTags = getNotConvertedTags();
++        if (notConvertedTags != null) {
++            for (String notConvertedTag : notConvertedTags) {
+                 converter.register(notConvertedTag, new JspNoopConverter());
+             }
+         }
+-
+         if (parserSetup != null) {
+             parserSetup.accept(converter);
+         }
++        return converter;
++    }
+ 
+-        String jte = converter.convert();
+-
+-        System.out.println(jte);
+-
+-        checkDependencies(jte);
++    private Map<String, byte[]> createVirtualResources(Map<Path, String> virtualFiles) {
++        Map<String, byte[]> result = new HashMap<>();
++        try {
++            URL resourceBase = getResourceBase();
++            if (!"file".equalsIgnoreCase(resourceBase.getProtocol())) {
++                return result;
++            }
+ 
+-        String jteTemplate = suggestJteFile(jspTag.replace('\\', '/'));
+-        Path jteTemplateFile = jteRoot.resolve(jteTemplate);
+-        IoUtils.writeFile(jteTemplateFile, jte);
++            Path resourceRoot = Paths.get(resourceBase.toURI()).toAbsolutePath().normalize();
++            for (Map.Entry<Path, String> virtualFile : virtualFiles.entrySet()) {
++                if (virtualFile.getKey().startsWith(resourceRoot)) {
++                    result.put(
++                            virtualFile.getKey().toUri().toURL().toExternalForm(),
++                            virtualFile.getValue().getBytes(StandardCharsets.UTF_8)
++                    );
++                }
++            }
++            return result;
++        } catch (MalformedURLException | URISyntaxException e) {
++            throw new IllegalArgumentException("Invalid JSP resource base.", e);
++        }
++    }
+ 
+-        replaceUsages(jspTagFile, jteTemplateFile);
++    private void checkBatchDependencies(String jteCode) {
++        String structuralCode = JSP_COMMENTS.matcher(jteCode).replaceAll("");
++        checkDependencies(structuralCode);
+     }
+ 
+     @SuppressWarnings("unused")
+@@ -121,15 +447,29 @@ public class JspToJteConverter {
+     }
+ 
+     private void replaceUsages(Path jspFile, String oldJspTagPrefix, String oldJspTagClosing, String newJteFile) {
+-        boolean modified = false;
++        String original = IoUtils.readFile(jspFile);
++        String rewritten = rewriteUsages(oldJspTagPrefix, oldJspTagClosing, newJteFile, original);
++        if (!original.equals(rewritten)) {
++            IoUtils.writeFile(jspFile, rewritten);
++        }
++    }
+ 
+-        StringBuilder jspContent = new StringBuilder(IoUtils.readFile(jspFile));
++    private String rewriteUsages(Path jspTag, Path jteTag, String jspContent) {
++        String oldJspTagPrefix = extractTagPrefix(jspTag);
++        String oldJspTagClosing = "</" + oldJspTagPrefix.substring(1) + ">";
++        String newJteFile = jteRoot.toAbsolutePath().normalize().relativize(jteTag).toString().replace('\\', '/');
++        return rewriteUsages(oldJspTagPrefix, oldJspTagClosing, newJteFile, jspContent);
++    }
+ 
++    private String rewriteUsages(String oldJspTagPrefix, String oldJspTagClosing, String newJteFile, String content) {
++        boolean modified = false;
++        StringBuilder jspContent = new StringBuilder(content);
+         int lastIndex = 0;
+ 
+         do {
+             lastIndex = jspContent.indexOf(oldJspTagPrefix, lastIndex);
+-            if (lastIndex >= 0 && lastIndex < jspContent.length()) {
++            int afterPrefix = lastIndex + oldJspTagPrefix.length();
++            if (lastIndex >= 0 && afterPrefix < jspContent.length()) {
+                 char character = jspContent.charAt(lastIndex + oldJspTagPrefix.length());
+                 if (Character.isWhitespace(character) || character == '/' || character == '>') {
+                     jspContent.replace(lastIndex, lastIndex + oldJspTagPrefix.length(), "<" + jteTag + " jte=\"" + newJteFile + "\"");
+@@ -154,9 +494,7 @@ public class JspToJteConverter {
+             }
+         } while (true);
+ 
+-        if (modified) {
+-            IoUtils.writeFile(jspFile, jspContent.toString());
+-        }
++        return modified ? jspContent.toString() : content;
+     }
+ 
+     private String extractTagPrefix(Path jspTag) {
+diff --git a/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/StaleJspMigrationPlanException.java b/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/StaleJspMigrationPlanException.java
+new file mode 100644
+index 00000000..8097b1c2
+--- /dev/null
++++ b/jte-jsp-converter/src/main/java/gg/jte/convert/jsp/StaleJspMigrationPlanException.java
+@@ -0,0 +1,18 @@
++package gg.jte.convert.jsp;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.List;
++
++public final class StaleJspMigrationPlanException extends IOException {
++    private final List<Path> changedPaths;
++
++    StaleJspMigrationPlanException(List<Path> changedPaths) {
++        super("JSP migration plan is stale: " + changedPaths);
++        this.changedPaths = List.copyOf(changedPaths);
++    }
++
++    public List<Path> getChangedPaths() {
++        return changedPaths;
++    }
++}
+diff --git a/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpConverter.java b/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpConverter.java
+index 5496eb32..2a2f91bb 100644
+--- a/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpConverter.java
++++ b/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpConverter.java
+@@ -24,21 +24,37 @@ public class JtpConverter extends Node.Visitor implements Converter {
+     private final URL resourceBase;
+     private final boolean tagFile;
+     private final ConverterOutput output;
++    private final Map<String, byte[]> virtualResources;
+     private final Map<String, CustomTagConverter> converters = new HashMap<>();
+     private final Set<String> inlinedIncludes = new HashSet<>();
+     private final Map<String, EnumSet<JspElementType>> suppressions = new HashMap<>();
+     private final Set<String> imports = new TreeSet<>();
+     private final Set<String> params = new TreeSet<>();
++    private Node.Nodes parsedNodes;
++    private Set<String> referencedCustomTags;
++    private Set<URL> referencedIncludes;
+ 
+     private String prefix;
+     private String lineSeparator = "\n";
+ 
+     public JtpConverter(String relativeFilePath, byte[] input, URL resourceBase, boolean tagFile, ConverterOutput output) {
++        this(relativeFilePath, input, resourceBase, tagFile, output, Collections.emptyMap());
++    }
++
++    public JtpConverter(
++            String relativeFilePath,
++            byte[] input,
++            URL resourceBase,
++            boolean tagFile,
++            ConverterOutput output,
++            Map<String, byte[]> virtualResources
++    ) {
+         this.relativeFilePath = relativeFilePath;
+         this.input = input;
+         this.resourceBase = resourceBase;
+         this.tagFile = tagFile;
+         this.output = output;
++        this.virtualResources = virtualResources;
+     }
+ 
+     @Override
+@@ -74,9 +90,7 @@ public class JtpConverter extends Node.Visitor implements Converter {
+     @Override
+     public String convert() {
+         try {
+-            Node.Nodes nodes = JtpParser.parse(relativeFilePath, input, resourceBase, tagFile);
+-
+-            nodes.visit(this);
++            getParsedNodes().visit(this);
+ 
+             return cleanResult(output.trim().prepend(createPrefix()).toString());
+         } catch (JasperException | IOException e) {
+@@ -84,6 +98,73 @@ public class JtpConverter extends Node.Visitor implements Converter {
+         }
+     }
+ 
++    public Set<String> findCustomTagReferences() {
++        collectTagReferences();
++        return referencedCustomTags;
++    }
++
++    public Set<URL> findIncludedFileReferences() {
++        collectTagReferences();
++        return referencedIncludes;
++    }
++
++    private void collectTagReferences() {
++        if (referencedCustomTags != null) {
++            return;
++        }
++
++        Set<String> customTags = new LinkedHashSet<>();
++        Set<URL> includedFiles = new LinkedHashSet<>();
++
++        try {
++            getParsedNodes().visit(new Node.Visitor() {
++                @Override
++                public void visit(Node.CustomTag n) throws JasperException {
++                    if (isSuppressed(n)) {
++                        return;
++                    }
++
++                    customTags.add(n.getQName());
++                    super.visit(n);
++                }
++
++                @Override
++                public void visit(Node.IncludeDirective n) throws JasperException {
++                    String file = n.getAttributeValue("file");
++                    if (!inlinedIncludes.contains(file)) {
++                        throw new UnsupportedOperationException("Includes are not supported. You should convert it to a tag first, or suppress with addInlinedInclude(\"" + file + "\")");
++                    }
++
++                    includedFiles.add(resolveIncludedResource(n, file));
++                    super.visit(n);
++                }
++            });
++        } catch (JasperException | IOException e) {
++            throw new RuntimeException(e);
++        }
++
++        referencedCustomTags = Collections.unmodifiableSet(customTags);
++        referencedIncludes = Collections.unmodifiableSet(includedFiles);
++    }
++
++    private URL resolveIncludedResource(Node.IncludeDirective include, String file) {
++        try {
++            if (file.startsWith("/")) {
++                return new URL(resourceBase, file.substring(1));
++            }
++            return new URL(include.getStart().getURL(), file);
++        } catch (IOException e) {
++            throw new IllegalArgumentException("Invalid included JSP resource: " + file, e);
++        }
++    }
++
++    private Node.Nodes getParsedNodes() throws JasperException, IOException {
++        if (parsedNodes == null) {
++            parsedNodes = JtpParser.parse(relativeFilePath, input, resourceBase, tagFile, virtualResources);
++        }
++        return parsedNodes;
++    }
++
+     private String createPrefix() {
+         StringBuilder result = new StringBuilder(prefix == null ? "" : prefix);
+ 
+diff --git a/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpParser.java b/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpParser.java
+index 67ff4ac7..143211b0 100644
+--- a/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpParser.java
++++ b/jte-jsp-converter/src/main/java/org/apache/jasper/compiler/JtpParser.java
+@@ -11,17 +11,31 @@ import org.xml.sax.SAXException;
+ import javax.servlet.ServletContext;
+ import javax.servlet.jsp.tagext.TagLibraryInfo;
+ import java.io.*;
++import java.net.URLConnection;
++import java.net.URLStreamHandler;
+ import java.net.URL;
++import java.nio.charset.StandardCharsets;
++import java.util.Collections;
+ import java.util.Map;
+ 
+ public class JtpParser {
+     public static Node.Nodes parse(String relativeFilePath, byte[] input, URL resourceBase, boolean tag) throws JasperException, IOException {
++        return parse(relativeFilePath, input, resourceBase, tag, Collections.emptyMap());
++    }
++
++    public static Node.Nodes parse(
++            String relativeFilePath,
++            byte[] input,
++            URL resourceBase,
++            boolean tag,
++            Map<String, byte[]> virtualResources
++    ) throws JasperException, IOException {
+         JspC jspc = new JspC();
+ 
+         PrintWriter log = new PrintWriter(System.out);
+ 
+         ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+-        ServletContext context = new JspCServletContext(log, resourceBase, classLoader, jspc.isValidateXml(), jspc.isBlockExternal());
++        ServletContext context = new JspCServletContext(log, overlay(resourceBase, virtualResources), classLoader, jspc.isValidateXml(), jspc.isBlockExternal());
+ 
+         TldScanner scanner = new TldScanner(context, true, jspc.isValidateTld(), jspc.isBlockExternal());
+         scanner.setClassLoader(classLoader);
+@@ -217,4 +231,44 @@ public class JtpParser {
+ 
+         return Parser.parse(parserController, jspReader, null, tag, false, null, "UTF-8", "UTF-8", true, false);
+     }
+-}
+\ No newline at end of file
++
++    private static URL overlay(URL resourceBase, Map<String, byte[]> virtualResources) throws IOException {
++        if (virtualResources.isEmpty()) {
++            return resourceBase;
++        }
++
++        Map<String, byte[]> resources = Collections.unmodifiableMap(virtualResources);
++        return new URL(null, resourceBase.toExternalForm(), new URLStreamHandler() {
++            @Override
++            protected URLConnection openConnection(URL url) throws IOException {
++                byte[] content = resources.get(url.toExternalForm());
++                if (content == null) {
++                    return new URL(url.toExternalForm()).openConnection();
++                }
++
++                return new URLConnection(url) {
++                    @Override
++                    public void connect() {
++                        connected = true;
++                    }
++
++                    @Override
++                    public InputStream getInputStream() {
++                        connect();
++                        return new ByteArrayInputStream(content);
++                    }
++
++                    @Override
++                    public long getContentLengthLong() {
++                        return content.length;
++                    }
++
++                    @Override
++                    public String getContentType() {
++                        return "text/plain; charset=" + StandardCharsets.UTF_8.name();
++                    }
++                };
++            }
++        });
++    }
++}

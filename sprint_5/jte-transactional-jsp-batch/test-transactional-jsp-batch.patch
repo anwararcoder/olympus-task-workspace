@@ -1,0 +1,2795 @@
+diff --git a/jte-jsp-converter-jakarta/src/test/java/gg/jte/convert/jsp/FailingPathFileSystem.java b/jte-jsp-converter-jakarta/src/test/java/gg/jte/convert/jsp/FailingPathFileSystem.java
+new file mode 100644
+index 00000000..4a303be1
+--- /dev/null
++++ b/jte-jsp-converter-jakarta/src/test/java/gg/jte/convert/jsp/FailingPathFileSystem.java
+@@ -0,0 +1,456 @@
++package gg.jte.convert.jsp;
++
++import java.io.IOException;
++import java.net.URI;
++import java.nio.channels.SeekableByteChannel;
++import java.nio.file.AccessMode;
++import java.nio.file.CopyOption;
++import java.nio.file.DirectoryStream;
++import java.nio.file.FileStore;
++import java.nio.file.FileSystem;
++import java.nio.file.FileSystemAlreadyExistsException;
++import java.nio.file.FileSystemNotFoundException;
++import java.nio.file.FileSystems;
++import java.nio.file.LinkOption;
++import java.nio.file.OpenOption;
++import java.nio.file.Path;
++import java.nio.file.PathMatcher;
++import java.nio.file.WatchEvent;
++import java.nio.file.WatchKey;
++import java.nio.file.WatchService;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.nio.file.attribute.FileAttribute;
++import java.nio.file.attribute.FileAttributeView;
++import java.nio.file.attribute.UserPrincipalLookupService;
++import java.nio.file.spi.FileSystemProvider;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.Set;
++
++final class FailingPathFileSystem extends FileSystem {
++    private final Provider provider;
++    private final FileSystem delegate = FileSystems.getDefault();
++
++    FailingPathFileSystem(Set<Path> affectedPaths, boolean failRollback) {
++        provider = new Provider(this, affectedPaths, failRollback);
++    }
++
++    Path wrap(Path path) {
++        return new WrappedPath(this, path);
++    }
++
++    @Override
++    public FileSystemProvider provider() {
++        return provider;
++    }
++
++    @Override
++    public void close() {
++    }
++
++    @Override
++    public boolean isOpen() {
++        return true;
++    }
++
++    @Override
++    public boolean isReadOnly() {
++        return false;
++    }
++
++    @Override
++    public String getSeparator() {
++        return delegate.getSeparator();
++    }
++
++    @Override
++    public Iterable<Path> getRootDirectories() {
++        return () -> new WrappingIterator(delegate.getRootDirectories().iterator(), this);
++    }
++
++    @Override
++    public Iterable<FileStore> getFileStores() {
++        return delegate.getFileStores();
++    }
++
++    @Override
++    public Set<String> supportedFileAttributeViews() {
++        return delegate.supportedFileAttributeViews();
++    }
++
++    @Override
++    public Path getPath(String first, String... more) {
++        return wrap(delegate.getPath(first, more));
++    }
++
++    @Override
++    public PathMatcher getPathMatcher(String syntaxAndPattern) {
++        PathMatcher matcher = delegate.getPathMatcher(syntaxAndPattern);
++        return path -> matcher.matches(unwrap(path));
++    }
++
++    @Override
++    public UserPrincipalLookupService getUserPrincipalLookupService() {
++        return delegate.getUserPrincipalLookupService();
++    }
++
++    @Override
++    public WatchService newWatchService() throws IOException {
++        return delegate.newWatchService();
++    }
++
++    private static Path unwrap(Path path) {
++        return path instanceof WrappedPath wrapped ? wrapped.delegate : path;
++    }
++
++    private static final class Provider extends FileSystemProvider {
++        private final FailingPathFileSystem fileSystem;
++        private final FileSystemProvider delegate = FileSystems.getDefault().provider();
++        private final Set<Path> affectedPaths;
++        private final boolean failRollback;
++        private boolean mutated;
++        private boolean primaryFailed;
++        private boolean rollbackFailed;
++
++        private Provider(FailingPathFileSystem fileSystem, Set<Path> affectedPaths, boolean failRollback) {
++            this.fileSystem = fileSystem;
++            this.affectedPaths = affectedPaths.stream()
++                    .map(path -> path.toAbsolutePath().normalize())
++                    .collect(java.util.stream.Collectors.toSet());
++            this.failRollback = failRollback;
++        }
++
++        @Override
++        public String getScheme() {
++            return "fault";
++        }
++
++        @Override
++        public FileSystem newFileSystem(URI uri, Map<String, ?> env) {
++            throw new FileSystemAlreadyExistsException();
++        }
++
++        @Override
++        public FileSystem getFileSystem(URI uri) {
++            return fileSystem;
++        }
++
++        @Override
++        public Path getPath(URI uri) {
++            if (!"file".equalsIgnoreCase(uri.getScheme())) {
++                throw new FileSystemNotFoundException(uri.toString());
++            }
++            return fileSystem.wrap(delegate.getPath(uri));
++        }
++
++        @Override
++        public SeekableByteChannel newByteChannel(Path path, Set<? extends OpenOption> options, FileAttribute<?>... attrs) throws IOException {
++            boolean writes = options.stream().anyMatch(option -> option.toString().contains("WRITE")
++                    || option.toString().contains("APPEND")
++                    || option.toString().contains("CREATE"));
++            if (writes) {
++                beforeMutation(path);
++            }
++            SeekableByteChannel channel = delegate.newByteChannel(unwrap(path), options, attrs);
++            if (writes) {
++                afterMutation(path);
++            }
++            return channel;
++        }
++
++        @Override
++        public DirectoryStream<Path> newDirectoryStream(Path dir, DirectoryStream.Filter<? super Path> filter) throws IOException {
++            DirectoryStream<Path> stream = delegate.newDirectoryStream(
++                    unwrap(dir),
++                    path -> filter.accept(fileSystem.wrap(path))
++            );
++            return new DirectoryStream<>() {
++                @Override
++                public Iterator<Path> iterator() {
++                    return new WrappingIterator(stream.iterator(), fileSystem);
++                }
++
++                @Override
++                public void close() throws IOException {
++                    stream.close();
++                }
++            };
++        }
++
++        @Override
++        public void createDirectory(Path dir, FileAttribute<?>... attrs) throws IOException {
++            beforeMutation(dir);
++            delegate.createDirectory(unwrap(dir), attrs);
++            afterMutation(dir);
++        }
++
++        @Override
++        public void delete(Path path) throws IOException {
++            beforeMutation(path);
++            delegate.delete(unwrap(path));
++            afterMutation(path);
++        }
++
++        @Override
++        public void copy(Path source, Path target, CopyOption... options) throws IOException {
++            beforeMutation(target);
++            delegate.copy(unwrap(source), unwrap(target), options);
++            afterMutation(target);
++        }
++
++        @Override
++        public void move(Path source, Path target, CopyOption... options) throws IOException {
++            beforeMutation(source, target);
++            delegate.move(unwrap(source), unwrap(target), options);
++            afterMutation(source, target);
++        }
++
++        @Override
++        public boolean isSameFile(Path path, Path path2) throws IOException {
++            return delegate.isSameFile(unwrap(path), unwrap(path2));
++        }
++
++        @Override
++        public boolean isHidden(Path path) throws IOException {
++            return delegate.isHidden(unwrap(path));
++        }
++
++        @Override
++        public FileStore getFileStore(Path path) throws IOException {
++            return delegate.getFileStore(unwrap(path));
++        }
++
++        @Override
++        public void checkAccess(Path path, AccessMode... modes) throws IOException {
++            delegate.checkAccess(unwrap(path), modes);
++        }
++
++        @Override
++        public <V extends FileAttributeView> V getFileAttributeView(Path path, Class<V> type, LinkOption... options) {
++            return delegate.getFileAttributeView(unwrap(path), type, options);
++        }
++
++        @Override
++        public <A extends BasicFileAttributes> A readAttributes(Path path, Class<A> type, LinkOption... options) throws IOException {
++            return delegate.readAttributes(unwrap(path), type, options);
++        }
++
++        @Override
++        public Map<String, Object> readAttributes(Path path, String attributes, LinkOption... options) throws IOException {
++            return delegate.readAttributes(unwrap(path), attributes, options);
++        }
++
++        @Override
++        public void setAttribute(Path path, String attribute, Object value, LinkOption... options) throws IOException {
++            delegate.setAttribute(unwrap(path), attribute, value, options);
++        }
++
++        private void beforeMutation(Path... paths) throws IOException {
++            if (!touchesAffectedPath(paths)) {
++                return;
++            }
++            if (!primaryFailed && mutated) {
++                primaryFailed = true;
++                throw new IOException("Injected commit failure");
++            }
++            if (primaryFailed && failRollback && !rollbackFailed) {
++                rollbackFailed = true;
++                throw new IOException("Injected rollback failure");
++            }
++        }
++
++        private void afterMutation(Path... paths) {
++            if (touchesAffectedPath(paths)) {
++                mutated = true;
++            }
++        }
++
++        private boolean touchesAffectedPath(Path... paths) {
++            for (Path path : paths) {
++                if (affectedPaths.contains(unwrap(path).toAbsolutePath().normalize())) {
++                    return true;
++                }
++            }
++            return false;
++        }
++    }
++
++    private static final class WrappedPath implements Path {
++        private final FailingPathFileSystem fileSystem;
++        private final Path delegate;
++
++        private WrappedPath(FailingPathFileSystem fileSystem, Path delegate) {
++            this.fileSystem = fileSystem;
++            this.delegate = delegate;
++        }
++
++        private Path wrap(Path path) {
++            return path == null ? null : fileSystem.wrap(path);
++        }
++
++        @Override
++        public FileSystem getFileSystem() {
++            return fileSystem;
++        }
++
++        @Override
++        public boolean isAbsolute() {
++            return delegate.isAbsolute();
++        }
++
++        @Override
++        public Path getRoot() {
++            return wrap(delegate.getRoot());
++        }
++
++        @Override
++        public Path getFileName() {
++            return delegate.getFileName();
++        }
++
++        @Override
++        public Path getParent() {
++            return wrap(delegate.getParent());
++        }
++
++        @Override
++        public int getNameCount() {
++            return delegate.getNameCount();
++        }
++
++        @Override
++        public Path getName(int index) {
++            return delegate.getName(index);
++        }
++
++        @Override
++        public Path subpath(int beginIndex, int endIndex) {
++            return delegate.subpath(beginIndex, endIndex);
++        }
++
++        @Override
++        public boolean startsWith(Path other) {
++            return delegate.startsWith(unwrap(other));
++        }
++
++        @Override
++        public boolean startsWith(String other) {
++            return delegate.startsWith(other);
++        }
++
++        @Override
++        public boolean endsWith(Path other) {
++            return delegate.endsWith(unwrap(other));
++        }
++
++        @Override
++        public boolean endsWith(String other) {
++            return delegate.endsWith(other);
++        }
++
++        @Override
++        public Path normalize() {
++            return wrap(delegate.normalize());
++        }
++
++        @Override
++        public Path resolve(Path other) {
++            return wrap(delegate.resolve(unwrap(other)));
++        }
++
++        @Override
++        public Path resolve(String other) {
++            return wrap(delegate.resolve(other));
++        }
++
++        @Override
++        public Path resolveSibling(Path other) {
++            return wrap(delegate.resolveSibling(unwrap(other)));
++        }
++
++        @Override
++        public Path resolveSibling(String other) {
++            return wrap(delegate.resolveSibling(other));
++        }
++
++        @Override
++        public Path relativize(Path other) {
++            return delegate.relativize(unwrap(other));
++        }
++
++        @Override
++        public URI toUri() {
++            return delegate.toUri();
++        }
++
++        @Override
++        public Path toAbsolutePath() {
++            return wrap(delegate.toAbsolutePath());
++        }
++
++        @Override
++        public Path toRealPath(LinkOption... options) throws IOException {
++            return wrap(delegate.toRealPath(options));
++        }
++
++        @Override
++        public java.io.File toFile() {
++            return delegate.toFile();
++        }
++
++        @Override
++        public WatchKey register(WatchService watcher, WatchEvent.Kind<?>[] events, WatchEvent.Modifier... modifiers) throws IOException {
++            return delegate.register(watcher, events, modifiers);
++        }
++
++        @Override
++        public WatchKey register(WatchService watcher, WatchEvent.Kind<?>... events) throws IOException {
++            return delegate.register(watcher, events);
++        }
++
++        @Override
++        public Iterator<Path> iterator() {
++            return new WrappingIterator(delegate.iterator(), fileSystem);
++        }
++
++        @Override
++        public int compareTo(Path other) {
++            return delegate.compareTo(unwrap(other));
++        }
++
++        @Override
++        public boolean equals(Object other) {
++            return other instanceof WrappedPath path && delegate.equals(path.delegate);
++        }
++
++        @Override
++        public int hashCode() {
++            return delegate.hashCode();
++        }
++
++        @Override
++        public String toString() {
++            return delegate.toString();
++        }
++    }
++
++    private static final class WrappingIterator implements Iterator<Path> {
++        private final Iterator<Path> delegate;
++        private final FailingPathFileSystem fileSystem;
++
++        private WrappingIterator(Iterator<Path> delegate, FailingPathFileSystem fileSystem) {
++            this.delegate = delegate;
++            this.fileSystem = fileSystem;
++        }
++
++        @Override
++        public boolean hasNext() {
++            return delegate.hasNext();
++        }
++
++        @Override
++        public Path next() {
++            return fileSystem.wrap(delegate.next());
++        }
++    }
++}
+diff --git a/jte-jsp-converter-jakarta/src/test/java/gg/jte/convert/jsp/TransactionalJspBatchJakarta_4f13c2_Test.java b/jte-jsp-converter-jakarta/src/test/java/gg/jte/convert/jsp/TransactionalJspBatchJakarta_4f13c2_Test.java
+new file mode 100644
+index 00000000..6e33bb5e
+--- /dev/null
++++ b/jte-jsp-converter-jakarta/src/test/java/gg/jte/convert/jsp/TransactionalJspBatchJakarta_4f13c2_Test.java
+@@ -0,0 +1,697 @@
++package gg.jte.convert.jsp;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.io.IOException;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.net.URL;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.attribute.FileTime;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.EnumSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.Consumer;
++import java.util.function.Function;
++import java.util.stream.Stream;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++class TransactionalJspBatchJakarta_4f13c2_Test {
++    @TempDir
++    Path tempDir;
++
++    private Path jspRoot;
++    private Path jteRoot;
++    private TestConverter converter;
++
++    @BeforeEach
++    void setUp() throws Exception {
++        jspRoot = tempDir.resolve("WEB-INF");
++        jteRoot = tempDir.resolve("jte");
++        writeTagLibrary();
++        converter = new TestConverter(jspRoot, jteRoot, tempDir.toUri().toURL());
++    }
++
++    @Test
++    void jakartaArtifactPlansAndCommitsTheSameBatchBehavior() throws Throwable {
++        tag("leaf", "leaf");
++        tag("parent", "<my:leaf/>");
++        tag("root", "<my:parent/>");
++        Path usage = write(jspRoot.resolve("usage.jsp"), "<my:root/>");
++
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag", "my/parent.tag"), noPrefix());
++
++        assertThat(order(plan)).containsExactly(tagPath("leaf"), tagPath("parent"), tagPath("root"));
++        assertThat(writes(plan).get(jteRoot.resolve("my/parent.jte"))).contains("@template.my.leaf(");
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte"))).contains("@template.my.parent(");
++        assertThat(jteRoot.resolve("my/leaf.jte")).doesNotExist();
++        assertThat(tagPath("leaf")).exists();
++
++        commit(plan);
++
++        assertThat(tagPath("leaf")).doesNotExist();
++        assertThat(tagPath("parent")).doesNotExist();
++        assertThat(tagPath("root")).doesNotExist();
++        assertThat(usage).content().contains("<my:jte jte=\"my/root.jte\"");
++        assertNoTransactionFiles();
++    }
++
++    @Test
++    void jakartaArtifactUsesVirtualIncludedContent() throws Throwable {
++        tag("leaf", "leaf");
++        tag("root", "<%@ include file=\"/WEB-INF/fragment.jsp.inc\" %>");
++        Path fragment = write(jspRoot.resolve("fragment.jsp.inc"), "<my:leaf/>");
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addInlinedInclude("/WEB-INF/fragment.jsp.inc");
++        };
++
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), setup);
++
++        assertThat(order(plan)).containsExactly(tagPath("leaf"), tagPath("root"));
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte"))).contains("@template.my.leaf(");
++        assertThat(fragment).content().contains("<my:leaf");
++    }
++
++    @Test
++    void jakartaArtifactIgnoresTagTextInComments() throws Throwable {
++        tag("a", "<%-- <my:z/> --%>a");
++        tag("z", "z");
++
++        Object plan = plan(List.of("my/z.tag", "my/a.tag"), noPrefix());
++
++        assertThat(order(plan)).containsExactly(tagPath("a"), tagPath("z"));
++    }
++
++    @Test
++    void jakartaArtifactIgnoresCommentedInvocationsInsideApprovedIncludes() throws Throwable {
++        tag("a", "<%@ include file=\"/WEB-INF/fragment.jsp.inc\" %>a");
++        tag("z", "<my:a/>");
++        write(jspRoot.resolve("fragment.jsp.inc"), "<%-- <my:z/> --%>");
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addInlinedInclude("/WEB-INF/fragment.jsp.inc");
++        };
++
++        Object plan = plan(List.of("my/z.tag", "my/a.tag"), setup);
++
++        assertThat(order(plan)).containsExactly(tagPath("a"), tagPath("z"));
++    }
++
++    @Test
++    void jakartaArtifactSurfacesALateParserSetupFailureUnchanged() throws Exception {
++        tag("leaf", "leaf");
++        tag("root", "<my:leaf/>");
++        Map<Path, String> before = snapshot(tempDir);
++        IllegalStateException sentinel = new IllegalStateException("late setup failure");
++        AtomicInteger setups = new AtomicInteger();
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            if (setups.incrementAndGet() == 2) {
++                throw sentinel;
++            }
++        };
++
++        assertThat(catchPlanFailure(List.of("my/root.tag", "my/leaf.tag"), setup)).isSameAs(sentinel);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void jakartaPlannedTemplateMatchesOneTagConversionForAStatefulSetupConverter() throws Throwable {
++        tag("root", "<my:mark/>");
++        tag("leaf", "leaf");
++
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), markSetup(new AtomicInteger()));
++        String planned = writes(plan).get(jteRoot.resolve("my/root.jte"));
++
++        converter.convertTag("my/root.tag", markSetup(new AtomicInteger()));
++
++        assertThat(planned).isEqualTo(Files.readString(jteRoot.resolve("my/root.jte"), StandardCharsets.UTF_8));
++    }
++
++    @Test
++    void jakartaArtifactCommitDoesNotWriteThroughAUsageSymlinkLeavingTheJspRoot() throws Throwable {
++        tag("leaf", "leaf");
++        Path outside = write(tempDir.resolve("outside.jsp"), "<my:leaf/>");
++        byte[] before = Files.readAllBytes(outside);
++        Files.createDirectories(jspRoot);
++        Files.createSymbolicLink(jspRoot.resolve("linked.jsp"), outside);
++
++        Object plan = null;
++        try {
++            plan = plan(List.of("my/leaf.tag"), noPrefix());
++        } catch (RuntimeException rejected) {
++            // Refusing the linked usage file is an acceptable outcome too.
++        }
++        if (plan != null) {
++            assertThat(writes(plan)).doesNotContainKey(outside);
++            commit(plan);
++        }
++
++        assertThat(Files.readAllBytes(outside))
++                .as("a file outside the JSP root is never written, whether the link is skipped or refused")
++                .isEqualTo(before);
++    }
++
++    @Test
++    void jakartaArtifactUnchangedScannedFileWithMalformedBytesIsNotAWrite() throws Throwable {
++        tag("leaf", "leaf");
++        Path untouched = jspRoot.resolve("untouched.jsp");
++        byte[] malformed = {'p', 'l', 'a', 'i', 'n', (byte) 0xC3, '('};
++        Files.createDirectories(untouched.getParent());
++        Files.write(untouched, malformed);
++
++        Object plan = plan(List.of("my/leaf.tag"), noPrefix());
++
++        assertThat(writes(plan)).doesNotContainKey(untouched);
++        commit(plan);
++
++        assertThat(Files.readAllBytes(untouched)).isEqualTo(malformed);
++    }
++
++    private Consumer<Converter> markSetup(AtomicInteger conversions) {
++        return value -> {
++            value.setPrefix("");
++            value.register("my:mark", (jtp, tag, output, bodyConverter) ->
++                    output.append("mark-" + conversions.incrementAndGet()));
++        };
++    }
++
++    @Test
++    void jakartaArtifactDetectsSameTimestampContentChanges() throws Throwable {
++        Path selected = tag("a", "original");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        FileTime timestamp = Files.getLastModifiedTime(selected);
++        write(selected, header() + "changed");
++        Files.setLastModifiedTime(selected, timestamp);
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure.getClass().getSimpleName()).isEqualTo("StaleJspMigrationPlanException");
++        assertThat(new ArrayList<>(collection(failure, "getChangedPaths"))).containsExactly(selected);
++        assertThat(jteRoot.resolve("my/a.jte")).doesNotExist();
++    }
++
++    @Test
++    void jakartaArtifactRejectsInvalidSelectionsWithoutMutation() throws Exception {
++        Path real = tag("a", "a");
++        write(jspRoot.resolve("page.jsp"), "plain");
++        Files.createDirectories(jspRoot.resolve("my/directory.tag"));
++        Map<Path, String> before = snapshot(tempDir);
++
++        assertThat(catchPlanFailure(null)).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/a.tag", "my/../my/a.tag")))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("../outside.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of(real.toString()))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/directory.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/page.jsp"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/missing.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of(" "))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(Collections.singletonList(null))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of())).isInstanceOf(IllegalArgumentException.class);
++
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void jakartaArtifactChecksUnchangedScannedFilesForStaleness() throws Throwable {
++        tag("a", "a");
++        Path scanned = write(jspRoot.resolve("unchanged.jsp"), "plain");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        write(scanned, "changed");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure.getClass().getSimpleName()).isEqualTo("StaleJspMigrationPlanException");
++        assertThat(new ArrayList<>(collection(failure, "getChangedPaths"))).containsExactly(scanned);
++        assertThat(tagPath("a")).exists();
++        assertThat(jteRoot.resolve("my/a.jte")).doesNotExist();
++    }
++
++    @Test
++    void jakartaArtifactRejectsExistingDestinationDuringPlanning() throws Exception {
++        tag("a", "a");
++        Path destination = write(jteRoot.resolve("my/a.jte"), "owned");
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(destination).content().isEqualTo("owned");
++        assertThat(tagPath("a")).exists();
++    }
++
++    @Test
++    void jakartaArtifactRejectsCyclesAndUnresolvedTagsWithoutMutation() throws Exception {
++        tag("a", "<my:z/>");
++        tag("z", "<my:a/>");
++        tag("leaf", "<my:external/>");
++        Map<Path, String> before = snapshot(tempDir);
++
++        Throwable cycle = catchPlanFailure(List.of("my/z.tag", "my/a.tag"));
++        assertThat(cycle).isInstanceOf(RuntimeException.class);
++        assertThat(cycle.getMessage())
++                .isEqualTo( catchPlanFailure(List.of("my/a.tag", "my/z.tag")).getMessage() )
++                .contains("my/a.tag")
++                .contains("my/z.tag");
++
++        assertThat(catchPlanFailure(List.of("my/leaf.tag"))).isInstanceOf(RuntimeException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void jakartaArtifactUsesLexicalReadyOrder() throws Throwable {
++        tag("a", "<my:z/>");
++        tag("leaf", "leaf");
++        tag("z", "z");
++
++        Object plan = plan(List.of("my/a.tag", "my/z.tag", "my/leaf.tag"), noPrefix());
++
++        assertThat(order(plan)).containsExactly(tagPath("leaf"), tagPath("z"), tagPath("a"));
++    }
++
++    @Test
++    void jakartaArtifactRejectsAnApprovedIncludeOutsideTheJspRoot() throws Exception {
++        tag("root", "<%@ include file=\"/outside.jsp.inc\" %>");
++        write(tempDir.resolve("outside.jsp.inc"), "outside");
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addInlinedInclude("/outside.jsp.inc");
++        };
++
++        assertThat(catchPlanFailure(List.of("my/root.tag"), setup))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(jteRoot.resolve("my/root.jte")).doesNotExist();
++    }
++
++    @Test
++    void jakartaArtifactRejectsSelectedSymbolicLinks() throws Exception {
++        Path real = tag("a", "a");
++        Files.createSymbolicLink(jspRoot.resolve("my/link.tag"), real.getFileName());
++
++        assertThat(catchPlanFailure(List.of("my/link.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(real).exists();
++    }
++
++    @Test
++    void jakartaArtifactRejectsAmbiguousNamesAndCollidingDestinations() throws Exception {
++        write(jspRoot.resolve("one/my/a.tag"), header() + "one");
++        write(jspRoot.resolve("two/my/a.tag"), header() + "two");
++        write(jspRoot.resolve("my/a-b.tag"), header() + "dashed");
++        write(jspRoot.resolve("my/aB.tag"), header() + "camel");
++
++        assertThat(catchPlanFailure(List.of("one/my/a.tag", "two/my/a.tag")))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/a-b.tag", "my/aB.tag")))
++                .isInstanceOf(IllegalArgumentException.class);
++    }
++
++    @Test
++    void jakartaArtifactRejectsAnExistingDirectoryDestination() throws Exception {
++        tag("a", "a");
++        Path destination = jteRoot.resolve("my/a.jte");
++        Files.createDirectories(destination);
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(destination).isDirectory();
++    }
++
++    @Test
++    void jakartaArtifactTreatsATimestampOnlyChangeAsCurrent() throws Throwable {
++        Path selected = tag("a", "a");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        Files.setLastModifiedTime(
++                selected,
++                FileTime.fromMillis(Files.getLastModifiedTime(selected).toMillis() - 60_000)
++        );
++
++        commit(plan);
++
++        assertThat(selected).doesNotExist();
++        assertThat(jteRoot.resolve("my/a.jte")).content().contains("a");
++    }
++
++    @Test
++    void jakartaArtifactAppliesSuppressionsAndNotConvertedTags() throws Throwable {
++        tag("a", "<my:z/>");
++        tag("z", "z");
++        tag("leaf", "<my:external/>");
++        converter.notConvertedTags = new String[]{"my:external"};
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addSuppressions("my/a.tag", EnumSet.of(JspElementType.CustomTag));
++        };
++
++        Object plan = plan(List.of("my/z.tag", "my/a.tag", "my/leaf.tag"), setup);
++
++        assertThat(order(plan)).containsExactly(tagPath("a"), tagPath("leaf"), tagPath("z"));
++        assertThat(writes(plan).get(jteRoot.resolve("my/leaf.jte"))).contains("<my:external>");
++    }
++
++    @Test
++    void jakartaArtifactReportsEveryStaleCategoryTogether() throws Throwable {
++        Path selected = tag("a", "a");
++        Path usage = write(jspRoot.resolve("usage.jsp"), "<my:a/>");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        write(selected, header() + "rewritten");
++        write(usage, "changed");
++        Path destination = write(jteRoot.resolve("my/a.jte"), "concurrent");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure.getClass().getSimpleName()).isEqualTo("StaleJspMigrationPlanException");
++        assertThat(new ArrayList<>(collection(failure, "getChangedPaths")))
++                .containsExactlyElementsOf(Stream.of(selected, usage, destination).sorted().toList());
++        assertThat(destination).content().isEqualTo("concurrent");
++    }
++
++    @Test
++    void jakartaArtifactRollbackRestoresExactBytesAndAttachesRollbackFailures() throws Throwable {
++        tag("a", "a");
++        Path usage = jspRoot.resolve("usage.jsp");
++        byte[] original = {'<', 'm', 'y', ':', 'a', '/', '>', (byte) 0xC3, '('};
++        Files.createDirectories(usage.getParent());
++        Files.write(usage, original);
++        Set<Path> affected = Set.of(usage, tagPath("a"));
++        FailingPathFileSystem fileSystem = new FailingPathFileSystem(affected, true);
++        converter = new TestConverter(fileSystem.wrap(jspRoot), fileSystem.wrap(jteRoot), tempDir.toUri().toURL());
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure).isInstanceOf(IOException.class).hasMessageContaining("Injected commit failure");
++        assertThat(suppressedMessages(failure)).anyMatch(message -> message.contains("Injected rollback failure"));
++        assertThat(Files.readAllBytes(usage)).isEqualTo(original);
++        assertThat(tagPath("a")).exists();
++    }
++
++    @Test
++    void jakartaArtifactRejectsAnOutputSuggestedOutsideTheJteRoot() throws Exception {
++        tag("a", "a");
++        converter.outputName = ignored -> "../outside.jte";
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(tempDir.resolve("outside.jte")).doesNotExist();
++    }
++
++    @Test
++    void jakartaArtifactRejectsADanglingDestinationSymlink() throws Exception {
++        tag("a", "a");
++        Path destination = jteRoot.resolve("my/a.jte");
++        Files.createDirectories(destination.getParent());
++        Files.createSymbolicLink(destination, Path.of("missing-target.jte"));
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"))).isInstanceOf(IllegalArgumentException.class);
++        assertThat(tagPath("a")).exists();
++        assertThat(destination).isSymbolicLink();
++    }
++
++    @Test
++    void jakartaArtifactCommitsPlannedContentAsUtf8Bytes() throws Throwable {
++        String beyondAscii = "\u00e9\u4e2d\u00df";
++        tag("leaf", "leaf " + beyondAscii);
++        Path usage = write(jspRoot.resolve("page.jsp"), "<my:leaf/> " + beyondAscii);
++
++        Object plan = plan(List.of("my/leaf.tag"), noPrefix());
++
++        assertThat(writes(plan).get(jteRoot.resolve("my/leaf.jte"))).contains(beyondAscii);
++        assertThat(writes(plan).get(usage)).contains(beyondAscii);
++
++        commit(plan);
++
++        for (Map.Entry<Path, String> write : writes(plan).entrySet()) {
++            assertThat(Files.readAllBytes(write.getKey()))
++                    .as("committed bytes of %s", write.getKey())
++                    .isEqualTo(write.getValue().getBytes(StandardCharsets.UTF_8));
++        }
++    }
++
++    @Test
++    void jakartaArtifactRollbackRemovesDirectoriesItCreated() throws Throwable {
++        tag("leaf", "leaf");
++        tag("root", "<my:leaf/>");
++        Path usage = write(jspRoot.resolve("usage.jsp"), "<my:root/>");
++        Map<Path, String> before = snapshot(tempDir);
++        Set<Path> affected = Set.of(
++                tagPath("leaf"),
++                tagPath("root"),
++                jteRoot.resolve("my/leaf.jte"),
++                jteRoot.resolve("my/root.jte"),
++                usage
++        );
++        FailingPathFileSystem fileSystem = new FailingPathFileSystem(affected, false);
++        converter = new TestConverter(fileSystem.wrap(jspRoot), fileSystem.wrap(jteRoot), tempDir.toUri().toURL());
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), noPrefix());
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure).isInstanceOf(IOException.class).hasMessageContaining("Injected commit failure");
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++        assertThat(jteRoot).doesNotExist();
++    }
++
++    @Test
++    void jakartaArtifactCollectionsAreImmutable() throws Throwable {
++        tag("a", "a");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++
++        assertThatThrownBy(() -> collection(plan, "getConversionOrder").clear())
++                .isInstanceOf(UnsupportedOperationException.class);
++        assertThatThrownBy(() -> collection(plan, "getDeletes").clear())
++                .isInstanceOf(UnsupportedOperationException.class);
++        assertThatThrownBy(() -> writes(plan).clear()).isInstanceOf(UnsupportedOperationException.class);
++    }
++
++    @Test
++    void jakartaArtifactRollsBackWhenLaterDestinationParentIsBlocked() throws Throwable {
++        Path first = write(jspRoot.resolve("aaa/a.tag"), header() + "first");
++        Path later = write(jspRoot.resolve("zzz/root.tag"), header() + "later");
++        Object plan = plan(List.of("zzz/root.tag", "aaa/a.tag"), noPrefix());
++        Path blocker = write(jteRoot.resolve("zzz"), "unrelated blocker");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure).isInstanceOf(IOException.class);
++        assertThat(first).content().contains("first");
++        assertThat(later).content().contains("later");
++        assertThat(jteRoot.resolve("aaa/a.jte")).doesNotExist();
++        assertThat(blocker).content().isEqualTo("unrelated blocker");
++    }
++
++    @Test
++    void jakartaArtifactAppliesSubclassHooksToEveryConversion() throws Throwable {
++        Path leaf = tag("leaf", "disk");
++        tag("root", "<my:leaf/>");
++        converter.readOverrides.put(leaf.toAbsolutePath().normalize(), header() + "from-hook");
++
++        Object plan = plan(
++                List.of("my/root.tag", "my/leaf.tag"),
++                value -> value.setPrefix("@import static example.JteContext.*\n")
++        );
++
++        assertThat(writes(plan).get(jteRoot.resolve("my/leaf.jte")))
++                .startsWith("@import static example.JteContext.*")
++                .contains("from-hook");
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte")))
++                .startsWith("@import static example.JteContext.*")
++                .contains("@template.my.leaf(");
++    }
++
++    @Test
++    void jakartaArtifactCommitsOnlyOnce() throws Throwable {
++        tag("a", "a");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++
++        commit(plan);
++        Map<Path, String> committed = snapshot(tempDir);
++
++        assertThat(catchCommitFailure(plan)).isNotNull();
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(committed);
++        assertThat(jteRoot.resolve("my/a.jte")).exists();
++        assertNoTransactionFiles();
++    }
++
++    private Consumer<Converter> noPrefix() {
++        return value -> value.setPrefix("");
++    }
++
++    private Throwable catchPlanFailure(Collection<String> tags) {
++        return catchPlanFailure(tags, noPrefix());
++    }
++
++    private Throwable catchPlanFailure(Collection<String> tags, Consumer<Converter> setup) {
++        try {
++            plan(tags, setup);
++        } catch (Throwable throwable) {
++            return throwable;
++        }
++        throw new AssertionError("Expected planning to fail.");
++    }
++
++    private Map<Path, String> snapshot(Path root) throws IOException {
++        Map<Path, String> result = new LinkedHashMap<>();
++        try (Stream<Path> stream = Files.walk(root)) {
++            stream.filter(Files::isRegularFile)
++                    .sorted()
++                    .forEach(path -> {
++                        try {
++                            result.put(root.relativize(path), Files.readString(path, StandardCharsets.UTF_8));
++                        } catch (IOException e) {
++                            throw new RuntimeException(e);
++                        }
++                    });
++        }
++        return result;
++    }
++
++    private Object plan(Collection<String> tags, Consumer<Converter> setup) throws Throwable {
++        try {
++            Method method = JspToJteConverter.class.getMethod("planTags", Collection.class, Consumer.class);
++            return method.invoke(converter, tags, setup);
++        } catch (InvocationTargetException e) {
++            throw e.getCause();
++        }
++    }
++
++    private void commit(Object plan) throws Throwable {
++        try {
++            plan.getClass().getMethod("commit").invoke(plan);
++        } catch (InvocationTargetException e) {
++            throw e.getCause();
++        }
++    }
++
++    private Throwable catchCommitFailure(Object plan) {
++        try {
++            commit(plan);
++        } catch (Throwable throwable) {
++            return throwable;
++        }
++        throw new AssertionError("Expected commit to fail.");
++    }
++
++    private List<Path> order(Object plan) throws Exception {
++        return new ArrayList<>(collection(plan, "getConversionOrder"));
++    }
++
++    @SuppressWarnings("unchecked")
++    private Collection<Path> collection(Object target, String getter) throws Exception {
++        return (Collection<Path>) target.getClass().getMethod(getter).invoke(target);
++    }
++
++    @SuppressWarnings("unchecked")
++    private Map<Path, String> writes(Object plan) throws Exception {
++        return (Map<Path, String>) plan.getClass().getMethod("getWrites").invoke(plan);
++    }
++
++    private List<Path> deletes(Object plan) throws Exception {
++        return new ArrayList<>(collection(plan, "getDeletes"));
++    }
++
++    private Path tag(String name, String body) throws IOException {
++        return write(tagPath(name), header() + body);
++    }
++
++    private Path tagPath(String name) {
++        return jspRoot.resolve("my/" + name + ".tag");
++    }
++
++    private String header() {
++        return """
++                <%@ taglib uri="urn:test" prefix="my" %>
++                <%@ attribute name="value" required="false" type="java.lang.String" %>
++                """;
++    }
++
++    private void writeTagLibrary() throws IOException {
++        StringBuilder tags = new StringBuilder();
++        for (String name : List.of("a", "external", "jte", "leaf", "mark", "parent", "root", "z")) {
++            tags.append("<tag><name>").append(name).append("</name>")
++                    .append("<tag-class>example.JteTag</tag-class>")
++                    .append("<body-content>scriptless</body-content>")
++                    .append("<dynamic-attributes>true</dynamic-attributes></tag>\n");
++        }
++        write(jspRoot.resolve("tld/my.tld"), """
++                <?xml version="1.0" encoding="UTF-8" ?>
++                <taglib xmlns="http://java.sun.com/xml/ns/j2ee" version="2.0">
++                  <tlib-version>1.0</tlib-version>
++                  <short-name>my</short-name>
++                  <uri>urn:test</uri>
++                """ + tags + "</taglib>\n");
++    }
++
++    private Path write(Path path, String content) throws IOException {
++        Files.createDirectories(path.getParent());
++        Files.writeString(path, content, StandardCharsets.UTF_8);
++        return path;
++    }
++
++    private void assertNoTransactionFiles() throws IOException {
++        try (Stream<Path> stream = Files.walk(tempDir)) {
++            assertThat(stream.filter(Files::isRegularFile).map(path -> path.getFileName().toString()))
++                    .allMatch(name -> name.endsWith(".tag")
++                            || name.endsWith(".jsp")
++                            || name.endsWith(".jsp.inc")
++                            || name.endsWith(".jte")
++                            || name.endsWith(".tld")
++                            || name.endsWith(".partial"));
++        }
++    }
++
++    private List<String> suppressedMessages(Throwable failure) {
++        List<String> messages = new ArrayList<>();
++        collectSuppressedMessages(failure, messages);
++        return messages;
++    }
++
++    private void collectSuppressedMessages(Throwable failure, List<String> messages) {
++        for (Throwable suppressed : failure.getSuppressed()) {
++            if (suppressed.getMessage() != null) {
++                messages.add(suppressed.getMessage());
++            }
++            collectSuppressedMessages(suppressed, messages);
++        }
++    }
++
++    private static class TestConverter extends JspToJteConverter {
++        private final URL resourceBase;
++        private final Map<Path, String> readOverrides = new LinkedHashMap<>();
++        private String[] notConvertedTags;
++        private Function<String, String> outputName;
++
++        private TestConverter(Path jspRoot, Path jteRoot, URL resourceBase) {
++            super(jspRoot, jteRoot, "my:jte");
++            this.resourceBase = resourceBase;
++        }
++
++        @Override
++        protected URL getResourceBase() {
++            return resourceBase;
++        }
++
++        @Override
++        protected String readFile(Path path) {
++            return readOverrides.getOrDefault(path.toAbsolutePath().normalize(), super.readFile(path));
++        }
++
++        @Override
++        protected String[] getNotConvertedTags() {
++            return notConvertedTags;
++        }
++
++        @Override
++        public String suggestJteFile(String jspFile) {
++            return outputName == null ? super.suggestJteFile(jspFile) : outputName.apply(jspFile);
++        }
++    }
++}
+diff --git a/jte-jsp-converter/src/test/java/gg/jte/convert/jsp/FailingPathFileSystem.java b/jte-jsp-converter/src/test/java/gg/jte/convert/jsp/FailingPathFileSystem.java
+new file mode 100644
+index 00000000..4a303be1
+--- /dev/null
++++ b/jte-jsp-converter/src/test/java/gg/jte/convert/jsp/FailingPathFileSystem.java
+@@ -0,0 +1,456 @@
++package gg.jte.convert.jsp;
++
++import java.io.IOException;
++import java.net.URI;
++import java.nio.channels.SeekableByteChannel;
++import java.nio.file.AccessMode;
++import java.nio.file.CopyOption;
++import java.nio.file.DirectoryStream;
++import java.nio.file.FileStore;
++import java.nio.file.FileSystem;
++import java.nio.file.FileSystemAlreadyExistsException;
++import java.nio.file.FileSystemNotFoundException;
++import java.nio.file.FileSystems;
++import java.nio.file.LinkOption;
++import java.nio.file.OpenOption;
++import java.nio.file.Path;
++import java.nio.file.PathMatcher;
++import java.nio.file.WatchEvent;
++import java.nio.file.WatchKey;
++import java.nio.file.WatchService;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.nio.file.attribute.FileAttribute;
++import java.nio.file.attribute.FileAttributeView;
++import java.nio.file.attribute.UserPrincipalLookupService;
++import java.nio.file.spi.FileSystemProvider;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.Set;
++
++final class FailingPathFileSystem extends FileSystem {
++    private final Provider provider;
++    private final FileSystem delegate = FileSystems.getDefault();
++
++    FailingPathFileSystem(Set<Path> affectedPaths, boolean failRollback) {
++        provider = new Provider(this, affectedPaths, failRollback);
++    }
++
++    Path wrap(Path path) {
++        return new WrappedPath(this, path);
++    }
++
++    @Override
++    public FileSystemProvider provider() {
++        return provider;
++    }
++
++    @Override
++    public void close() {
++    }
++
++    @Override
++    public boolean isOpen() {
++        return true;
++    }
++
++    @Override
++    public boolean isReadOnly() {
++        return false;
++    }
++
++    @Override
++    public String getSeparator() {
++        return delegate.getSeparator();
++    }
++
++    @Override
++    public Iterable<Path> getRootDirectories() {
++        return () -> new WrappingIterator(delegate.getRootDirectories().iterator(), this);
++    }
++
++    @Override
++    public Iterable<FileStore> getFileStores() {
++        return delegate.getFileStores();
++    }
++
++    @Override
++    public Set<String> supportedFileAttributeViews() {
++        return delegate.supportedFileAttributeViews();
++    }
++
++    @Override
++    public Path getPath(String first, String... more) {
++        return wrap(delegate.getPath(first, more));
++    }
++
++    @Override
++    public PathMatcher getPathMatcher(String syntaxAndPattern) {
++        PathMatcher matcher = delegate.getPathMatcher(syntaxAndPattern);
++        return path -> matcher.matches(unwrap(path));
++    }
++
++    @Override
++    public UserPrincipalLookupService getUserPrincipalLookupService() {
++        return delegate.getUserPrincipalLookupService();
++    }
++
++    @Override
++    public WatchService newWatchService() throws IOException {
++        return delegate.newWatchService();
++    }
++
++    private static Path unwrap(Path path) {
++        return path instanceof WrappedPath wrapped ? wrapped.delegate : path;
++    }
++
++    private static final class Provider extends FileSystemProvider {
++        private final FailingPathFileSystem fileSystem;
++        private final FileSystemProvider delegate = FileSystems.getDefault().provider();
++        private final Set<Path> affectedPaths;
++        private final boolean failRollback;
++        private boolean mutated;
++        private boolean primaryFailed;
++        private boolean rollbackFailed;
++
++        private Provider(FailingPathFileSystem fileSystem, Set<Path> affectedPaths, boolean failRollback) {
++            this.fileSystem = fileSystem;
++            this.affectedPaths = affectedPaths.stream()
++                    .map(path -> path.toAbsolutePath().normalize())
++                    .collect(java.util.stream.Collectors.toSet());
++            this.failRollback = failRollback;
++        }
++
++        @Override
++        public String getScheme() {
++            return "fault";
++        }
++
++        @Override
++        public FileSystem newFileSystem(URI uri, Map<String, ?> env) {
++            throw new FileSystemAlreadyExistsException();
++        }
++
++        @Override
++        public FileSystem getFileSystem(URI uri) {
++            return fileSystem;
++        }
++
++        @Override
++        public Path getPath(URI uri) {
++            if (!"file".equalsIgnoreCase(uri.getScheme())) {
++                throw new FileSystemNotFoundException(uri.toString());
++            }
++            return fileSystem.wrap(delegate.getPath(uri));
++        }
++
++        @Override
++        public SeekableByteChannel newByteChannel(Path path, Set<? extends OpenOption> options, FileAttribute<?>... attrs) throws IOException {
++            boolean writes = options.stream().anyMatch(option -> option.toString().contains("WRITE")
++                    || option.toString().contains("APPEND")
++                    || option.toString().contains("CREATE"));
++            if (writes) {
++                beforeMutation(path);
++            }
++            SeekableByteChannel channel = delegate.newByteChannel(unwrap(path), options, attrs);
++            if (writes) {
++                afterMutation(path);
++            }
++            return channel;
++        }
++
++        @Override
++        public DirectoryStream<Path> newDirectoryStream(Path dir, DirectoryStream.Filter<? super Path> filter) throws IOException {
++            DirectoryStream<Path> stream = delegate.newDirectoryStream(
++                    unwrap(dir),
++                    path -> filter.accept(fileSystem.wrap(path))
++            );
++            return new DirectoryStream<>() {
++                @Override
++                public Iterator<Path> iterator() {
++                    return new WrappingIterator(stream.iterator(), fileSystem);
++                }
++
++                @Override
++                public void close() throws IOException {
++                    stream.close();
++                }
++            };
++        }
++
++        @Override
++        public void createDirectory(Path dir, FileAttribute<?>... attrs) throws IOException {
++            beforeMutation(dir);
++            delegate.createDirectory(unwrap(dir), attrs);
++            afterMutation(dir);
++        }
++
++        @Override
++        public void delete(Path path) throws IOException {
++            beforeMutation(path);
++            delegate.delete(unwrap(path));
++            afterMutation(path);
++        }
++
++        @Override
++        public void copy(Path source, Path target, CopyOption... options) throws IOException {
++            beforeMutation(target);
++            delegate.copy(unwrap(source), unwrap(target), options);
++            afterMutation(target);
++        }
++
++        @Override
++        public void move(Path source, Path target, CopyOption... options) throws IOException {
++            beforeMutation(source, target);
++            delegate.move(unwrap(source), unwrap(target), options);
++            afterMutation(source, target);
++        }
++
++        @Override
++        public boolean isSameFile(Path path, Path path2) throws IOException {
++            return delegate.isSameFile(unwrap(path), unwrap(path2));
++        }
++
++        @Override
++        public boolean isHidden(Path path) throws IOException {
++            return delegate.isHidden(unwrap(path));
++        }
++
++        @Override
++        public FileStore getFileStore(Path path) throws IOException {
++            return delegate.getFileStore(unwrap(path));
++        }
++
++        @Override
++        public void checkAccess(Path path, AccessMode... modes) throws IOException {
++            delegate.checkAccess(unwrap(path), modes);
++        }
++
++        @Override
++        public <V extends FileAttributeView> V getFileAttributeView(Path path, Class<V> type, LinkOption... options) {
++            return delegate.getFileAttributeView(unwrap(path), type, options);
++        }
++
++        @Override
++        public <A extends BasicFileAttributes> A readAttributes(Path path, Class<A> type, LinkOption... options) throws IOException {
++            return delegate.readAttributes(unwrap(path), type, options);
++        }
++
++        @Override
++        public Map<String, Object> readAttributes(Path path, String attributes, LinkOption... options) throws IOException {
++            return delegate.readAttributes(unwrap(path), attributes, options);
++        }
++
++        @Override
++        public void setAttribute(Path path, String attribute, Object value, LinkOption... options) throws IOException {
++            delegate.setAttribute(unwrap(path), attribute, value, options);
++        }
++
++        private void beforeMutation(Path... paths) throws IOException {
++            if (!touchesAffectedPath(paths)) {
++                return;
++            }
++            if (!primaryFailed && mutated) {
++                primaryFailed = true;
++                throw new IOException("Injected commit failure");
++            }
++            if (primaryFailed && failRollback && !rollbackFailed) {
++                rollbackFailed = true;
++                throw new IOException("Injected rollback failure");
++            }
++        }
++
++        private void afterMutation(Path... paths) {
++            if (touchesAffectedPath(paths)) {
++                mutated = true;
++            }
++        }
++
++        private boolean touchesAffectedPath(Path... paths) {
++            for (Path path : paths) {
++                if (affectedPaths.contains(unwrap(path).toAbsolutePath().normalize())) {
++                    return true;
++                }
++            }
++            return false;
++        }
++    }
++
++    private static final class WrappedPath implements Path {
++        private final FailingPathFileSystem fileSystem;
++        private final Path delegate;
++
++        private WrappedPath(FailingPathFileSystem fileSystem, Path delegate) {
++            this.fileSystem = fileSystem;
++            this.delegate = delegate;
++        }
++
++        private Path wrap(Path path) {
++            return path == null ? null : fileSystem.wrap(path);
++        }
++
++        @Override
++        public FileSystem getFileSystem() {
++            return fileSystem;
++        }
++
++        @Override
++        public boolean isAbsolute() {
++            return delegate.isAbsolute();
++        }
++
++        @Override
++        public Path getRoot() {
++            return wrap(delegate.getRoot());
++        }
++
++        @Override
++        public Path getFileName() {
++            return delegate.getFileName();
++        }
++
++        @Override
++        public Path getParent() {
++            return wrap(delegate.getParent());
++        }
++
++        @Override
++        public int getNameCount() {
++            return delegate.getNameCount();
++        }
++
++        @Override
++        public Path getName(int index) {
++            return delegate.getName(index);
++        }
++
++        @Override
++        public Path subpath(int beginIndex, int endIndex) {
++            return delegate.subpath(beginIndex, endIndex);
++        }
++
++        @Override
++        public boolean startsWith(Path other) {
++            return delegate.startsWith(unwrap(other));
++        }
++
++        @Override
++        public boolean startsWith(String other) {
++            return delegate.startsWith(other);
++        }
++
++        @Override
++        public boolean endsWith(Path other) {
++            return delegate.endsWith(unwrap(other));
++        }
++
++        @Override
++        public boolean endsWith(String other) {
++            return delegate.endsWith(other);
++        }
++
++        @Override
++        public Path normalize() {
++            return wrap(delegate.normalize());
++        }
++
++        @Override
++        public Path resolve(Path other) {
++            return wrap(delegate.resolve(unwrap(other)));
++        }
++
++        @Override
++        public Path resolve(String other) {
++            return wrap(delegate.resolve(other));
++        }
++
++        @Override
++        public Path resolveSibling(Path other) {
++            return wrap(delegate.resolveSibling(unwrap(other)));
++        }
++
++        @Override
++        public Path resolveSibling(String other) {
++            return wrap(delegate.resolveSibling(other));
++        }
++
++        @Override
++        public Path relativize(Path other) {
++            return delegate.relativize(unwrap(other));
++        }
++
++        @Override
++        public URI toUri() {
++            return delegate.toUri();
++        }
++
++        @Override
++        public Path toAbsolutePath() {
++            return wrap(delegate.toAbsolutePath());
++        }
++
++        @Override
++        public Path toRealPath(LinkOption... options) throws IOException {
++            return wrap(delegate.toRealPath(options));
++        }
++
++        @Override
++        public java.io.File toFile() {
++            return delegate.toFile();
++        }
++
++        @Override
++        public WatchKey register(WatchService watcher, WatchEvent.Kind<?>[] events, WatchEvent.Modifier... modifiers) throws IOException {
++            return delegate.register(watcher, events, modifiers);
++        }
++
++        @Override
++        public WatchKey register(WatchService watcher, WatchEvent.Kind<?>... events) throws IOException {
++            return delegate.register(watcher, events);
++        }
++
++        @Override
++        public Iterator<Path> iterator() {
++            return new WrappingIterator(delegate.iterator(), fileSystem);
++        }
++
++        @Override
++        public int compareTo(Path other) {
++            return delegate.compareTo(unwrap(other));
++        }
++
++        @Override
++        public boolean equals(Object other) {
++            return other instanceof WrappedPath path && delegate.equals(path.delegate);
++        }
++
++        @Override
++        public int hashCode() {
++            return delegate.hashCode();
++        }
++
++        @Override
++        public String toString() {
++            return delegate.toString();
++        }
++    }
++
++    private static final class WrappingIterator implements Iterator<Path> {
++        private final Iterator<Path> delegate;
++        private final FailingPathFileSystem fileSystem;
++
++        private WrappingIterator(Iterator<Path> delegate, FailingPathFileSystem fileSystem) {
++            this.delegate = delegate;
++            this.fileSystem = fileSystem;
++        }
++
++        @Override
++        public boolean hasNext() {
++            return delegate.hasNext();
++        }
++
++        @Override
++        public Path next() {
++            return fileSystem.wrap(delegate.next());
++        }
++    }
++}
+diff --git a/jte-jsp-converter/src/test/java/gg/jte/convert/jsp/TransactionalJspBatch_4f13c2_Test.java b/jte-jsp-converter/src/test/java/gg/jte/convert/jsp/TransactionalJspBatch_4f13c2_Test.java
+new file mode 100644
+index 00000000..0546789e
+--- /dev/null
++++ b/jte-jsp-converter/src/test/java/gg/jte/convert/jsp/TransactionalJspBatch_4f13c2_Test.java
+@@ -0,0 +1,1104 @@
++package gg.jte.convert.jsp;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.io.IOException;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.net.URL;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.attribute.FileTime;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.EnumSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.Consumer;
++import java.util.function.Function;
++import java.util.stream.Stream;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++class TransactionalJspBatch_4f13c2_Test {
++    @TempDir
++    Path tempDir;
++
++    private Path jspRoot;
++    private Path jteRoot;
++    private TestConverter converter;
++
++    @BeforeEach
++    void setUp() throws Exception {
++        jspRoot = tempDir.resolve("WEB-INF");
++        jteRoot = tempDir.resolve("jte");
++        writeTagLibrary();
++        converter = new TestConverter(jspRoot, jteRoot, tempDir.toUri().toURL());
++    }
++
++    @Test
++    void unorderedPlanIsReadOnlyInspectableAndDependencySafe() throws Throwable {
++        tag("leaf", "leaf ${value}");
++        tag("parent", "<my:leaf value=\"${value}\"/>");
++        tag("root", "<my:parent value=\"${value}\">body</my:parent>");
++        tag("independent", "independent");
++        Path page = write(jspRoot.resolve("page.jsp"), header() + "<my:root value=\"hello\"/>");
++        write(jspRoot.resolve("untouched.jsp"), "plain");
++        Map<Path, String> before = snapshot(tempDir);
++
++        Object plan = plan(List.of("my/root.tag", "my/parent.tag", "my/leaf.tag", "my/independent.tag"), noPrefix());
++
++        assertThat(order(plan)).containsExactly(
++                tagPath("independent"),
++                tagPath("leaf"),
++                tagPath("parent"),
++                tagPath("root")
++        );
++        assertThat(deletes(plan)).containsExactlyInAnyOrderElementsOf(order(plan));
++        assertNormalizedAbsolute(order(plan));
++        assertNormalizedAbsolute(deletes(plan));
++        assertNormalizedAbsolute(List.copyOf(writes(plan).keySet()));
++        assertThat(writes(plan)).containsOnlyKeys(
++                jteRoot.resolve("my/independent.jte"),
++                jteRoot.resolve("my/leaf.jte"),
++                jteRoot.resolve("my/parent.jte"),
++                jteRoot.resolve("my/root.jte"),
++                page
++        );
++        assertThat(writes(plan).get(jteRoot.resolve("my/parent.jte"))).contains("@template.my.leaf(");
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte"))).contains("@template.my.parent(");
++        assertThat(writes(plan).get(page)).contains("<my:jte jte=\"my/root.jte\"");
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++
++        commit(plan);
++
++        assertThat(tagPath("leaf")).doesNotExist();
++        assertThat(tagPath("parent")).doesNotExist();
++        assertThat(tagPath("root")).doesNotExist();
++        assertThat(jteRoot.resolve("my/leaf.jte")).content().contains("leaf ${value}");
++        assertThat(jteRoot.resolve("my/parent.jte")).content().contains("@template.my.leaf(");
++        assertThat(jteRoot.resolve("my/root.jte")).content().contains("@template.my.parent(");
++        assertThat(page).content().contains("<my:jte jte=\"my/root.jte\"");
++        assertThat(jspRoot.resolve("untouched.jsp")).content().isEqualTo("plain");
++        assertNoTransactionFiles();
++    }
++
++    @Test
++    void nonSelectedTagUsagesAreFinalWrites() throws Throwable {
++        tag("leaf", "leaf");
++        Path host = tag("root", "<my:leaf/>");
++
++        Object plan = plan(List.of("my/leaf.tag"), noPrefix());
++
++        assertThat(deletes(plan)).containsExactly(tagPath("leaf"));
++        assertThat(writes(plan)).containsKey(host);
++        assertThat(writes(plan).get(host)).contains("<my:jte jte=\"my/leaf.jte\"");
++
++        commit(plan);
++
++        assertThat(tagPath("leaf")).doesNotExist();
++        assertThat(host).content().contains("<my:jte jte=\"my/leaf.jte\"");
++        assertNoTransactionFiles();
++    }
++
++    @Test
++    void unchangedUsageScannedFileIsCheckedForStaleness() throws Throwable {
++        tag("a", "a");
++        Path unrelated = write(jspRoot.resolve("unrelated.jsp"), "plain page");
++
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++
++        assertThat(writes(plan)).doesNotContainKey(unrelated);
++        write(unrelated, "plain page changed");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertChangedPaths(failure, unrelated);
++        assertThat(tagPath("a")).exists();
++        assertThat(jteRoot.resolve("my/a.jte")).doesNotExist();
++    }
++
++    @Test
++    void danglingDestinationIsRejectedDuringPlanning() throws Exception {
++        tag("a", "a");
++        Path destination = jteRoot.resolve("my/a.jte");
++        Files.createDirectories(destination.getParent());
++        Files.createSymbolicLink(destination, Path.of("missing-target.jte"));
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(tagPath("a")).exists();
++        assertThat(destination).isSymbolicLink();
++    }
++
++    @Test
++    void danglingDestinationMakesPlanStaleAtCommit() throws Throwable {
++        tag("a", "a");
++        Path destination = jteRoot.resolve("my/a.jte");
++
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        Files.createDirectories(destination.getParent());
++        Files.createSymbolicLink(destination, Path.of("missing-target.jte"));
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertChangedPaths(failure, destination);
++        assertThat(tagPath("a")).exists();
++        assertThat(destination).isSymbolicLink();
++    }
++
++    @Test
++    void unselectedDependencyIsUnresolvedAndRejectsThePlan() throws Exception {
++        tag("leaf", "leaf");
++        tag("root", "<my:leaf/>");
++        Map<Path, String> before = snapshot(tempDir);
++
++        assertThat(catchPlanFailure(List.of("my/root.tag"), noPrefix())).isInstanceOf(RuntimeException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void deletedUsageScannedFileMakesPlanStale() throws Throwable {
++        tag("a", "a");
++        Path usage = write(jspRoot.resolve("usage.jsp"), "<my:a/>");
++
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        Files.delete(usage);
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertChangedPaths(failure, usage);
++        assertThat(tagPath("a")).exists();
++        assertThat(jteRoot.resolve("my/a.jte")).doesNotExist();
++    }
++
++    @Test
++    void rollbackRestoresMalformedUtf8BytesExactly() throws Throwable {
++        tag("a", "a");
++        Path usage = jspRoot.resolve("usage.jsp");
++        byte[] original = {'<', 'm', 'y', ':', 'a', '/', '>', (byte) 0xC3, '('};
++        Files.createDirectories(usage.getParent());
++        Files.write(usage, original);
++        Set<Path> affected = Set.of(usage, tagPath("a"));
++        FailingPathFileSystem fileSystem = new FailingPathFileSystem(affected, false);
++        converter = new TestConverter(fileSystem.wrap(jspRoot), fileSystem.wrap(jteRoot), tempDir.toUri().toURL());
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure).isInstanceOf(IOException.class).hasMessageContaining("Injected commit failure");
++        assertThat(Files.readAllBytes(usage)).isEqualTo(original);
++        assertThat(tagPath("a")).exists();
++        assertThat(jteRoot.resolve("my/a.jte")).doesNotExist();
++        assertNoTransactionFiles();
++    }
++
++    @Test
++    void inputOrderDoesNotChangeThePlan() throws Throwable {
++        tag("leaf", "leaf");
++        tag("parent", "<my:leaf/>");
++        tag("root", "<my:parent/>");
++
++        Object reverse = plan(List.of("my/root.tag", "my/parent.tag", "my/leaf.tag"), noPrefix());
++        Object shuffled = plan(List.of("my/parent.tag", "my/leaf.tag", "my/root.tag"), noPrefix());
++
++        assertThat(order(reverse)).isEqualTo(order(shuffled));
++        assertThat(writes(reverse)).isEqualTo(writes(shuffled));
++        assertThat(deletes(reverse)).isEqualTo(deletes(shuffled));
++    }
++
++    @Test
++    void multipleSelectedTagRewritesAccumulateInSingleFinalWrite() throws Throwable {
++        tag("a", "a");
++        tag("z", "z");
++        Path usage = write(jspRoot.resolve("both.jsp"), "<my:a/><my:z/>");
++
++        Object plan = plan(List.of("my/z.tag", "my/a.tag"), noPrefix());
++
++        assertThat(writes(plan)).containsOnlyKeys(
++                jteRoot.resolve("my/a.jte"),
++                jteRoot.resolve("my/z.jte"),
++                usage
++        );
++        assertThat(writes(plan).get(usage))
++                .contains("<my:jte jte=\"my/a.jte\"")
++                .contains("<my:jte jte=\"my/z.jte\"");
++
++        commit(plan);
++
++        assertThat(usage).content()
++                .contains("<my:jte jte=\"my/a.jte\"")
++                .contains("<my:jte jte=\"my/z.jte\"");
++    }
++
++    @Test
++    void mixedDependenciesUseLexicalReadyOrder() throws Throwable {
++        tag("a", "<my:z/>");
++        tag("b", "b");
++        tag("z", "z");
++
++        Object plan = plan(List.of("my/a.tag", "my/z.tag", "my/b.tag"), noPrefix());
++
++        assertThat(order(plan)).containsExactly(tagPath("b"), tagPath("z"), tagPath("a"));
++    }
++
++    @Test
++    void inspectedCollectionsAreImmutable() throws Throwable {
++        tag("leaf", "leaf");
++        Object plan = plan(List.of("my/leaf.tag"), noPrefix());
++
++        assertThatThrownBy(() -> collection(plan, "getConversionOrder").clear())
++                .isInstanceOf(UnsupportedOperationException.class);
++        assertThatThrownBy(() -> collection(plan, "getDeletes").clear())
++                .isInstanceOf(UnsupportedOperationException.class);
++        assertThatThrownBy(() -> writes(plan).put(jteRoot.resolve("other.jte"), "other"))
++                .isInstanceOf(UnsupportedOperationException.class);
++    }
++
++    @Test
++    void repeatedUsagesCollapseIntoOneFinalWrite() throws Throwable {
++        tag("leaf", "leaf");
++        Path usage = write(
++                jspRoot.resolve("nested/usage.jsp.inc"),
++                "<my:leaf/><my:leaf>body</my:leaf><my:leafish/>"
++        );
++
++        Object plan = plan(List.of("my/leaf.tag"), noPrefix());
++
++        assertThat(writes(plan).keySet()).containsExactlyInAnyOrder(jteRoot.resolve("my/leaf.jte"), usage);
++        assertThat(writes(plan).get(usage))
++                .contains("<my:jte jte=\"my/leaf.jte\"/>")
++                .contains("<my:jte jte=\"my/leaf.jte\">body</my:jte>")
++                .contains("<my:leafish/>");
++    }
++
++    @Test
++    void commentsDoNotCreateDependenciesOrUnresolvedTags() throws Throwable {
++        tag("a", "<%-- <my:z/> --%>a");
++        tag("z", "z");
++
++        Object plan = plan(List.of("my/z.tag", "my/a.tag"), noPrefix());
++
++        assertThat(order(plan)).containsExactly(tagPath("a"), tagPath("z"));
++        assertThat(writes(plan).get(jteRoot.resolve("my/a.jte"))).contains("<%-- <my:z/> --%>");
++    }
++
++    @Test
++    void commentedInvocationInAnApprovedIncludeCreatesNoDependency() throws Throwable {
++        tag("a", "<%@ include file=\"/WEB-INF/fragment.jsp.inc\" %>a");
++        tag("z", "<my:a/>");
++        write(jspRoot.resolve("fragment.jsp.inc"), "<%-- <my:z/> --%>");
++
++        Object plan = plan(List.of("my/z.tag", "my/a.tag"), withInclude());
++
++        assertThat(order(plan)).containsExactly(tagPath("a"), tagPath("z"));
++    }
++
++    @Test
++    void realCustomTagDependencyIsNotConfusedWithLongerNames() throws Throwable {
++        tag("foo", "foo");
++        tag("foobar", "foobar");
++        tag("root", "<my:foobar/>");
++
++        Object plan = plan(List.of("my/root.tag", "my/foobar.tag", "my/foo.tag"), noPrefix());
++
++        assertThat(order(plan)).containsExactly(tagPath("foo"), tagPath("foobar"), tagPath("root"));
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte"))).contains("@template.my.foobar(");
++    }
++
++    @Test
++    void directCycleReportsAClosedDeterministicPathWithoutMutation() throws Exception {
++        tag("a", "<my:b/>");
++        tag("b", "<my:a/>");
++        Map<Path, String> before = snapshot(tempDir);
++
++        Throwable first = catchPlanFailure(List.of("my/b.tag", "my/a.tag"), noPrefix());
++        Throwable second = catchPlanFailure(List.of("my/a.tag", "my/b.tag"), noPrefix());
++
++        assertThat(first).isInstanceOf(RuntimeException.class);
++        String report = first.getMessage();
++        assertThat(report)
++                .isEqualTo(second.getMessage())
++                .contains("my/a.tag")
++                .contains("my/b.tag");
++        assertThat(countOccurrences(report, "my/a.tag") > 1 || countOccurrences(report, "my/b.tag") > 1)
++                .as("the reported path closes, so a tag on it is reported again: %s", report)
++                .isTrue();
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void longerCycleReportsAClosedDeterministicPathWithoutMutation() throws Exception {
++        tag("a", "<my:b/>");
++        tag("b", "<my:z/>");
++        tag("z", "<my:a/>");
++        Map<Path, String> before = snapshot(tempDir);
++
++        Throwable first = catchPlanFailure(List.of("my/b.tag", "my/z.tag", "my/a.tag"), noPrefix());
++        Throwable second = catchPlanFailure(List.of("my/a.tag", "my/b.tag", "my/z.tag"), noPrefix());
++
++        assertThat(first).isInstanceOf(RuntimeException.class);
++        String report = first.getMessage();
++        assertThat(report)
++                .isEqualTo(second.getMessage())
++                .contains("my/a.tag")
++                .contains("my/b.tag")
++                .contains("my/z.tag");
++        int mostMentions = Math.max(
++                countOccurrences(report, "my/a.tag"),
++                Math.max(countOccurrences(report, "my/b.tag"), countOccurrences(report, "my/z.tag")));
++        assertThat(mostMentions)
++                .as("the reported path closes, so a tag on it is reported again: %s", report)
++                .isGreaterThan(1);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void aFileStaleInBothSelectedAndScannedRolesIsReportedOnce() throws Throwable {
++        tag("leaf", "leaf");
++        Path host = tag("root", "<my:leaf/>");
++
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), noPrefix());
++        write(host, header() + "<my:leaf/> changed");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertChangedPaths(failure, host);
++        assertThat(tagPath("leaf")).exists();
++        assertThat(jteRoot.resolve("my/leaf.jte")).doesNotExist();
++    }
++
++    @Test
++    void unresolvedExternalTagRejectsTheWholePlan() throws Exception {
++        tag("a", "<my:external/>");
++        Map<Path, String> before = snapshot(tempDir);
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"), noPrefix())).isInstanceOf(RuntimeException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void conversionFailureAfterAnEarlierConversionLeavesEveryFileUntouched() throws Exception {
++        tag("a", "a");
++        tag("z", "<my:external/>");
++        Map<Path, String> before = snapshot(tempDir);
++
++        assertThat(catchPlanFailure(List.of("my/a.tag", "my/z.tag"), noPrefix()))
++                .isInstanceOf(RuntimeException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++        assertThat(jteRoot).doesNotExist();
++    }
++
++    @Test
++    void explicitlyUnconvertedExternalTagMayRemain() throws Throwable {
++        tag("a", "<my:external/>");
++        converter.notConvertedTags = new String[]{"my:external"};
++
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++
++        assertThat(writes(plan).get(jteRoot.resolve("my/a.jte"))).contains("<my:external>");
++    }
++
++    @Test
++    void suppressedCustomTagDoesNotCreateAnEdge() throws Throwable {
++        tag("a", "<my:z/>");
++        tag("z", "z");
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addSuppressions("my/a.tag", EnumSet.of(JspElementType.CustomTag));
++        };
++
++        Object plan = plan(List.of("my/z.tag", "my/a.tag"), setup);
++
++        assertThat(order(plan)).containsExactly(tagPath("a"), tagPath("z"));
++    }
++
++    @Test
++    void approvedIncludeParticipatesInOrderingAndVirtualConversion() throws Throwable {
++        tag("leaf", "leaf");
++        tag("root", "<%@ include file=\"/WEB-INF/fragment.jsp.inc\" %>");
++        Path fragment = write(jspRoot.resolve("fragment.jsp.inc"), "<my:leaf/>");
++        Consumer<Converter> setup = withInclude();
++
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), setup);
++
++        assertThat(order(plan)).containsExactly(tagPath("leaf"), tagPath("root"));
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte"))).contains("@template.my.leaf(");
++        assertThat(writes(plan).get(fragment)).contains("<my:jte jte=\"my/leaf.jte\"");
++        assertThat(fragment).content().contains("<my:leaf");
++    }
++
++    @Test
++    void approvedNonScannedIncludeParticipatesInVirtualConversionAndStaleness() throws Throwable {
++        tag("leaf", "leaf");
++        tag("root", "<%@ include file=\"/WEB-INF/fragment.partial\" %>");
++        Path fragment = write(jspRoot.resolve("fragment.partial"), "<my:leaf/>");
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addInlinedInclude("/WEB-INF/fragment.partial");
++        };
++
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), setup);
++
++        assertThat(order(plan)).containsExactly(tagPath("leaf"), tagPath("root"));
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte"))).contains("@template.my.leaf(");
++        assertThat(writes(plan)).doesNotContainKey(fragment);
++
++        write(fragment, "<my:leaf/> changed");
++        assertChangedPaths(catchCommitFailure(plan), fragment);
++    }
++
++    @Test
++    void normalizedDuplicateAndEscapingPathsAreRejectedBeforeParsing() throws Exception {
++        tag("a", "a");
++        Map<Path, String> before = snapshot(tempDir);
++
++        assertThat(catchPlanFailure(List.of("my/a.tag", "my/../my/a.tag"), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("../outside.tag"), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of(tagPath("a").toString()), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void emptyMissingNonRegularAndNonTagInputsAreRejected() throws Exception {
++        tag("a", "a");
++        Files.createDirectories(jspRoot.resolve("my/directory.tag"));
++        write(jspRoot.resolve("my/page.jsp"), "page");
++
++        assertThat(catchPlanFailure(null, noPrefix())).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of(), noPrefix())).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of(" "), noPrefix())).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(Collections.singletonList(null), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/missing.tag"), noPrefix())).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/directory.tag"), noPrefix())).isInstanceOf(IllegalArgumentException.class);
++        assertThat(catchPlanFailure(List.of("my/page.jsp"), noPrefix())).isInstanceOf(IllegalArgumentException.class);
++    }
++
++    @Test
++    void symbolicSelectedTagIsRejected() throws Exception {
++        Path real = tag("a", "a");
++        Path link = jspRoot.resolve("my/link.tag");
++        Files.createSymbolicLink(link, real.getFileName());
++
++        assertThat(catchPlanFailure(List.of("my/link.tag"), noPrefix())).isInstanceOf(IllegalArgumentException.class);
++    }
++
++    @Test
++    void normalizedOutputCollisionAndExistingDestinationAreRejected() throws Exception {
++        tag("a-b", "one");
++        tag("aB", "two");
++
++        assertThat(catchPlanFailure(List.of("my/a-b.tag", "my/aB.tag"), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++
++        Files.createDirectories(jteRoot.resolve("my"));
++        write(jteRoot.resolve("my/aB.jte"), "owned");
++        assertThat(catchPlanFailure(List.of("my/a-b.tag"), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(jteRoot.resolve("my/aB.jte")).content().isEqualTo("owned");
++    }
++
++    @Test
++    void ambiguousSelectedInvocationNamesAreRejected() throws Exception {
++        write(jspRoot.resolve("one/my/a.tag"), header() + "one");
++        write(jspRoot.resolve("two/my/a.tag"), header() + "two");
++
++        assertThat(catchPlanFailure(List.of("one/my/a.tag", "two/my/a.tag"), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++    }
++
++    @Test
++    void outputSuggestedOutsideTheJteRootIsRejected() throws Exception {
++        tag("a", "a");
++        converter.outputName = ignored -> "../outside.jte";
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"), noPrefix())).isInstanceOf(IllegalArgumentException.class);
++        assertThat(tempDir.resolve("outside.jte")).doesNotExist();
++    }
++
++    @Test
++    void approvedIncludeOutsideTheJspRootIsRejected() throws Exception {
++        tag("root", "<%@ include file=\"/outside.jsp.inc\" %>");
++        write(tempDir.resolve("outside.jsp.inc"), "outside");
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addInlinedInclude("/outside.jsp.inc");
++        };
++
++        assertThat(catchPlanFailure(List.of("my/root.tag"), setup))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(jteRoot.resolve("my/root.jte")).doesNotExist();
++    }
++
++    @Test
++    void lateParserSetupFailureLeavesEveryFileUntouched() throws Exception {
++        tag("leaf", "leaf");
++        tag("root", "<my:leaf/>");
++        Map<Path, String> before = snapshot(tempDir);
++        IllegalStateException sentinel = new IllegalStateException("late setup failure");
++        AtomicInteger setups = new AtomicInteger();
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            if (setups.incrementAndGet() == 2) {
++                throw sentinel;
++            }
++        };
++
++        assertThat(catchPlanFailure(List.of("my/root.tag", "my/leaf.tag"), setup)).isSameAs(sentinel);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void parseFailureLeavesEveryFileUntouched() throws Exception {
++        tag("a", "valid");
++        write(tagPath("b"), "<%@ attribute name=\"broken\"");
++        Map<Path, String> before = snapshot(tempDir);
++
++        assertThat(catchPlanFailure(List.of("my/a.tag", "my/b.tag"), noPrefix()))
++                .isInstanceOf(RuntimeException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void selectedContentChangeWithUnchangedTimestampMakesPlanStale() throws Throwable {
++        Path selected = tag("a", "original");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        FileTime time = Files.getLastModifiedTime(selected);
++        write(selected, header() + "changed!");
++        Files.setLastModifiedTime(selected, time);
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertChangedPaths(failure, selected);
++        assertThat(selected).content().contains("changed!");
++        assertThat(jteRoot.resolve("my/a.jte")).doesNotExist();
++    }
++
++    @Test
++    void changedScannedUsageAndNewDestinationAreBothReportedInOrder() throws Throwable {
++        tag("a", "a");
++        Path usage = write(jspRoot.resolve("usage.jsp"), "<my:a/>");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        write(usage, "changed");
++        Path destination = write(jteRoot.resolve("my/a.jte"), "concurrent");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        List<Path> expected = Stream.of(usage, destination).sorted().toList();
++        assertChangedPaths(failure, expected.toArray(Path[]::new));
++        assertThat(tagPath("a")).exists();
++        assertThat(destination).content().isEqualTo("concurrent");
++    }
++
++    @Test
++    void changedApprovedIncludeMakesPlanStale() throws Throwable {
++        tag("leaf", "leaf");
++        tag("root", "<%@ include file=\"/WEB-INF/fragment.jsp.inc\" %>");
++        Path fragment = write(jspRoot.resolve("fragment.jsp.inc"), "<my:leaf/>");
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), withInclude());
++        write(fragment, "<my:leaf/> changed");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertChangedPaths(failure, fragment);
++        assertThat(tagPath("leaf")).exists();
++        assertThat(jteRoot.resolve("my/leaf.jte")).doesNotExist();
++    }
++
++    @Test
++    void everyStaleCategoryIsReportedTogetherInOneFailure() throws Throwable {
++        Path selected = tag("a", "a");
++        Path usage = write(jspRoot.resolve("usage.jsp"), "<my:a/>");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        write(selected, header() + "rewritten");
++        write(usage, "changed");
++        Path destination = write(jteRoot.resolve("my/a.jte"), "concurrent");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        List<Path> expected = Stream.of(selected, usage, destination).sorted().toList();
++        assertChangedPaths(failure, expected.toArray(Path[]::new));
++        assertThat(selected).content().contains("rewritten");
++        assertThat(destination).content().isEqualTo("concurrent");
++    }
++
++    @Test
++    void dottedSelectionIsEitherRejectedOrKeptInNormalizedForm() throws Throwable {
++        Path selected = tag("a", "a");
++        Object plan;
++        try {
++            plan = plan(List.of("my/other/../a.tag"), noPrefix());
++        }
++        catch (IllegalArgumentException rejected) {
++            assertThat(selected).exists();
++            return;
++        }
++
++        assertThat(order(plan)).containsExactly(selected);
++        assertNormalizedAbsolute(order(plan));
++        assertNormalizedAbsolute(deletes(plan));
++        write(selected, header() + "changed");
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertChangedPaths(failure, selected);
++    }
++
++    @Test
++    void committedBytesAreThePlannedContentEncodedAsUtf8() throws Throwable {
++        String beyondAscii = "\u00e9\u4e2d\u00df";
++        tag("leaf", "leaf " + beyondAscii);
++        Path usage = write(jspRoot.resolve("page.jsp"), "<my:leaf/> " + beyondAscii);
++
++        Object plan = plan(List.of("my/leaf.tag"), noPrefix());
++
++        assertThat(writes(plan).get(jteRoot.resolve("my/leaf.jte"))).contains(beyondAscii);
++        assertThat(writes(plan).get(usage)).contains(beyondAscii);
++
++        commit(plan);
++
++        for (Map.Entry<Path, String> write : writes(plan).entrySet()) {
++            assertThat(Files.readAllBytes(write.getKey()))
++                    .as("committed bytes of %s", write.getKey())
++                    .isEqualTo(write.getValue().getBytes(StandardCharsets.UTF_8));
++        }
++    }
++
++    @Test
++    void aTimestampOnlyChangeLeavesThePlanCurrent() throws Throwable {
++        Path selected = tag("a", "a");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++        FileTime moved = FileTime.fromMillis(Files.getLastModifiedTime(selected).toMillis() - 60_000);
++        Files.setLastModifiedTime(selected, moved);
++
++        commit(plan);
++
++        assertThat(selected).doesNotExist();
++        assertThat(jteRoot.resolve("my/a.jte")).content().contains("a");
++    }
++
++    @Test
++    void existingDirectoryDestinationIsRejectedDuringPlanning() throws Exception {
++        tag("a", "a");
++        Path destination = jteRoot.resolve("my/a.jte");
++        Files.createDirectories(destination);
++
++        assertThat(catchPlanFailure(List.of("my/a.tag"), noPrefix()))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(tagPath("a")).exists();
++        assertThat(destination).isDirectory();
++    }
++
++    @Test
++    void rollbackRestoresASourceDeletedBeforeALaterDeleteFails() throws Throwable {
++        Path first = tag("a", "first");
++        Path second = tag("z", "second");
++        byte[] firstBytes = Files.readAllBytes(first);
++        byte[] secondBytes = Files.readAllBytes(second);
++        Set<Path> affected = Set.of(first, second);
++        FailingPathFileSystem fileSystem = new FailingPathFileSystem(affected, false);
++        converter = new TestConverter(fileSystem.wrap(jspRoot), fileSystem.wrap(jteRoot), tempDir.toUri().toURL());
++        Object plan = plan(List.of("my/a.tag", "my/z.tag"), noPrefix());
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure).isInstanceOf(IOException.class);
++        assertThat(Files.readAllBytes(first)).isEqualTo(firstBytes);
++        assertThat(Files.readAllBytes(second)).isEqualTo(secondBytes);
++        assertThat(jteRoot.resolve("my/a.jte")).doesNotExist();
++        assertThat(jteRoot.resolve("my/z.jte")).doesNotExist();
++        assertNoTransactionFiles();
++    }
++
++    @Test
++    void successfulPlanCommitsOnlyOnce() throws Throwable {
++        tag("a", "a");
++        Object plan = plan(List.of("my/a.tag"), noPrefix());
++
++        commit(plan);
++        Map<Path, String> committed = snapshot(tempDir);
++
++        assertThat(catchCommitFailure(plan)).isNotNull();
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(committed);
++        assertNoTransactionFiles();
++    }
++
++
++    @Test
++    void ioFailureAfterAnInstalledWriteRestoresExactOriginalState() throws Throwable {
++        tag("leaf", "leaf");
++        tag("root", "<my:leaf/>");
++        Path usage = write(jspRoot.resolve("usage.jsp"), "<my:root/>");
++        Map<Path, String> before = snapshot(tempDir);
++        Set<Path> affected = Set.of(
++                tagPath("leaf"),
++                tagPath("root"),
++                jteRoot.resolve("my/leaf.jte"),
++                jteRoot.resolve("my/root.jte"),
++                usage
++        );
++        FailingPathFileSystem fileSystem = new FailingPathFileSystem(affected, false);
++        converter = new TestConverter(fileSystem.wrap(jspRoot), fileSystem.wrap(jteRoot), tempDir.toUri().toURL());
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), noPrefix());
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure).isInstanceOf(IOException.class).hasMessageContaining("Injected commit failure");
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++        assertThat(jteRoot.resolve("my/leaf.jte")).doesNotExist();
++        assertThat(jteRoot.resolve("my/root.jte")).doesNotExist();
++        assertThat(jteRoot).doesNotExist();
++        assertNoTransactionFiles();
++    }
++
++    @Test
++    void rollbackFailureIsAttachedToTheOriginalIoFailure() throws Throwable {
++        tag("leaf", "leaf");
++        tag("root", "<my:leaf/>");
++        Set<Path> affected = Set.of(
++                tagPath("leaf"),
++                tagPath("root"),
++                jteRoot.resolve("my/leaf.jte"),
++                jteRoot.resolve("my/root.jte")
++        );
++        FailingPathFileSystem fileSystem = new FailingPathFileSystem(affected, true);
++        converter = new TestConverter(fileSystem.wrap(jspRoot), fileSystem.wrap(jteRoot), tempDir.toUri().toURL());
++        Object plan = plan(List.of("my/root.tag", "my/leaf.tag"), noPrefix());
++
++        Throwable failure = catchCommitFailure(plan);
++
++        assertThat(failure).isInstanceOf(IOException.class).hasMessageContaining("Injected commit failure");
++        assertThat(suppressedMessages(failure)).anyMatch(message -> message.contains("Injected rollback failure"));
++    }
++
++
++    @Test
++    void readFileAndParserSetupHooksApplyToEveryConversion() throws Throwable {
++        Path leaf = tag("leaf", "disk");
++        tag("root", "<my:leaf/>");
++        converter.readOverrides.put(leaf.toAbsolutePath().normalize(), header() + "from-hook");
++
++        Object plan = plan(
++                List.of("my/root.tag", "my/leaf.tag"),
++                value -> value.setPrefix("@import static example.JteContext.*\n")
++        );
++
++        assertThat(writes(plan).get(jteRoot.resolve("my/leaf.jte")))
++                .startsWith("@import static example.JteContext.*")
++                .contains("from-hook");
++        assertThat(writes(plan).get(jteRoot.resolve("my/root.jte")))
++                .startsWith("@import static example.JteContext.*")
++                .contains("@template.my.leaf(");
++    }
++
++    @Test
++    void plannedTemplateMatchesOneTagConversionForAStatefulSetupConverter() throws Throwable {
++        tag("root", "<my:mark/>");
++        tag("independent", "independent");
++
++        Object plan = plan(List.of("my/root.tag", "my/independent.tag"), markSetup(new AtomicInteger()));
++        String planned = writes(plan).get(jteRoot.resolve("my/root.jte"));
++
++        converter.convertTag("my/root.tag", markSetup(new AtomicInteger()));
++
++        assertThat(planned).isEqualTo(Files.readString(jteRoot.resolve("my/root.jte"), StandardCharsets.UTF_8));
++    }
++
++    @Test
++    void aConverterCallbackFailureRejectsThePlanWithoutMutation() throws Exception {
++        tag("root", "<my:mark/>");
++        tag("independent", "independent");
++        Map<Path, String> before = snapshot(tempDir);
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.register("my:mark", (jtp, tag, output, bodyConverter) -> {
++                throw new IllegalStateException("converter failure");
++            });
++        };
++
++        Throwable failure = catchPlanFailure(List.of("my/root.tag", "my/independent.tag"), setup);
++
++        assertThat(failure).isInstanceOf(RuntimeException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void approvedIncludeEscapingTheJspRootByTraversalIsRejected() throws Exception {
++        tag("root", "<%@ include file=\"/WEB-INF/../outside.jsp.inc\" %>");
++        write(tempDir.resolve("outside.jsp.inc"), "outside");
++        Map<Path, String> before = snapshot(tempDir);
++        Consumer<Converter> setup = value -> {
++            value.setPrefix("");
++            value.addInlinedInclude("/WEB-INF/../outside.jsp.inc");
++        };
++
++        assertThat(catchPlanFailure(List.of("my/root.tag"), setup))
++                .isInstanceOf(IllegalArgumentException.class);
++        assertThat(snapshot(tempDir)).containsExactlyInAnyOrderEntriesOf(before);
++    }
++
++    @Test
++    void CommitDoesNotWriteThroughAUsageSymlinkLeavingTheJspRoot() throws Throwable {
++        tag("leaf", "leaf");
++        Path outside = write(tempDir.resolve("outside.jsp"), "<my:leaf/>");
++        byte[] before = Files.readAllBytes(outside);
++        Files.createDirectories(jspRoot);
++        Files.createSymbolicLink(jspRoot.resolve("linked.jsp"), outside);
++
++        Object plan = null;
++        try {
++            plan = plan(List.of("my/leaf.tag"), noPrefix());
++        } catch (RuntimeException rejected) {
++            // Refusing the linked usage file is an acceptable outcome too.
++        }
++        if (plan != null) {
++            assertThat(writes(plan)).doesNotContainKey(outside);
++            commit(plan);
++        }
++
++        assertThat(Files.readAllBytes(outside))
++                .as("a file outside the JSP root is never written, whether the link is skipped or refused")
++                .isEqualTo(before);
++    }
++
++    @Test
++    void UnchangedScannedFileWithMalformedBytesIsNotAWrite() throws Throwable {
++        tag("leaf", "leaf");
++        Path untouched = jspRoot.resolve("untouched.jsp");
++        byte[] malformed = {'p', 'l', 'a', 'i', 'n', (byte) 0xC3, '('};
++        Files.createDirectories(untouched.getParent());
++        Files.write(untouched, malformed);
++
++        Object plan = plan(List.of("my/leaf.tag"), noPrefix());
++
++        assertThat(writes(plan)).doesNotContainKey(untouched);
++        commit(plan);
++
++        assertThat(Files.readAllBytes(untouched)).isEqualTo(malformed);
++    }
++
++    private Consumer<Converter> markSetup(AtomicInteger conversions) {
++        return value -> {
++            value.setPrefix("");
++            value.register("my:mark", (jtp, tag, output, bodyConverter) ->
++                    output.append("mark-" + conversions.incrementAndGet()));
++        };
++    }
++
++    private Consumer<Converter> noPrefix() {
++        return value -> value.setPrefix("");
++    }
++
++    private Consumer<Converter> withInclude() {
++        return value -> {
++            value.setPrefix("");
++            value.addInlinedInclude("/WEB-INF/fragment.jsp.inc");
++        };
++    }
++
++    private Object plan(Collection<String> tags, Consumer<Converter> setup) throws Throwable {
++        try {
++            Method method = JspToJteConverter.class.getMethod("planTags", Collection.class, Consumer.class);
++            return method.invoke(converter, tags, setup);
++        } catch (InvocationTargetException e) {
++            throw e.getCause();
++        }
++    }
++
++    private Throwable catchPlanFailure(Collection<String> tags, Consumer<Converter> setup) {
++        try {
++            plan(tags, setup);
++        } catch (Throwable throwable) {
++            return throwable;
++        }
++        throw new AssertionError("Expected planning to fail.");
++    }
++
++    private void commit(Object plan) throws Throwable {
++        try {
++            plan.getClass().getMethod("commit").invoke(plan);
++        } catch (InvocationTargetException e) {
++            throw e.getCause();
++        }
++    }
++
++    private Throwable catchCommitFailure(Object plan) {
++        try {
++            commit(plan);
++        } catch (Throwable throwable) {
++            return throwable;
++        }
++        throw new AssertionError("Expected commit to fail.");
++    }
++
++    private List<Path> order(Object plan) throws Exception {
++        return new ArrayList<>(collection(plan, "getConversionOrder"));
++    }
++
++    @SuppressWarnings("unchecked")
++    private Collection<Path> collection(Object target, String getter) throws Exception {
++        return (Collection<Path>) target.getClass().getMethod(getter).invoke(target);
++    }
++
++    @SuppressWarnings("unchecked")
++    private Map<Path, String> writes(Object plan) throws Exception {
++        return (Map<Path, String>) plan.getClass().getMethod("getWrites").invoke(plan);
++    }
++
++    private List<Path> deletes(Object plan) throws Exception {
++        return new ArrayList<>(collection(plan, "getDeletes"));
++    }
++
++    @SuppressWarnings("unchecked")
++    private void assertChangedPaths(Throwable failure, Path... paths) throws Exception {
++        assertThat(failure.getClass().getSimpleName()).isEqualTo("StaleJspMigrationPlanException");
++        List<Path> changed = new ArrayList<>(collection(failure, "getChangedPaths"));
++        assertNormalizedAbsolute(changed);
++        assertThat(changed).containsExactly(paths);
++    }
++
++    private Path tag(String name, String body) throws IOException {
++        return write(tagPath(name), header() + body);
++    }
++
++    private Path tagPath(String name) {
++        return jspRoot.resolve("my/" + name + ".tag");
++    }
++
++    private String header() {
++        return """
++                <%@ taglib uri="urn:test" prefix="my" %>
++                <%@ attribute name="value" required="false" type="java.lang.String" %>
++                """;
++    }
++
++    private void writeTagLibrary() throws IOException {
++        List<String> names = List.of(
++                "a", "a-b", "aB", "b", "external", "foo", "foobar",
++                "independent", "jte", "leaf", "mark", "parent", "root", "z"
++        );
++        StringBuilder tags = new StringBuilder();
++        for (String name : names) {
++            tags.append("<tag><name>").append(name).append("</name>")
++                    .append("<tag-class>example.JteTag</tag-class>")
++                    .append("<body-content>scriptless</body-content>")
++                    .append("<dynamic-attributes>true</dynamic-attributes></tag>\n");
++        }
++        write(jspRoot.resolve("tld/my.tld"), """
++                <?xml version="1.0" encoding="UTF-8" ?>
++                <taglib xmlns="http://java.sun.com/xml/ns/j2ee" version="2.0">
++                  <tlib-version>1.0</tlib-version>
++                  <short-name>my</short-name>
++                  <uri>urn:test</uri>
++                """ + tags + "</taglib>\n");
++    }
++
++    private Path write(Path path, String content) throws IOException {
++        Files.createDirectories(path.getParent());
++        Files.writeString(path, content, StandardCharsets.UTF_8);
++        return path;
++    }
++
++    private Map<Path, String> snapshot(Path root) throws IOException {
++        Map<Path, String> result = new LinkedHashMap<>();
++        try (Stream<Path> stream = Files.walk(root)) {
++            stream.filter(Files::isRegularFile)
++                    .sorted()
++                    .forEach(path -> {
++                        try {
++                            result.put(root.relativize(path), Files.readString(path, StandardCharsets.UTF_8));
++                        } catch (IOException e) {
++                            throw new RuntimeException(e);
++                        }
++                    });
++        }
++        return result;
++    }
++
++    private void assertNoTransactionFiles() throws IOException {
++        try (Stream<Path> stream = Files.walk(tempDir)) {
++            assertThat(stream.filter(Files::isRegularFile).map(path -> path.getFileName().toString()))
++                    .allMatch(name -> name.endsWith(".tag")
++                            || name.endsWith(".jsp")
++                            || name.endsWith(".jsp.inc")
++                            || name.endsWith(".jte")
++                            || name.endsWith(".tld")
++                            || name.endsWith(".partial"));
++        }
++    }
++
++    private int countOccurrences(String text, String token) {
++        int count = 0;
++        for (int index = text.indexOf(token); index >= 0; index = text.indexOf(token, index + token.length())) {
++            count++;
++        }
++        return count;
++    }
++
++    private void assertNormalizedAbsolute(List<Path> paths) {
++        assertThat(paths).isNotEmpty();
++        for (Path path : paths) {
++            assertThat(path.isAbsolute()).isTrue();
++            assertThat(path).isEqualTo(path.normalize());
++        }
++    }
++
++    private List<String> suppressedMessages(Throwable failure) {
++        List<String> messages = new ArrayList<>();
++        collectSuppressedMessages(failure, messages);
++        return messages;
++    }
++
++    private void collectSuppressedMessages(Throwable failure, List<String> messages) {
++        for (Throwable suppressed : failure.getSuppressed()) {
++            if (suppressed.getMessage() != null) {
++                messages.add(suppressed.getMessage());
++            }
++            collectSuppressedMessages(suppressed, messages);
++        }
++    }
++
++    private static class TestConverter extends JspToJteConverter {
++        private final URL resourceBase;
++        private final Map<Path, String> readOverrides = new LinkedHashMap<>();
++        private String[] notConvertedTags;
++        private Function<String, String> outputName;
++
++        private TestConverter(Path jspRoot, Path jteRoot, URL resourceBase) {
++            super(jspRoot, jteRoot, "my:jte");
++            this.resourceBase = resourceBase;
++        }
++
++        @Override
++        protected URL getResourceBase() {
++            return resourceBase;
++        }
++
++        @Override
++        protected String readFile(Path path) {
++            return readOverrides.getOrDefault(path.toAbsolutePath().normalize(), super.readFile(path));
++        }
++
++        @Override
++        protected String[] getNotConvertedTags() {
++            return notConvertedTags;
++        }
++
++        @Override
++        public String suggestJteFile(String jspFile) {
++            return outputName == null ? super.suggestJteFile(jspFile) : outputName.apply(jspFile);
++        }
++    }
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..958f4536
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,52 @@
++#!/bin/bash
++set -o pipefail
++INVOKE_DIR="$PWD"
++cd "$(dirname "$0")"
++
++OUTPUT_PATH=""
++MODE=""
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --output_path) OUTPUT_PATH="$2"; shift 2;;
++        base|new) MODE="$1"; shift;;
++        *) echo "Usage: $0 --output_path <path> {base|new}"; exit 1;;
++    esac
++done
++[[ -z "$MODE" ]] && { echo "Usage: $0 --output_path <path> {base|new}"; exit 1; }
++[[ -n "$OUTPUT_PATH" && "$OUTPUT_PATH" != /* ]] && OUTPUT_PATH="$INVOKE_DIR/$OUTPUT_PATH"
++
++export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
++export PATH="$JAVA_HOME/bin:$PATH"
++
++JAVAX_TEST="TransactionalJspBatch_4f13c2_Test"
++JAKARTA_TEST="TransactionalJspBatchJakarta_4f13c2_Test"
++MVN="mvn -o -B -fae -Dmaven.repo.local=/opt/.m2/repository -pl jte-jsp-converter,jte-jsp-converter-jakarta -am -DforkCount=1 -DreuseForks=false -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false"
++
++find . -path '*/target/surefire-reports' -type d -exec rm -rf {} + 2>/dev/null || true
++
++case "$MODE" in
++    base)
++        EXCLUDES="$(mktemp)"
++        {
++            echo "**/${JAVAX_TEST}.java"
++            echo "**/${JAKARTA_TEST}.java"
++        } > "$EXCLUDES"
++        $MVN test -Dsurefire.excludesFile="$EXCLUDES"
++        status=$?
++        rm -f "$EXCLUDES"
++        ;;
++    new)
++        $MVN test -Dtest="${JAVAX_TEST},${JAKARTA_TEST}"
++        status=$?
++        ;;
++esac
++
++if [[ -n "$OUTPUT_PATH" ]]; then
++    {
++        echo '<testsuites>'
++        find . -path '*/target/surefire-reports/TEST-*.xml' -exec sed '1{/^[[:space:]]*<?xml/d;}' {} \; 2>/dev/null
++        echo '</testsuites>'
++    } > "$OUTPUT_PATH"
++fi
++
++exit $status

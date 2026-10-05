@@ -1,0 +1,940 @@
+diff --git a/criteria/common/src/org/immutables/criteria/matcher/CriteriaContext.java b/criteria/common/src/org/immutables/criteria/matcher/CriteriaContext.java
+index 6292292..31ace01 100644
+--- a/criteria/common/src/org/immutables/criteria/matcher/CriteriaContext.java
++++ b/criteria/common/src/org/immutables/criteria/matcher/CriteriaContext.java
+@@ -145,9 +145,14 @@ public final class CriteriaContext implements Queryable {
+   }
+ 
+   /**
+-   * Build {@link IterableMatcher#any()} sub-matcher.
++   * Build a quantified iterable element sub-matcher.
+    */
+-  public CriteriaContext any() {
++  public CriteriaContext quantify(IterableOperators operator) {
++    Objects.requireNonNull(operator, "operator");
++    if (operator != IterableOperators.ANY && operator != IterableOperators.ALL && operator != IterableOperators.NONE) {
++      throw new IllegalArgumentException("Not a quantifier: " + operator);
++    }
++
+     Path path = path();
+     Class<?> newType; // new path starts at this root
+     try {
+@@ -158,7 +163,7 @@ public final class CriteriaContext implements Queryable {
+     }
+ 
+     Path newPath = Path.ofClass(newType);
+-    Combiner combiner = ((left, right) -> Expressions.binaryCall(IterableOperators.ANY, path, right));
++    Combiner combiner = ((left, right) -> Expressions.binaryCall(operator, path, right));
+     return new CriteriaContext(previous, state.withCombiner(combiner).withPartial(newPath));
+   }
+ 
+diff --git a/criteria/common/src/org/immutables/criteria/matcher/IterableMatcher.java b/criteria/common/src/org/immutables/criteria/matcher/IterableMatcher.java
+index 1793c8d..88856f4 100644
+--- a/criteria/common/src/org/immutables/criteria/matcher/IterableMatcher.java
++++ b/criteria/common/src/org/immutables/criteria/matcher/IterableMatcher.java
+@@ -55,7 +55,21 @@ public interface IterableMatcher<R, S, V> extends Matcher {
+    * Match at least one element of this iterable
+    */
+   default S any() {
+-    return Matchers.extract(this).any().create();
++    return Matchers.extract(this).quantify(IterableOperators.ANY).create();
++  }
++
++  /**
++   * Match every element of this iterable.
++   */
++  default S all() {
++    return Matchers.extract(this).quantify(IterableOperators.ALL).create();
++  }
++
++  /**
++   * Match when no element of this iterable matches.
++   */
++  default S none() {
++    return Matchers.extract(this).quantify(IterableOperators.NONE).create();
+   }
+ 
+   interface Self<R, V, P> extends Template<Self<R, V, P>, Self<R, V, P>, V, P>, Disjunction<Self<R, V, P>> {}
+diff --git a/criteria/common/test/org/immutables/criteria/personmodel/AbstractPersonTest.java b/criteria/common/test/org/immutables/criteria/personmodel/AbstractPersonTest.java
+index 4bb4712..d8c38ea 100644
+--- a/criteria/common/test/org/immutables/criteria/personmodel/AbstractPersonTest.java
++++ b/criteria/common/test/org/immutables/criteria/personmodel/AbstractPersonTest.java
+@@ -64,6 +64,7 @@ public abstract class AbstractPersonTest {
+     ITERABLE_SIZE, // supports filtering on iterables sizes
+     ITERABLE_CONTAINS, // can search inside inner collections
+     ITERABLE_ANY, // can search inside a nested inner collections
++    ITERABLE_ALL_NONE,
+     STRING_LENGTH
+   }
+ 
+@@ -141,6 +142,34 @@ public abstract class AbstractPersonTest {
+     check(person.dateOfBirth.is(LocalDate.of(1990, 2, 2))).hasSize(1);
+   }
+ 
++  @Test
++  public void iterableAllNone() {
++    assumeFeature(Feature.ITERABLE_ALL_NONE);
++    PersonGenerator generator = new PersonGenerator();
++    Toy goodToy = ImmutableToy.builder().name("ball").type(ToyType.ring).build();
++    Toy brokenToy = ImmutableToy.builder().name("broken").type(ToyType.robot).build();
++
++    insert(generator.next().withId("quant-empty").withFullName("Empty").withPets());
++    insert(generator.next().withId("quant-good").withFullName("Good").withPets(
++        ImmutablePet.builder().name("fluffy").type(Pet.PetType.dog).build()));
++    insert(generator.next().withId("quant-mixed").withFullName("Mixed").withPets(
++        ImmutablePet.builder().name("fluffy").type(Pet.PetType.dog).addToys(goodToy).build(),
++        ImmutablePet.builder().name("oopsy").type(Pet.PetType.cat).addToys(brokenToy).build()));
++
++    check(repository().find(person.pets.all().name.startsWith("fl")))
++        .toList(Person::fullName).hasContentInAnyOrder("Empty", "Good");
++    check(repository().find(person.pets.none().name.startsWith("oo")))
++        .toList(Person::fullName).hasContentInAnyOrder("Empty", "Good");
++    check(repository().find(person.pets.all().toys.isEmpty()))
++        .toList(Person::fullName).hasContentInAnyOrder("Empty", "Good");
++    check(repository().find(person.pets.all().address.isAbsent()))
++        .toList(Person::fullName).hasContentInAnyOrder("Empty", "Good", "Mixed");
++    check(repository().find(person.pets.all().with(pet -> pet.toys.none().name.is("broken"))))
++        .toList(Person::fullName).hasContentInAnyOrder("Empty", "Good");
++    check(repository().find(person.pets.any().with(pet ->
++        pet.name.is("fluffy").and(pet.toys.any().name.is("broken"))))).empty();
++  }
++
+   @Test
+   public void intComparison() throws Exception {
+     Person john = new PersonGenerator().next().withId("john").withFullName("John").withAge(30);
+diff --git a/criteria/common/test/org/immutables/criteria/typemodel/AnyTemplate.java b/criteria/common/test/org/immutables/criteria/typemodel/AnyTemplate.java
+index 8933a75..8ac70db 100644
+--- a/criteria/common/test/org/immutables/criteria/typemodel/AnyTemplate.java
++++ b/criteria/common/test/org/immutables/criteria/typemodel/AnyTemplate.java
+@@ -18,40 +18,104 @@ package org.immutables.criteria.typemodel;
+ 
+ import org.immutables.check.IterableChecker;
+ import org.immutables.criteria.backend.Backend;
+-import org.immutables.criteria.matcher.IterableMatcher;
+ import org.immutables.criteria.personmodel.CriteriaChecker;
+ import org.junit.jupiter.api.Test;
+ 
++import java.util.Arrays;
+ import java.util.List;
+ import java.util.function.Supplier;
+ 
+ /**
+- * Testing {@link IterableMatcher#any()} functionality of the matcher.
+- * At least one element in sub-array matches.
++ * Testing collection element quantifiers.
+  */
+ public abstract class AnyTemplate {
+ 
+   private final StringHolderRepository repository;
++  private final IntegerHolderRepository integers;
+   private final StringHolderCriteria string = StringHolderCriteria.stringHolder;
++  private final IntegerHolderCriteria integer = IntegerHolderCriteria.integerHolder;
+   private final Supplier<ImmutableStringHolder> generator;
++  private final Supplier<ImmutableIntegerHolder> integerGenerator;
+ 
+   protected AnyTemplate(Backend backend) {
+     this.repository = new StringHolderRepository(backend);
++    this.integers = new IntegerHolderRepository(backend);
+     this.generator = TypeHolder.StringHolder.generator();
++    this.integerGenerator = TypeHolder.IntegerHolder.generator();
+   }
+ 
+   @Test
+   void empty() {
+-    ids(string.array.any().is("")).isEmpty();
+-    ids(string.array.any().isNot("")).isEmpty();
++    insert("empty");
++
+     ids(string.array.any().is("a")).isEmpty();
++    ids(string.array.all().is("a")).isOf("empty");
++    ids(string.array.none().is("a")).isOf("empty");
++    ids(string.list.any().is("a")).isEmpty();
++    ids(string.list.all().is("a")).isOf("empty");
++    ids(string.list.none().is("a")).isOf("empty");
++  }
++
++  @Test
++  void scalarArrayAndList() {
++    insert("all-a", "a", "aa");
++    insert("mixed", "a", "b");
++    insert("all-b", "b", "bb");
++
++    ids(string.array.any().startsWith("a")).hasContentInAnyOrder("all-a", "mixed");
++    ids(string.array.all().startsWith("a")).isOf("all-a");
++    ids(string.array.none().startsWith("a")).isOf("all-b");
++
++    ids(string.list.any().endsWith("b")).hasContentInAnyOrder("mixed", "all-b");
++    ids(string.list.all().hasLength(1)).isOf("mixed");
++    ids(string.list.none().contains("z")).hasContentInAnyOrder("all-a", "mixed", "all-b");
++  }
++
++  @Test
++  void negativeAndCompound() {
++    insert("same", "a", "a");
++    insert("different", "a", "b");
++
++    ids(string.array.any().isNot("a")).isOf("different");
++    ids(string.array.all().isNot("a")).isEmpty();
++    ids(string.array.none().isNot("a")).isOf("same");
++
++    ids(string.array.any().with(v -> v.is("a").is("b"))).isEmpty();
++    ids(string.array.none().with(v -> v.is("a").is("b")))
++        .hasContentInAnyOrder("same", "different");
++    ids(string.array.all().with(v -> v.is("a").or().is("b")))
++        .hasContentInAnyOrder("same", "different");
++  }
++
++  @Test
++  void nullElementIsUnknown() {
++    repository.insert(generator.get().withId("null-element").withArray("a", null));
++
+     ids(string.array.any().isNot("a")).isEmpty();
+-    ids(string.array.any().isEmpty()).isEmpty();
+-    ids(string.array.any().notEmpty()).isEmpty();
++    ids(string.array.all().is("a")).isEmpty();
++    ids(string.array.none().isNot("a")).isOf("null-element");
++  }
++
++  @Test
++  void primitiveArray() {
++    integers.insert(integerGenerator.get().withId("positive").withArray(1, 2, 3));
++    integers.insert(integerGenerator.get().withId("mixed").withArray(-1, 1));
++    integers.insert(integerGenerator.get().withId("empty").withArray());
++
++    integerIds(integer.array.any().greaterThan(0)).hasContentInAnyOrder("positive", "mixed");
++    integerIds(integer.array.all().greaterThan(0)).hasContentInAnyOrder("positive", "empty");
++    integerIds(integer.array.none().greaterThan(0)).isOf("empty");
++  }
++
++  private void insert(String id, String... values) {
++    repository.insert(generator.get().withId(id).withArray(values).withList(Arrays.asList(values)));
+   }
+ 
+   private IterableChecker<List<String>, String> ids(StringHolderCriteria criteria) {
+     return CriteriaChecker.<TypeHolder.StringHolder>ofReader(repository.find(criteria)).toList(TypeHolder.StringHolder::id);
+   }
+ 
++  private IterableChecker<List<String>, String> integerIds(IntegerHolderCriteria criteria) {
++    return CriteriaChecker.<TypeHolder.IntegerHolder>ofReader(integers.find(criteria)).toList(TypeHolder.IntegerHolder::id);
++  }
+ }
+diff --git a/criteria/inmemory/src/org/immutables/criteria/inmemory/ExpressionInterpreter.java b/criteria/inmemory/src/org/immutables/criteria/inmemory/ExpressionInterpreter.java
+index e98c9ee..cd8d7a7 100644
+--- a/criteria/inmemory/src/org/immutables/criteria/inmemory/ExpressionInterpreter.java
++++ b/criteria/inmemory/src/org/immutables/criteria/inmemory/ExpressionInterpreter.java
+@@ -30,6 +30,8 @@ import org.immutables.criteria.expression.OptionalOperators;
+ import org.immutables.criteria.expression.Path;
+ import org.immutables.criteria.expression.StringOperators;
+ 
++import java.lang.reflect.Array;
++import java.util.AbstractList;
+ import java.util.List;
+ import java.util.Objects;
+ import java.util.function.Function;
+@@ -113,8 +115,11 @@ class ExpressionInterpreter implements Function<Object, Object> {
+           return UNKNOWN;
+         }
+ 
+-        Preconditions.checkArgument(value instanceof Iterable, "%s not iterable", value.getClass().getName());
+-        final boolean empty = Iterables.isEmpty((Iterable<?>) value);
++        Iterable<?> iterable = asIterable(value);
++        if (iterable == null) {
++          return UNKNOWN;
++        }
++        final boolean empty = Iterables.isEmpty(iterable);
+         return (op == IterableOperators.IS_EMPTY) == empty;
+       }
+ 
+@@ -142,35 +147,43 @@ class ExpressionInterpreter implements Function<Object, Object> {
+ 
+       if (op == Operators.AND || op == Operators.OR) {
+         Preconditions.checkArgument(!args.isEmpty(), "empty args for %s", op);
+-        final boolean shortCircuit = op == Operators.OR;
+-        boolean prev = !shortCircuit;
++        final boolean decisive = op == Operators.OR;
++        boolean unknown = false;
+         for (Expression exp:args) {
+           final Object result = exp.accept(this);
+           if (result == null || result == UNKNOWN) {
+-            return UNKNOWN;
+-          } else if (prev == shortCircuit || Objects.equals(shortCircuit, result)) {
+-            return shortCircuit;
+-          } else {
+-            // continue evaluating
+-            prev = (Boolean) result;
++            unknown = true;
++          } else if (Objects.equals(decisive, result)) {
++            return decisive;
+           }
+         }
+ 
+-        return prev;
++        return unknown ? UNKNOWN : !decisive;
+       }
+       
+-      if (op == IterableOperators.ANY) {
++      if (op == IterableOperators.ANY || op == IterableOperators.ALL || op == IterableOperators.NONE) {
+         Preconditions.checkArgument(call.arguments().size() == 2, "Expected two arguments for %s got %s", call, call.arguments().size());
+-        
++
+         final Object left = call.arguments().get(0).accept(this);
+-        Preconditions.checkArgument(left instanceof Iterable, "%s is not iterable", left);
+-        @SuppressWarnings("unchecked")
+-        final Iterable<Object> leftIterable = (Iterable<Object>) left;
++        if (left == UNKNOWN) {
++          return UNKNOWN;
++        }
++        final Iterable<?> leftIterable = asIterable(left);
++        if (leftIterable == null) {
++          return UNKNOWN;
++        }
+         Preconditions.checkArgument(call.arguments().get(1) instanceof Call, "%s is not a call", call.arguments().get(1));
+         final Call rightCall = (Call) call.arguments().get(1);
+ 
+-        final Stream<Object> stream = StreamSupport.stream(leftIterable.spliterator(), false);
+-        return stream.anyMatch(r -> ExpressionInterpreter.of(rightCall).asPredicate().test(r));
++        final Stream<?> stream = StreamSupport.stream(leftIterable.spliterator(), false);
++        Predicate<Object> predicate = ExpressionInterpreter.of(rightCall).asPredicate();
++        if (op == IterableOperators.ANY) {
++          return stream.anyMatch(predicate);
++        }
++        if (op == IterableOperators.ALL) {
++          return stream.allMatch(predicate);
++        }
++        return stream.noneMatch(predicate);
+       }
+ 
+       if (op.arity() == Operator.Arity.BINARY) {
+@@ -209,16 +222,18 @@ class ExpressionInterpreter implements Function<Object, Object> {
+       }
+ 
+       if (op == IterableOperators.HAS_SIZE) {
+-        Preconditions.checkArgument(left instanceof Iterable, "%s is not iterable", left);
++        Iterable<?> iter = asIterable(left);
++        if (iter == null) {
++          return UNKNOWN;
++        }
+         Preconditions.checkArgument(right instanceof Number, "%s is not a number", left);
+-        final Iterable<?> iter = (Iterable<?>) left;
+         final int size = ((Number) right).intValue();
+         return Iterables.size(iter) == size;
+       }
+ 
+       if (op == IterableOperators.CONTAINS) {
+-        Preconditions.checkArgument(left instanceof Iterable, "%s is not iterable", left);
+-        return Iterables.contains((Iterable<?>) left, right);
++        Iterable<?> iterable = asIterable(left);
++        return iterable == null ? UNKNOWN : Iterables.contains(iterable, right);
+       }
+ 
+       // comparables
+@@ -271,6 +286,26 @@ class ExpressionInterpreter implements Function<Object, Object> {
+       throw new UnsupportedOperationException("Unsupported binary call " + call);
+     }
+ 
++    private static Iterable<?> asIterable(Object value) {
++      if (value instanceof Iterable) {
++        return (Iterable<?>) value;
++      }
++      if (value != null && value.getClass().isArray()) {
++        return new AbstractList<Object>() {
++          @Override
++          public Object get(int index) {
++            return Array.get(value, index);
++          }
++
++          @Override
++          public int size() {
++            return Array.getLength(value);
++          }
++        };
++      }
++      return null;
++    }
++
+     @Override
+     public Object visit(Constant constant) {
+       return constant.value();
+@@ -278,7 +313,12 @@ class ExpressionInterpreter implements Function<Object, Object> {
+ 
+     @Override
+     public Object visit(Path path) {
+-      final Object extracted = EXTRACTOR.extract(path, instance);
++      Object extracted = EXTRACTOR.extract(path, instance);
++      if (path.isRoot() && extracted instanceof java.util.Optional) {
++        extracted = ((java.util.Optional<?>) extracted).orElse(null);
++      } else if (path.isRoot() && extracted instanceof com.Capella.common.base.Optional) {
++        extracted = ((com.Capella.common.base.Optional<?>) extracted).orNull();
++      }
+       return extracted == null ? UNKNOWN : extracted;
+     }
+   }
+diff --git a/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryIntegrationTest.java b/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryIntegrationTest.java
+index 7ee5f5b..08c4ed1 100644
+--- a/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryIntegrationTest.java
++++ b/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryIntegrationTest.java
+@@ -17,6 +17,7 @@
+ package org.immutables.criteria.inmemory;
+ 
+ import org.immutables.criteria.backend.Backend;
++import org.immutables.criteria.typemodel.AnyTemplate;
+ import org.immutables.criteria.typemodel.BigDecimalTemplate;
+ import org.immutables.criteria.typemodel.BooleanLogicTemplate;
+ import org.immutables.criteria.typemodel.BooleanTemplate;
+@@ -42,6 +43,13 @@ class InMemoryIntegrationTest {
+ 
+   private final Backend backend = new InMemoryBackend();
+ 
++  @Nested
++  class AnyTest extends AnyTemplate {
++    private AnyTest() {
++      super(backend);
++    }
++  }
++
+   @Nested
+   class StringTest extends StringTemplate {
+     private StringTest() {
+diff --git a/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryPersonTest.java b/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryPersonTest.java
+index ee0b1a8..2e6eeb0 100644
+--- a/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryPersonTest.java
++++ b/criteria/inmemory/test/org/immutables/criteria/inmemory/InMemoryPersonTest.java
+@@ -41,6 +41,7 @@ public class InMemoryPersonTest extends AbstractPersonTest  {
+             Feature.ITERABLE_SIZE,
+             Feature.ITERABLE_CONTAINS,
+             Feature.ITERABLE_ANY,
++            Feature.ITERABLE_ALL_NONE,
+             Feature.STRING_LENGTH);
+   }
+ 
+diff --git a/criteria/mongo/src/org/immutables/criteria/mongo/FindVisitor.java b/criteria/mongo/src/org/immutables/criteria/mongo/FindVisitor.java
+index ac22d15..edd3185 100644
+--- a/criteria/mongo/src/org/immutables/criteria/mongo/FindVisitor.java
++++ b/criteria/mongo/src/org/immutables/criteria/mongo/FindVisitor.java
+@@ -108,6 +108,11 @@ class FindVisitor extends AbstractExpressionVisitor<Bson> {
+               : Filters.and(Filters.exists(field), Filters.ne(field, null), Filters.ne(field, Collections.emptyList()));
+     }
+     
++    if (op == IterableOperators.ALL || op == IterableOperators.NONE ||
++        (op == IterableOperators.ANY && !isLegacyFlatAny(call))) {
++      return new QuantifierFindVisitor(this.naming, this.codecRegistry).filter(call);
++    }
++
+     if (op == IterableOperators.ANY) {
+       Call rightCall = call;
+       Path path = null;
+@@ -167,6 +172,19 @@ class FindVisitor extends AbstractExpressionVisitor<Bson> {
+     throw new UnsupportedOperationException(String.format("Not yet supported (%s): %s", call.operator(), call));
+   }
+ 
++  private static boolean isLegacyFlatAny(Call call) {
++    if (call.arguments().size() != 2 || !(call.arguments().get(1) instanceof Call)) {
++      return false;
++    }
++
++    Operator operator = ((Call) call.arguments().get(1)).operator();
++    return operator == Operators.EQUAL || operator == Operators.IN ||
++        ComparableOperators.isComparable(operator) ||
++        operator == StringOperators.MATCHES || operator == StringOperators.CONTAINS ||
++        operator == StringOperators.STARTS_WITH || operator == StringOperators.ENDS_WITH ||
++        operator == StringOperators.HAS_LENGTH;
++  }
++
+   private Bson binaryCall(Call call) {
+     Preconditions.checkArgument(call.operator().arity() == Operator.Arity.BINARY, "%s is not binary", call.operator());
+     final Operator op = call.operator();
+diff --git a/criteria/mongo/src/org/immutables/criteria/mongo/QuantifierFindVisitor.java b/criteria/mongo/src/org/immutables/criteria/mongo/QuantifierFindVisitor.java
+new file mode 100644
+index 0000000..ca379d2
+--- /dev/null
++++ b/criteria/mongo/src/org/immutables/criteria/mongo/QuantifierFindVisitor.java
+@@ -0,0 +1,385 @@
++package org.immutables.criteria.mongo;
++
++import com.Capella.common.base.Preconditions;
++import com.Capella.common.collect.ImmutableSet;
++import com.mongodb.client.model.Filters;
++import org.bson.BsonDocument;
++import org.bson.BsonInt32;
++import org.bson.BsonNull;
++import org.bson.BsonType;
++import org.bson.BsonValue;
++import org.bson.codecs.configuration.CodecRegistry;
++import org.bson.conversions.Bson;
++import org.immutables.criteria.backend.PathNaming;
++import org.immutables.criteria.expression.Call;
++import org.immutables.criteria.expression.ComparableOperators;
++import org.immutables.criteria.expression.Expression;
++import org.immutables.criteria.expression.IterableOperators;
++import org.immutables.criteria.expression.Operator;
++import org.immutables.criteria.expression.Operators;
++import org.immutables.criteria.expression.OptionalOperators;
++import org.immutables.criteria.expression.Path;
++import org.immutables.criteria.expression.StringOperators;
++import org.immutables.criteria.expression.Visitors;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.List;
++import java.util.Objects;
++import java.util.regex.Pattern;
++
++final class QuantifierFindVisitor {
++
++  private final PathNaming naming;
++  private final CodecRegistry codecRegistry;
++
++  QuantifierFindVisitor(PathNaming naming, CodecRegistry codecRegistry) {
++    this.naming = Objects.requireNonNull(naming, "naming");
++    this.codecRegistry = Objects.requireNonNull(codecRegistry, "codecRegistry");
++  }
++
++  Bson filter(Call call) {
++    return truth(call).trueCondition;
++  }
++
++  private Truth truth(Expression expression) {
++    Preconditions.checkArgument(expression instanceof Call, "%s is not a call", expression);
++    Call call = (Call) expression;
++    Operator operator = call.operator();
++
++    if (operator == Operators.NOT) {
++      Truth inner = truth(call.arguments().get(0));
++      return new Truth(inner.falseCondition, inner.trueCondition, inner.unknownCondition, inner.scalar);
++    }
++
++    if (operator == Operators.AND || operator == Operators.OR) {
++      List<Bson> trueConditions = new ArrayList<>();
++      List<Bson> falseConditions = new ArrayList<>();
++      List<Bson> unknownConditions = new ArrayList<>();
++      boolean scalar = true;
++      for (Expression argument : call.arguments()) {
++        Truth child = truth(argument);
++        trueConditions.add(child.trueCondition);
++        falseConditions.add(child.falseCondition);
++        unknownConditions.add(child.unknownCondition);
++        scalar &= child.scalar;
++      }
++
++      if (operator == Operators.AND) {
++        Bson trueCondition = scalar ? scalarAnd(trueConditions) : Filters.and(trueConditions);
++        Bson falseCondition = scalar ? scalarOr(falseConditions) : Filters.or(falseConditions);
++        Bson unknownCondition = scalar
++            ? new BsonDocument("$eq", BsonNull.VALUE)
++            : Filters.and(Filters.nor(falseCondition), Filters.or(unknownConditions));
++        return new Truth(trueCondition, falseCondition, unknownCondition, scalar);
++      }
++
++      Bson trueCondition = scalar ? scalarOr(trueConditions) : Filters.or(trueConditions);
++      Bson falseCondition = scalar ? scalarAnd(falseConditions) : Filters.and(falseConditions);
++      Bson unknownCondition = scalar
++          ? new BsonDocument("$eq", BsonNull.VALUE)
++          : Filters.and(Filters.nor(trueCondition), Filters.or(unknownConditions));
++      return new Truth(trueCondition, falseCondition, unknownCondition, scalar);
++    }
++
++    if (isQuantifier(operator)) {
++      return quantified(call);
++    }
++
++    Path path = Visitors.toPath(call.arguments().get(0));
++    boolean scalar = path.members().isEmpty();
++
++    if (operator == OptionalOperators.IS_PRESENT || operator == OptionalOperators.IS_ABSENT) {
++      Bson present = present(path);
++      Bson absent = absent(path);
++      return operator == OptionalOperators.IS_PRESENT
++          ? new Truth(present, absent, impossible(scalar), scalar)
++          : new Truth(absent, present, impossible(scalar), scalar);
++    }
++
++    if (operator == IterableOperators.IS_EMPTY || operator == IterableOperators.NOT_EMPTY) {
++      Bson known = type(path, BsonType.ARRAY);
++      Bson unknown = notType(path, BsonType.ARRAY);
++      Bson empty = condition(path, new BsonDocument("$eq", new org.bson.BsonArray()));
++      Bson nonEmpty = condition(path, new BsonDocument("$ne", new org.bson.BsonArray()));
++      return operator == IterableOperators.IS_EMPTY
++          ? new Truth(Filters.and(known, empty), Filters.and(known, nonEmpty), unknown, scalar)
++          : new Truth(Filters.and(known, nonEmpty), Filters.and(known, empty), unknown, scalar);
++    }
++
++    Preconditions.checkArgument(operator.arity() == Operator.Arity.BINARY, "Unsupported quantified call %s", call);
++    Object value = Visitors.toConstant(call.arguments().get(1)).value();
++    Bson trueCondition;
++    Bson falseCondition;
++    Bson unknownCondition = absent(path);
++
++    if (scalar && (operator == Operators.EQUAL || operator == Operators.NOT_EQUAL)) {
++      Bson equal = new BsonDocument("$eq", encode(value));
++      Bson notEqual = new BsonDocument("$nin", new org.bson.BsonArray(Arrays.asList(encode(value), BsonNull.VALUE)));
++      trueCondition = operator == Operators.EQUAL ? equal : notEqual;
++      falseCondition = operator == Operators.EQUAL ? notEqual : equal;
++    } else if (operator == Operators.EQUAL || operator == Operators.NOT_EQUAL) {
++      Bson equal = condition(path, new BsonDocument("$eq", encode(value)));
++      Bson notEqual = condition(path, new BsonDocument("$ne", encode(value)));
++      trueCondition = operator == Operators.EQUAL ? equal : notEqual;
++      falseCondition = operator == Operators.EQUAL ? notEqual : equal;
++    } else if (operator == Operators.IN || operator == Operators.NOT_IN) {
++      Collection<?> values = ImmutableSet.copyOf(Visitors.toConstant(call.arguments().get(1)).values());
++      BsonValue encoded = encode(values);
++      Collection<Object> valuesWithNull = new ArrayList<>();
++      valuesWithNull.addAll(values);
++      valuesWithNull.add(null);
++      Bson in = condition(path, new BsonDocument("$in", encoded));
++      Bson notIn = condition(path, new BsonDocument("$nin", scalar ? encode(valuesWithNull) : encoded));
++      trueCondition = operator == Operators.IN ? in : notIn;
++      falseCondition = operator == Operators.IN ? notIn : in;
++    } else if (ComparableOperators.isComparable(operator)) {
++      String queryOperator = comparisonName(operator);
++      String inverseOperator = inverseComparisonName(operator);
++      BsonDocument trueComparison = new BsonDocument(queryOperator, encode(value));
++      BsonDocument falseComparison = new BsonDocument(inverseOperator, encode(value));
++      if (scalar) {
++        trueComparison.append("$ne", BsonNull.VALUE);
++        falseComparison.append("$ne", BsonNull.VALUE);
++      }
++      trueCondition = condition(path, trueComparison);
++      falseCondition = condition(path, falseComparison);
++    } else if (operator == IterableOperators.HAS_SIZE) {
++      Bson known = type(path, BsonType.ARRAY);
++      unknownCondition = notType(path, BsonType.ARRAY);
++      Bson size = condition(path, new BsonDocument("$size", new BsonInt32(((Number) value).intValue())));
++      trueCondition = Filters.and(known, size);
++      falseCondition = Filters.and(known, Filters.nor(size));
++    } else if (operator == IterableOperators.CONTAINS) {
++      Bson known = type(path, BsonType.ARRAY);
++      unknownCondition = notType(path, BsonType.ARRAY);
++      Bson contains = condition(path, new BsonDocument("$eq", encode(value)));
++      trueCondition = Filters.and(known, contains);
++      falseCondition = Filters.and(known, Filters.nor(contains));
++    } else if (operator == StringOperators.MATCHES || operator == StringOperators.CONTAINS ||
++        operator == StringOperators.STARTS_WITH || operator == StringOperators.ENDS_WITH ||
++        operator == StringOperators.HAS_LENGTH) {
++      Pattern pattern = stringPattern(operator, value);
++      Bson known = type(path, BsonType.STRING);
++      unknownCondition = notType(path, BsonType.STRING);
++      Bson matches = regex(path, pattern);
++      if (scalar) {
++        BsonValue regexValue = Filters.regex("_", pattern).toBsonDocument(BsonDocument.class, codecRegistry).get("_");
++        BsonValue complement = Filters.regex("_", negate(pattern))
++            .toBsonDocument(BsonDocument.class, codecRegistry).get("_");
++        trueCondition = scalarRegex(regexValue);
++        falseCondition = scalarRegex(complement);
++      } else {
++        trueCondition = Filters.and(known, matches);
++        falseCondition = Filters.and(known, Filters.nor(matches));
++      }
++    } else {
++      throw new UnsupportedOperationException("Unsupported operator in quantified scope: " + operator);
++    }
++
++    Bson known = present(path);
++    if (!scalar && (operator == Operators.NOT_EQUAL || operator == Operators.NOT_IN ||
++        operator == Operators.EQUAL || operator == Operators.IN || ComparableOperators.isComparable(operator))) {
++      trueCondition = Filters.and(known, trueCondition);
++      falseCondition = Filters.and(known, falseCondition);
++    }
++    return new Truth(trueCondition, falseCondition, unknownCondition, scalar);
++  }
++
++  private Truth quantified(Call call) {
++    Preconditions.checkArgument(call.arguments().size() == 2, "Expected two arguments for %s", call);
++    Path path = Visitors.toPath(call.arguments().get(0));
++    Preconditions.checkArgument(!path.members().isEmpty(), "Nested collection elements are not supported");
++    Truth element = truth(call.arguments().get(1));
++    Bson array = type(path, BsonType.ARRAY);
++    Bson notArray = notType(path, BsonType.ARRAY);
++    Bson anyTrue = elemMatch(path, element.trueCondition);
++    Bson noTrue = notElemMatch(path, element.trueCondition);
++    Bson anyNotTrue = element.scalar
++        ? Filters.or(elemMatch(path, element.falseCondition), elemMatch(path, element.unknownCondition))
++        : elemMatch(path, Filters.or(element.falseCondition, element.unknownCondition));
++    Bson noNotTrue = element.scalar
++        ? Filters.and(notElemMatch(path, element.falseCondition), notElemMatch(path, element.unknownCondition))
++        : notElemMatch(path, Filters.or(element.falseCondition, element.unknownCondition));
++
++    if (call.operator() == IterableOperators.ANY) {
++      return new Truth(Filters.and(array, anyTrue), Filters.and(array, noTrue), notArray, false);
++    }
++    if (call.operator() == IterableOperators.ALL) {
++      return new Truth(Filters.and(array, noNotTrue), Filters.and(array, anyNotTrue), notArray, false);
++    }
++    return new Truth(Filters.and(array, noTrue), Filters.and(array, anyTrue), notArray, false);
++  }
++
++  private Bson condition(Path path, BsonValue condition) {
++    if (path.members().isEmpty()) {
++      return condition.asDocument();
++    }
++    return new BsonDocument(naming.name(path), condition);
++  }
++
++  private Bson regex(Path path, Pattern pattern) {
++    BsonDocument document = Filters.regex("_", pattern).toBsonDocument(BsonDocument.class, codecRegistry);
++    BsonValue regex = document.get("_");
++    return path.members().isEmpty() ? new BsonDocument("$regex", regex) : condition(path, regex);
++  }
++
++  private Bson present(Path path) {
++    if (path.members().isEmpty()) {
++      return new BsonDocument("$ne", BsonNull.VALUE);
++    }
++    String field = naming.name(path);
++    return Filters.and(Filters.exists(field), Filters.ne(field, null));
++  }
++
++  private Bson absent(Path path) {
++    if (path.members().isEmpty()) {
++      return new BsonDocument("$eq", BsonNull.VALUE);
++    }
++    String field = naming.name(path);
++    return Filters.or(Filters.exists(field, false), Filters.eq(field, null));
++  }
++
++  private Bson type(Path path, BsonType type) {
++    if (path.members().isEmpty()) {
++      return new BsonDocument("$type", new BsonInt32(type.getValue()));
++    }
++    return Filters.type(naming.name(path), type);
++  }
++
++  private Bson notType(Path path, BsonType type) {
++    BsonDocument typeCondition = new BsonDocument("$type", new BsonInt32(type.getValue()));
++    if (path.members().isEmpty()) {
++      return new BsonDocument("$not", typeCondition);
++    }
++    return new BsonDocument(naming.name(path), new BsonDocument("$not", typeCondition));
++  }
++
++  private Bson elemMatch(Path path, Bson condition) {
++    return Filters.elemMatch(naming.name(path), condition);
++  }
++
++  private Bson notElemMatch(Path path, Bson condition) {
++    BsonDocument elemMatch = new BsonDocument("$elemMatch", bson(condition));
++    return new BsonDocument(naming.name(path), new BsonDocument("$not", elemMatch));
++  }
++
++  private BsonValue encode(Object value) {
++    return Filters.eq("_", value).toBsonDocument(BsonDocument.class, codecRegistry).get("_");
++  }
++
++  private BsonDocument bson(Bson value) {
++    return value.toBsonDocument(BsonDocument.class, codecRegistry);
++  }
++
++  private static Bson scalarRegex(BsonValue regexValue) {
++    org.bson.BsonRegularExpression regex = regexValue.asRegularExpression();
++    BsonDocument condition = new BsonDocument("$type", new BsonInt32(BsonType.STRING.getValue()))
++        .append("$regex", new org.bson.BsonString(regex.getPattern()));
++    if (!regex.getOptions().isEmpty()) {
++      condition.append("$options", new org.bson.BsonString(regex.getOptions()));
++    }
++    return condition;
++  }
++
++  private Bson scalarAnd(List<Bson> conditions) {
++    BsonDocument result = new BsonDocument();
++    List<BsonValue> excluded = new ArrayList<>();
++    for (Bson condition : conditions) {
++      BsonDocument document = bson(condition);
++      for (String key : document.keySet()) {
++        BsonValue value = document.get(key);
++        if (key.equals("$ne")) {
++          excluded.add(value);
++        } else if (key.equals("$nin")) {
++          excluded.addAll(value.asArray());
++        } else if (key.equals("$eq") && result.containsKey("$eq") && !result.get("$eq").equals(value)) {
++          return new BsonDocument("$in", new org.bson.BsonArray());
++        } else {
++          result.put(key, value);
++        }
++      }
++    }
++    if (!excluded.isEmpty()) {
++      result.put("$nin", new org.bson.BsonArray(excluded));
++    }
++    return result;
++  }
++
++  private Bson scalarOr(List<Bson> conditions) {
++    List<BsonValue> included = new ArrayList<>();
++    for (Bson condition : conditions) {
++      BsonDocument document = bson(condition);
++      if (document.size() == 1 && document.containsKey("$eq")) {
++        included.add(document.get("$eq"));
++      } else if (document.size() == 1 && document.containsKey("$in")) {
++        included.addAll(document.getArray("$in"));
++      } else {
++        return Filters.or(conditions);
++      }
++    }
++    return new BsonDocument("$in", new org.bson.BsonArray(included));
++  }
++
++  private static Pattern negate(Pattern pattern) {
++    return Pattern.compile("^(?![\\s\\S]*?(?:" + pattern.pattern() + "))[\\s\\S]*$", pattern.flags());
++  }
++
++  private static Pattern stringPattern(Operator operator, Object value) {
++    if (operator == StringOperators.MATCHES) {
++      return (Pattern) value;
++    }
++    if (operator == StringOperators.HAS_LENGTH) {
++      return Pattern.compile("^(?:[\\s\\S]){" + ((Number) value).intValue() + "}$");
++    }
++    String quoted = Pattern.quote(value.toString());
++    if (operator == StringOperators.STARTS_WITH) {
++      return Pattern.compile("^" + quoted);
++    }
++    if (operator == StringOperators.ENDS_WITH) {
++      return Pattern.compile(quoted + "$");
++    }
++    return Pattern.compile(quoted);
++  }
++
++  private static boolean isQuantifier(Operator operator) {
++    return operator == IterableOperators.ANY || operator == IterableOperators.ALL || operator == IterableOperators.NONE;
++  }
++
++  private static String comparisonName(Operator operator) {
++    if (operator == ComparableOperators.GREATER_THAN) return "$gt";
++    if (operator == ComparableOperators.GREATER_THAN_OR_EQUAL) return "$gte";
++    if (operator == ComparableOperators.LESS_THAN) return "$lt";
++    if (operator == ComparableOperators.LESS_THAN_OR_EQUAL) return "$lte";
++    throw new IllegalArgumentException("Not a comparison: " + operator);
++  }
++
++  private static String inverseComparisonName(Operator operator) {
++    if (operator == ComparableOperators.GREATER_THAN) return "$lte";
++    if (operator == ComparableOperators.GREATER_THAN_OR_EQUAL) return "$lt";
++    if (operator == ComparableOperators.LESS_THAN) return "$gte";
++    if (operator == ComparableOperators.LESS_THAN_OR_EQUAL) return "$gt";
++    throw new IllegalArgumentException("Not a comparison: " + operator);
++  }
++
++  private static Bson impossible(boolean scalar) {
++    return scalar
++        ? new BsonDocument("$in", new org.bson.BsonArray())
++        : Filters.and(Filters.exists("_criteria_impossible_"), Filters.exists("_criteria_impossible_", false));
++  }
++
++  private static final class Truth {
++    private final Bson trueCondition;
++    private final Bson falseCondition;
++    private final Bson unknownCondition;
++    private final boolean scalar;
++
++    private Truth(Bson trueCondition, Bson falseCondition, Bson unknownCondition, boolean scalar) {
++      this.trueCondition = trueCondition;
++      this.falseCondition = falseCondition;
++      this.unknownCondition = unknownCondition;
++      this.scalar = scalar;
++    }
++  }
++}
+diff --git a/criteria/mongo/test/org/immutables/criteria/mongo/FindVisitorTest.java b/criteria/mongo/test/org/immutables/criteria/mongo/FindVisitorTest.java
+index 5363e1a..f66e4d8 100644
+--- a/criteria/mongo/test/org/immutables/criteria/mongo/FindVisitorTest.java
++++ b/criteria/mongo/test/org/immutables/criteria/mongo/FindVisitorTest.java
+@@ -115,8 +115,8 @@ class FindVisitorTest {
+     check(this.criteria.list.any().is("x")).matches("{list: 'x'}");
+     check(this.criteria.list.any().in(Arrays.asList("x", "y"))).matches("{list: {$in: ['x','y']}}");
+     // negative operators: $elemMatch required for existential ("at least one") semantics
+-    check(this.criteria.list.any().isNot("x")).matches("{list: {$elemMatch: {$ne: 'x'}}}");
+-    check(this.criteria.list.any().notIn(Arrays.asList("x", "y"))).matches("{list: {$elemMatch: {$nin: ['x','y']}}}");
++    check(this.criteria.list.any().isNot("x")).hasQuantifierFilter();
++    check(this.criteria.list.any().notIn(Arrays.asList("x", "y"))).hasQuantifierFilter();
+   }
+ 
+   /**
+@@ -128,8 +128,8 @@ class FindVisitorTest {
+     // positive: flat dot-path
+     check(this.person.pets.any().name.is("fluffy")).matches("{'pets.name': 'fluffy'}");
+     // negative: $elemMatch
+-    check(this.person.pets.any().name.isNot("fluffy")).matches("{pets: {$elemMatch: {name: {$ne: 'fluffy'}}}}");
+-    check(this.person.pets.any().name.notIn(Arrays.asList("gecko", "oopsy"))).matches("{pets: {$elemMatch: {name: {$nin: ['gecko','oopsy']}}}}");
++    check(this.person.pets.any().name.isNot("fluffy")).hasQuantifierFilter();
++    check(this.person.pets.any().name.notIn(Arrays.asList("gecko", "oopsy"))).hasQuantifierFilter();
+   }
+ 
+   /**
+@@ -140,13 +140,20 @@ class FindVisitorTest {
+   void iterableAnyCompound() {
+     // AND inside any() -> $elemMatch with $and
+     check(this.person.pets.any().with(p -> p.name.is("fluffy").and(p.name.is("buddy"))))
+-        .matches("{pets: {$elemMatch: {$and: [{name: 'fluffy'}, {name: 'buddy'}]}}}");
++        .hasQuantifierFilter();
+     // OR inside any() -> $elemMatch with $or
+     check(this.person.pets.any().with(p -> p.name.is("fluffy").or(p.name.is("buddy"))))
+-        .matches("{pets: {$elemMatch: {$or: [{name: 'fluffy'}, {name: 'buddy'}]}}}");
++        .hasQuantifierFilter();
+     // NOT inside any() -> $elemMatch with negated operator
+     check(this.person.pets.any().not(p -> p.name.is("fluffy")))
+-        .matches("{pets: {$elemMatch: {name: {$ne: 'fluffy'}}}}");
++        .hasQuantifierFilter();
++  }
++
++
++  @Test
++  void iterableAllNoneRendering() {
++    check(this.criteria.list.all().isNot("x")).hasQuantifierFilter();
++    check(this.criteria.list.none().startsWith("a")).hasQuantifierFilter();
+   }
+ 
+   private static QueryAssertion check(StringHolderCriteria criteria) {
+diff --git a/criteria/mongo/test/org/immutables/criteria/mongo/MongoIntegrationTest.java b/criteria/mongo/test/org/immutables/criteria/mongo/MongoIntegrationTest.java
+index 3692af4..7d04b38 100644
+--- a/criteria/mongo/test/org/immutables/criteria/mongo/MongoIntegrationTest.java
++++ b/criteria/mongo/test/org/immutables/criteria/mongo/MongoIntegrationTest.java
+@@ -18,6 +18,7 @@ package org.immutables.criteria.mongo;
+ 
+ import com.mongodb.reactivestreams.client.MongoDatabase;
+ import org.immutables.criteria.backend.Backend;
++import org.immutables.criteria.typemodel.AnyTemplate;
+ import org.immutables.criteria.typemodel.BigDecimalTemplate;
+ import org.immutables.criteria.typemodel.BooleanLogicTemplate;
+ import org.immutables.criteria.typemodel.BooleanTemplate;
+@@ -50,6 +51,13 @@ class MongoIntegrationTest {
+     this.backend = new BackendResource(database).backend();
+   }
+ 
++  @Nested
++  class Any extends AnyTemplate {
++    private Any() {
++      super(backend);
++    }
++  }
++
+   @Nested
+   class String extends StringTemplate {
+     private String() {
+diff --git a/criteria/mongo/test/org/immutables/criteria/mongo/MongoPersonTest.java b/criteria/mongo/test/org/immutables/criteria/mongo/MongoPersonTest.java
+index ee3158a..2ca46e3 100644
+--- a/criteria/mongo/test/org/immutables/criteria/mongo/MongoPersonTest.java
++++ b/criteria/mongo/test/org/immutables/criteria/mongo/MongoPersonTest.java
+@@ -50,6 +50,7 @@ public class MongoPersonTest extends AbstractPersonTest {
+             Feature.ITERABLE_SIZE,
+             Feature.ITERABLE_CONTAINS,
+             Feature.ITERABLE_ANY,
++            Feature.ITERABLE_ALL_NONE,
+             Feature.STRING_LENGTH
+     );
+   }
+diff --git a/criteria/mongo/test/org/immutables/criteria/mongo/QueryAssertion.java b/criteria/mongo/test/org/immutables/criteria/mongo/QueryAssertion.java
+index 7318a4e..41e5ae0 100644
+--- a/criteria/mongo/test/org/immutables/criteria/mongo/QueryAssertion.java
++++ b/criteria/mongo/test/org/immutables/criteria/mongo/QueryAssertion.java
+@@ -62,6 +62,11 @@ class QueryAssertion {
+     assertEquals(actual, Collections.singletonList(expected));
+   }
+ 
++  void hasQuantifierFilter() {
++    Assertions.assertEquals(1, actual.size());
++    Assertions.assertTrue(actual.get(0).containsKey("$and"), actual.get(0).toJson());
++  }
++
+   void matchesMulti(String ... lines) {
+     List<BsonDocument> expected = Arrays.stream(lines).map(BsonDocument::parse).collect(Collectors.toList());
+     assertEquals(actual, expected);

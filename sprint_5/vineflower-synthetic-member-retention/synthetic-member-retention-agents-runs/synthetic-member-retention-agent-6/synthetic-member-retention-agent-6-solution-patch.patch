@@ -1,0 +1,505 @@
+diff --git a/src/org/jetbrains/java/decompiler/main/ClassWriter.java b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+index 0a6b7a9..b985abe 100644
+--- a/src/org/jetbrains/java/decompiler/main/ClassWriter.java
++++ b/src/org/jetbrains/java/decompiler/main/ClassWriter.java
+@@ -44,12 +44,18 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
+ import org.jetbrains.java.decompiler.struct.gen.generics.GenericsChecker;
+ import org.jetbrains.java.decompiler.util.*;
+ import org.jetbrains.java.decompiler.util.collections.VBStyleCollection;
++import org.jetbrains.java.decompiler.util.token.ClassTextToken;
++import org.jetbrains.java.decompiler.util.token.FieldTextToken;
++import org.jetbrains.java.decompiler.util.token.MethodTextToken;
++import org.jetbrains.java.decompiler.util.token.TextToken;
+ 
+ import java.io.IOException;
+ import java.util.*;
+ import java.util.stream.Collectors;
+ 
+ public class ClassWriter implements StatementWriter {
++  private static final Key<ReferenceAwareRetention> REFERENCE_AWARE_RETENTION = Key.of("REFERENCE_AWARE_RETENTION");
++
+   private static final Set<String> ERROR_DUMP_STOP_POINTS = new HashSet<>(Arrays.asList(
+     "Fernflower.decompileContext",
+     "MethodProcessor.codeToJava",
+@@ -60,6 +66,101 @@ public class ClassWriter implements StatementWriter {
+   private final PoolInterceptor interceptor;
+   private final IFabricJavadocProvider javadocProvider;
+ 
++  private enum RetainedMemberType {
++    CLASS,
++    FIELD,
++    METHOD
++  }
++
++  private record RetainedMember(RetainedMemberType type, String className, String name, String descriptor) {
++    private static RetainedMember classMember(String className) {
++      return new RetainedMember(RetainedMemberType.CLASS, className, null, null);
++    }
++
++    private static RetainedMember field(String className, String name, String descriptor) {
++      return new RetainedMember(RetainedMemberType.FIELD, className, name, descriptor);
++    }
++
++    private static RetainedMember method(String className, String name, String descriptor) {
++      return new RetainedMember(RetainedMemberType.METHOD, className, name, descriptor);
++    }
++  }
++
++  /**
++   * Retention is shared by all ClassWriter instances used while one source file is written. Anonymous
++   * classes and lambda bodies create their own writers, but still contribute to the same output file.
++   */
++  private static final class ReferenceAwareRetention {
++    private final Set<ClassNode> processedNodes = Collections.newSetFromMap(new IdentityHashMap<>());
++    private final Set<ClassNode> failedNodes = Collections.newSetFromMap(new IdentityHashMap<>());
++    private final Set<RetainedMember> candidates = new HashSet<>();
++    private final Set<RetainedMember> retained = new HashSet<>();
++    private ImportCollector baseImports;
++
++    private void collectCandidates(ClassNode node) {
++      if (node.type != ClassNode.Type.LAMBDA) {
++        StructClass cl = node.classStruct;
++
++        if (node.type == ClassNode.Type.MEMBER && (node.hasModifier(CodeConstants.ACC_SYNTHETIC) || cl.isSynthetic())) {
++          candidates.add(RetainedMember.classMember(cl.qualifiedName));
++        }
++
++        for (StructField field : cl.getFields()) {
++          if (field.isSynthetic()) {
++            candidates.add(RetainedMember.field(cl.qualifiedName, field.getName(), field.getDescriptor()));
++          }
++        }
++
++        for (StructMethod method : cl.getMethods()) {
++          if (method.isSynthetic() || method.hasModifier(CodeConstants.ACC_BRIDGE)) {
++            candidates.add(RetainedMember.method(cl.qualifiedName, method.getName(), method.getDescriptor()));
++          }
++        }
++      }
++
++      for (ClassNode child : node.nested) {
++        collectCandidates(child);
++      }
++    }
++
++    private void initialize(ClassNode root) {
++      collectCandidates(root);
++      baseImports = new ImportCollector(DecompilerContext.getImportCollector());
++    }
++
++    private boolean isRetained(RetainedMember member) {
++      return retained.contains(member);
++    }
++
++    private void addReferences(TextBuffer buffer) {
++      int length = buffer.length();
++      for (TextToken token : buffer.getTokens()) {
++        // TextBuffer can retain token metadata for text removed with setLength/setStart. Such a token
++        // is not part of the emitted Java and must not affect the decision.
++        if (token.isDeclaration() || token.getStart() < 0 || token.getStart() + token.getLength() > length) {
++          continue;
++        }
++
++        RetainedMember member = null;
++        if (token instanceof ClassTextToken classToken) {
++          member = RetainedMember.classMember(classToken.qualifiedName);
++        } else if (token instanceof FieldTextToken fieldToken) {
++          member = RetainedMember.field(fieldToken.className, fieldToken.name, fieldToken.descriptor.descriptorString);
++        } else if (token instanceof MethodTextToken methodToken) {
++          member = RetainedMember.method(methodToken.className, methodToken.name, methodToken.descriptor.toString());
++        }
++
++        if (member != null && candidates.contains(member)) {
++          retained.add(member);
++        }
++      }
++    }
++
++    private ImportCollector newImportCollector() {
++      return new ImportCollector(baseImports);
++    }
++  }
++
+   public ClassWriter() {
+     interceptor = DecompilerContext.getPoolInterceptor();
+     javadocProvider = (IFabricJavadocProvider) DecompilerContext.getProperty(IFabricJavadocProvider.PROPERTY_NAME);
+@@ -374,167 +475,233 @@ public class ClassWriter implements StatementWriter {
+     ClassNode outerNode = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+     DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
+ 
++    ReferenceAwareRetention retention = DecompilerContext.getContextProperty(REFERENCE_AWARE_RETENTION);
++    boolean ownsRetention = retention == null && node.type == ClassNode.Type.ROOT &&
++      DecompilerContext.getOption(IFernflowerPreferences.REFERENCE_AWARE_SYNTHETIC_RETENTION);
++
++    if (ownsRetention) {
++      retention = new ReferenceAwareRetention();
++      DecompilerContext.setProperty(REFERENCE_AWARE_RETENTION, retention);
++    }
++
+     try {
+       // last minute processing
+-      boolean ok = invokeProcessors(buffer, node);
+-
+-      if (!ok) {
++      if (!invokeProcessorsIfNeeded(node, retention, buffer)) {
+         return;
+       }
+ 
+-      ClassWrapper wrapper = node.getWrapper();
+-      StructClass cl = wrapper.getClassStruct();
+-
+-      DecompilerContext.getLogger().startWriteClass(cl.qualifiedName);
+-
+-      if (DecompilerContext.getOption(IFernflowerPreferences.SOURCE_FILE_COMMENTS)) {
+-        StructSourceFileAttribute sourceFileAttr = node.classStruct
+-          .getAttribute(StructGeneralAttribute.ATTRIBUTE_SOURCE_FILE);
++      if (ownsRetention) {
++        retention.initialize(node);
+ 
+-        if (sourceFileAttr != null) {
+-          ConstantPool pool = node.classStruct.getPool();
+-          String sourceFile = sourceFileAttr.getSourceFile(pool);
++        TextBuffer result;
++        if (retention.candidates.isEmpty()) {
++          result = buffer;
++          writeClassContents(node, result, indent);
++        } else {
++          do {
++            DecompilerContext.setImportCollector(retention.newImportCollector());
++            result = new TextBuffer(ClassesProcessor.AVERAGE_CLASS_SIZE);
++            writeClassContents(node, result, indent);
++
++            int retainedBefore = retention.retained.size();
++            retention.addReferences(result);
++            if (retention.retained.size() == retainedBefore) {
++              break;
++            }
++          } while (true);
++        }
+ 
+-          buffer
+-            .appendIndent(indent)
+-            .append("// $VF: Compiled from " + sourceFile)
+-            .appendLineSeparator();
++        if (result != buffer) {
++          buffer.append(result);
+         }
++      } else {
++        writeClassContents(node, buffer, indent);
++      }
++    }
++    finally {
++      if (ownsRetention) {
++        DecompilerContext.setProperty(REFERENCE_AWARE_RETENTION, null);
+       }
++      DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, outerNode);
++    }
++  }
+ 
+-      // write class definition
+-      writeClassDefinition(node, buffer, indent);
++  private static boolean invokeProcessorsIfNeeded(ClassNode node, ReferenceAwareRetention retention, TextBuffer buffer) {
++    if (retention == null) {
++      return invokeProcessors(buffer, node);
++    }
+ 
+-      final AtomicBoolean hasContent = new AtomicBoolean(false);
+-      // writeClassDefinition will skip adding a trailing newline for anonymous classes.
+-      // This allows us to only add it if we end up writing any content for the class, so something
+-      // like `new Object() {}` will not have a newline in between `{` and `}`.
+-      // The runnable should be executed immediately before writing any anonymous class content to the buffer.
+-      // hasContent also fills a similar purpose, determining whether elements need an extra newline prepended due to previous content being written.
+-      final Runnable haveContent = () -> {
+-        if (!hasContent.get() && node.type == ClassNode.Type.ANONYMOUS) {
+-          buffer.appendLineSeparator();
+-        }
+-        hasContent.set(true);
+-      };
++    if (!retention.processedNodes.add(node)) {
++      return !retention.failedNodes.contains(node);
++    }
++
++    boolean ok = invokeProcessors(buffer, node);
++    if (!ok) {
++      retention.failedNodes.add(node);
++    }
++    return ok;
++  }
+ 
+-      String methodToDecompile = (String) DecompilerContext.getProperty(IFernflowerPreferences.METHOD_TO_DECOMPILE);
++  private void writeClassContents(ClassNode node, TextBuffer buffer, int indent) {
++    ClassWrapper wrapper = node.getWrapper();
++    StructClass cl = wrapper.getClassStruct();
+ 
+-      // fields
+-      if (methodToDecompile.isEmpty()) {
+-        List<StructRecordComponent> components = cl.getRecordComponents();
++    DecompilerContext.getLogger().startWriteClass(cl.qualifiedName);
+ 
+-        List<StructField> enumFields = new ArrayList<>();
+-        List<StructField> nonEnumFields = new ArrayList<>();
++    if (DecompilerContext.getOption(IFernflowerPreferences.SOURCE_FILE_COMMENTS)) {
++      StructSourceFileAttribute sourceFileAttr = node.classStruct
++        .getAttribute(StructGeneralAttribute.ATTRIBUTE_SOURCE_FILE);
+ 
+-        for (StructField fd : cl.getFields()) {
+-          boolean isEnum = fd.hasModifier(CodeConstants.ACC_ENUM) && DecompilerContext.getOption(IFernflowerPreferences.DECOMPILE_ENUM);
+-          if (isEnum) {
+-            enumFields.add(fd);
+-          } else {
+-            nonEnumFields.add(fd);
+-          }
+-        }
++      if (sourceFileAttr != null) {
++        ConstantPool pool = node.classStruct.getPool();
++        String sourceFile = sourceFileAttr.getSourceFile(pool);
+ 
+-        boolean enums = false;
+-        for (StructField fd : enumFields) {
+-          if (enums) {
+-            buffer.append(',').appendLineSeparator();
+-          }
+-          enums = true;
++        buffer
++          .appendIndent(indent)
++          .append("// $VF: Compiled from " + sourceFile)
++          .appendLineSeparator();
++      }
++    }
++
++    // write class definition
++    writeClassDefinition(node, buffer, indent);
++
++    final AtomicBoolean hasContent = new AtomicBoolean(false);
++    // writeClassDefinition will skip adding a trailing newline for anonymous classes.
++    // This allows us to only add it if we end up writing any content for the class, so something
++    // like `new Object() {}` will not have a newline in between `{` and `}`.
++    // The runnable should be executed immediately before writing any anonymous class content to the buffer.
++    // hasContent also fills a similar purpose, determining whether elements need an extra newline prepended due to previous content being written.
++    final Runnable haveContent = () -> {
++      if (!hasContent.get() && node.type == ClassNode.Type.ANONYMOUS) {
++        buffer.appendLineSeparator();
++      }
++      hasContent.set(true);
++    };
++
++    String methodToDecompile = (String) DecompilerContext.getProperty(IFernflowerPreferences.METHOD_TO_DECOMPILE);
++    ReferenceAwareRetention retention = DecompilerContext.getContextProperty(REFERENCE_AWARE_RETENTION);
++
++    // fields
++    if (methodToDecompile.isEmpty()) {
++      List<StructRecordComponent> components = cl.getRecordComponents();
++
++      List<StructField> enumFields = new ArrayList<>();
++      List<StructField> nonEnumFields = new ArrayList<>();
+ 
+-          haveContent.run();
+-          writeField(buffer, indent, fd, wrapper);
++      for (StructField fd : cl.getFields()) {
++        boolean isEnum = fd.hasModifier(CodeConstants.ACC_ENUM) && DecompilerContext.getOption(IFernflowerPreferences.DECOMPILE_ENUM);
++        if (isEnum) {
++          enumFields.add(fd);
++        } else {
++          nonEnumFields.add(fd);
+         }
++      }
+ 
++      boolean enums = false;
++      for (StructField fd : enumFields) {
+         if (enums) {
+-          buffer.append(';').appendLineSeparator();
++          buffer.append(',').appendLineSeparator();
+         }
++        enums = true;
+ 
+-        for (StructField fd : nonEnumFields) {
+-          boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-            wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
+-          if (hide) continue;
++        haveContent.run();
++        writeField(buffer, indent, fd, wrapper);
++      }
+ 
+-          if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
+-            components.stream().anyMatch(c -> c.getName().equals(fd.getName()) && c.getDescriptor().equals(fd.getDescriptor()))) {
+-            // Record component field: skip it
+-            continue;
+-          }
++      if (enums) {
++        buffer.append(';').appendLineSeparator();
++      }
+ 
+-          if (enums) {
+-            // Add an extra line break between enums and non-enum fields
+-            buffer.appendLineSeparator();
+-            enums = false;
+-          }
++      for (StructField fd : nonEnumFields) {
++        boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++          wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
++        if (hide && retention != null && retention.isRetained(RetainedMember.field(cl.qualifiedName, fd.getName(), fd.getDescriptor()))) {
++          hide = false;
++        }
++        if (hide) continue;
+ 
+-          haveContent.run();
+-          writeField(buffer, indent, fd, wrapper);
++        if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
++          components.stream().anyMatch(c -> c.getName().equals(fd.getName()) && c.getDescriptor().equals(fd.getDescriptor()))) {
++          // Record component field: skip it
++          continue;
+         }
+-      }
+ 
+-      // methods
+-      VBStyleCollection<StructMethod, String> methods = cl.getMethods();
+-      for (int i = 0; i < methods.size(); i++) {
+-        StructMethod mt = methods.get(i);
+-        boolean hide;
+-        if (methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
+-          hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-                 mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
+-                 wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
+-        } else {
+-          hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
+-                 (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
++        if (enums) {
++          // Add an extra line break between enums and non-enum fields
++          buffer.appendLineSeparator();
++          enums = false;
+         }
+-        if (hide) continue;
+ 
+-        TextBuffer methodBuffer = new TextBuffer();
+-        boolean methodSkipped = !writeMethod(node, mt, i, methodBuffer, indent + 1);
+-        if (!methodSkipped) {
+-          if (hasContent.get()) {
+-            buffer.appendLineSeparator();
+-          }
+-          haveContent.run();
+-          buffer.append(methodBuffer);
++        haveContent.run();
++        writeField(buffer, indent, fd, wrapper);
++      }
++    }
++
++    // methods
++    VBStyleCollection<StructMethod, String> methods = cl.getMethods();
++    for (int i = 0; i < methods.size(); i++) {
++      StructMethod mt = methods.get(i);
++      boolean hide;
++      if (methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
++        hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++               mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
++               wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
++        if (hide && retention != null && retention.isRetained(RetainedMember.method(cl.qualifiedName, mt.getName(), mt.getDescriptor()))) {
++          hide = false;
+         }
++      } else {
++        hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
++               (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
+       }
++      if (hide) continue;
+ 
+-      // member classes
+-      for (ClassNode inner : node.nested) {
+-        if (inner.type == ClassNode.Type.MEMBER) {
+-          StructClass innerCl = inner.classStruct;
+-          boolean hide;
+-          if (methodToDecompile.isEmpty()) {
+-            boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
+-            hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+-                   wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
+-          } else {
+-            hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+-          }
+-          if (hide) continue;
++      TextBuffer methodBuffer = new TextBuffer();
++      boolean methodSkipped = !writeMethod(node, mt, i, methodBuffer, indent + 1);
++      if (!methodSkipped) {
++        if (hasContent.get()) {
++          buffer.appendLineSeparator();
++        }
++        haveContent.run();
++        buffer.append(methodBuffer);
++      }
++    }
+ 
+-          if (hasContent.get()) {
+-            buffer.appendLineSeparator();
++    // member classes
++    for (ClassNode inner : node.nested) {
++      if (inner.type == ClassNode.Type.MEMBER) {
++        StructClass innerCl = inner.classStruct;
++        boolean hide;
++        if (methodToDecompile.isEmpty()) {
++          boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
++          hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
++                 wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
++          if (hide && retention != null && retention.isRetained(RetainedMember.classMember(innerCl.qualifiedName))) {
++            hide = false;
+           }
+-          TextBuffer clsBuffer = new TextBuffer();
+-          writeClass(inner, clsBuffer, indent + 1);
+-          haveContent.run();
+-          buffer.append(clsBuffer);
++        } else {
++          hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+         }
+-      }
++        if (hide) continue;
+ 
+-      if (hasContent.get() || node.type != ClassNode.Type.ANONYMOUS) {
+-        // Skip indent for anonymous classes with no content, since we also skipped the newline in the cls definition
+-        buffer.appendIndent(indent);
++        if (hasContent.get()) {
++          buffer.appendLineSeparator();
++        }
++        TextBuffer clsBuffer = new TextBuffer();
++        writeClass(inner, clsBuffer, indent + 1);
++        haveContent.run();
++        buffer.append(clsBuffer);
+       }
+-      buffer.append('}');
++    }
+ 
+-      if (node.type != ClassNode.Type.ANONYMOUS) {
+-        buffer.appendLineSeparator();
+-      }
++    if (hasContent.get() || node.type != ClassNode.Type.ANONYMOUS) {
++      // Skip indent for anonymous classes with no content, since we also skipped the newline in the cls definition
++      buffer.appendIndent(indent);
+     }
+-    finally {
+-      DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, outerNode);
++    buffer.append('}');
++
++    if (node.type != ClassNode.Type.ANONYMOUS) {
++      buffer.appendLineSeparator();
+     }
+ 
+     DecompilerContext.getLogger().endWriteClass();
+diff --git a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+index 5353261..432255b 100644
+--- a/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
++++ b/src/org/jetbrains/java/decompiler/main/extern/IFernflowerPreferences.java
+@@ -21,6 +21,11 @@ public interface IFernflowerPreferences {
+   @Type(DecompilerOption.Type.BOOLEAN)
+   String REMOVE_SYNTHETIC = "remove-synthetic";
+ 
++  @Name("Reference-Aware Synthetic Retention")
++  @Description("Retain removed synthetic and bridge members when the emitted Java code refers to them.")
++  @Type(DecompilerOption.Type.BOOLEAN)
++  String REFERENCE_AWARE_SYNTHETIC_RETENTION = "reference-aware-synthetic-retention";
++
+   @Name("Decompile Inner Classes")
+   @Description("Process inner classes and add them to the decompiled output.")
+   @ShortName("din")
+@@ -425,6 +430,7 @@ public interface IFernflowerPreferences {
+ 
+     defaults.put(REMOVE_BRIDGE, "1");
+     defaults.put(REMOVE_SYNTHETIC, "1");
++    defaults.put(REFERENCE_AWARE_SYNTHETIC_RETENTION, "0");
+     defaults.put(DECOMPILE_INNER, "1");
+     defaults.put(DECOMPILE_CLASS_1_4, "1");
+     defaults.put(DECOMPILE_ASSERTIONS, "1");
