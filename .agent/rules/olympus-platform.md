@@ -1,21 +1,28 @@
 ---
 trigger: always_on
-description: Official Olympus submission requirements and platform process (repo, description, tests, solution, Dockerfile, checks, rollouts, FP check, review, tokens)
+description: Official Olympus submission requirements and platform process (repo, task prompt, tests, solution, Dockerfile, checks, rollouts, FP check, review, tokens)
 ---
 
 # Olympus Platform Requirements
 
 Source: the official Olympus docs ("Creating Olympus Challenges" and "The Olympus Process"),
-captured 2026-09-27. This file is the authority for what the platform requires and in what order
+captured 2026-09-27, refreshed 2026-10-06. This file is the authority for what the platform requires and in what order
 it checks it. Numeric bars (pass rate, LOC, messages, files, minimum finished rollouts) are NOT
 restated here: read the submission's "Submission criteria" panel, then
 `my-review-workflow/rules/platform-panel.md`. Other `.agent` rules add stricter house practice on
 top of this file; where they disagree on a platform requirement, this file wins.
 
+Naming: the platform now calls the description the **task prompt** (form field, prechecks, and the
+Task Prompt Quality check). House files keep the `*-description.md` name, and "description" means
+the same thing everywhere in `.agent`.
+
+Bar: the task must be **really challenging** for SOTA models. If you think you know what
+"challenging" means, bump it up a notch.
+
 ## 1. Submission pieces
 
 1. Repo and commit: one public GitHub repo pinned to one SHA.
-2. Problem description: the task, submitted as text.
+2. Task prompt (the description): the task, submitted as text.
 3. Test patch: unified git diff with `test.sh` plus the new or modified tests.
 4. Solution patch: unified git diff with the reference (golden) implementation.
 5. Dockerfile: pasted in directly.
@@ -46,11 +53,11 @@ Take-care rules, all verified later by the Scope Gate:
 - A heavily used repo makes the duplicate check and Scope Gate harder to clear. Repos cannot be
   claimed or reserved.
 
-## 3. Problem description
+## 3. Task prompt (description)
 
 - **P1** aligns with the repo's philosophy.
 - **P2** not already fixed in an open or merged PR.
-- **P3** self-contained: solvable from the repo plus the description alone.
+- **P3** self-contained: solvable from the repo plus the task prompt alone.
 - **P4** clear, concise, unambiguous: nothing left to guess.
 - **P5** verifiable: success is objectively testable.
 - **P6** not prescriptive: do not leak the solution.
@@ -158,13 +165,24 @@ force, not the size of the diff.
 8. Confirm no existing PR (open, merged, closed) already solves it.
 9. Confirm every point in this file holds.
 
+### 8a. Be your own reviewer first
+
+Before submitting, read the agent runs the way a reviewer will:
+
+- **Are the failures fair?** An agent should fail because the task is genuinely hard, not because
+  a sentence was ambiguous, a requirement was hidden, or a test asked for something the task
+  prompt never stated. Fix what you did not intend now; after submission it returns as a revision.
+- **Still clearing the LOC bar?** If agents solve it in noticeably fewer lines than the golden,
+  the real effective count is probably lower than it looks (comments, blanks, generated files,
+  and test code do not count).
+
 ## 9. Platform flow
 
 Each step unlocks the next and costs more. Never spend on a later step while an earlier one fails.
 The "Submission criteria" panel tracks everything live; when it is all green you can submit.
 
 1. **Prechecks** (cheapest). Repo: URL/commit resolve, stars, activity, language, license.
-   Problem and tests: description well formed (length, formatting, no leftover URLs, matches its
+   Problem and tests: task prompt well formed (length, formatting, no leftover URLs, matches its
    category), not a near-duplicate, test patch a valid diff with a working `test.sh`, no solution
    code, no quest leaks. Dockerfile: base image, `/app`, build-time deps, no tests in build.
    Solution: valid, cleanly structured diff. Fix everything in one pass, then rerun. Warnings do
@@ -183,13 +201,17 @@ The "Submission criteria" panel tracks everything live; when it is all green you
      would discover in the repo; advisory coverage feedback.
    - Task Quality: grades description and tests as a pair; lists failing criteria.
    - Solution Quality: completeness and code quality against the repo; lists concrete issues.
-   - Description Quality: tone, redundancy, repo-discoverable detail; suggests rewrites.
+   - Task Prompt Quality (formerly Description Quality): templated structure, redundancy, and
+     details an agent could find in the repo on its own; suggests rewrites.
 5. **Agent rollouts**: agent gets description, repo at the commit, and the Docker environment;
    graded by the hidden tests. A minimum number of finished rollouts is required (see criteria
    panel). Quick check = one cheap run for iterating; full batch = several runs, configurable
    agents and counts. Trust the results banner (quick check / full batch / too easy / looks broken
    / ready). Usually ~15 minutes, up to 90 on big or hard tasks. At least one agent must pass
-   before you can submit.
+   before you can submit; if none ever passes, the tests are too strict, the task prompt is
+   missing something, or the task is unfair. Read the fails: failing because the task is hard is
+   the goal; failing on an ambiguous sentence is a revision waiting to happen. Passing too often
+   means make it harder before spending the remaining runs.
 6. **FP check**: reviews every passing run; a single pass judged false fails the "No false
    positives" criterion. Run it only after the run set is settled. If it finds a false positive,
    strengthen the tests (and check the description so the new tests stay discoverable), then
@@ -236,3 +258,20 @@ unanswered flag and the submission comes back.
 
 Assembling a submission typically takes 3-6 hours, plus iteration with checks. Almost nobody
 lands the first pass; every loop closed before submission is a revision cycle saved.
+
+The assessment runs a smaller version of this flow (fewer checks, several steps skipped). Every
+step above applies to real submissions.
+
+## 13. Official tips
+
+1. **Plan the scope before writing patches.** Without thinking about overall scope and the repo's
+   architecture first, it is easy to end up too trivial for the difficulty criteria. The bar moves
+   quickly; find out the task is too easy before writing 600 lines of solution.
+2. **Consider cross-cutting changes.** A solution spanning several layers or subsystems tends to
+   be harder for agents and carries more effective LOC than one confined to a single spot. Not
+   required, but the best lever when an idea keeps landing short on difficulty or LOC.
+3. **Spend tokens smartly.** Clear checks first, then a small batch for a signal: 100% pass means
+   too easy; 0% on a vague point or unfair test means fix before a full run.
+4. **Read the check and run outputs.** A 0% pass rate is not always a bad task; it can be one
+   ambiguous sentence or one unfair test, and the agent logs show it fastest.
+5. **Expect to iterate.** Closing every loop yourself is the path to a clean approval.

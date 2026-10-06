@@ -36,7 +36,8 @@ apply its solution instead of re-deriving it.
 A problem is anything that cost a round, a token spend, or a correction:
 
 - a failing or warning gate (prechecks, Scope Gate, build, Verify Tests/Solution/Flakiness, Test
-  Quality, Task Quality, Solution Quality, Description Quality, FP check, Auto Review);
+  Quality, Task Quality, Solution Quality, Task Prompt Quality (formerly Description Quality), FP
+  check, Auto Review);
 - a human-review or manager finding;
 - an agent-run verdict that exposed a task defect (TEST_MISMATCH, TEST_BROKEN, confirmed false
   positive, zero pass, over-solve);

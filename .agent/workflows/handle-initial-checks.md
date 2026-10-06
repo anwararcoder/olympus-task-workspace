@@ -17,7 +17,7 @@ In platform order (see `../rules/olympus-platform.md` section 9):
 | Stage | Check | Passing means |
 |-------|-------|---------------|
 | Prechecks | Repo | URL/commit resolve; stars, activity, language, license meet the floor |
-| Prechecks | Problem and tests | Description well formed (length, formatting, no leftover URLs, matches category), not a near-duplicate; test patch valid diff with working `test.sh`, no solution code, no quest leaks |
+| Prechecks | Problem and tests | Task prompt well formed (length, formatting, no leftover URLs, matches category), not a near-duplicate; test patch valid diff with working `test.sh`, no solution code, no quest leaks |
 | Prechecks | Dockerfile | Base image, `WORKDIR /app`, build-time deps, no tests in build |
 | Prechecks | Solution patch | Valid, cleanly structured diff |
 | Scope Gate | Duplicates / upstream / repo fit | Pass; a drop means rethink the idea, not reword it |
@@ -28,7 +28,7 @@ In platform order (see `../rules/olympus-platform.md` section 9):
 | Quality | Test Quality | Each hidden test checks something stated or discoverable; advisory coverage notes |
 | Quality | Task Quality | Description and tests graded as a pair; failing criteria listed |
 | Quality | Solution Quality | Completeness and code quality issues listed |
-| Quality | Description Quality | Tone, redundancy, repo-discoverable detail; suggested rewrites |
+| Quality | Task Prompt Quality (formerly Description Quality) | Templated structure, redundancy, details an agent could find in the repo; suggested rewrites |
 
 Only failures block; warnings do not, but read each warning and confirm it is fine. Fix everything
 in one pass, then rerun once: every edit stales every completed check, and reruns cost tokens.

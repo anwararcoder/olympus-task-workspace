@@ -137,7 +137,7 @@ git apply ../../my-work/{problem}/solution-{name}.patch
 
 Before clicking Submit, the "Submission criteria" panel must be fully green: Prechecks, Scope Gate,
 Build, all Quality checks (Verify Tests, Verify Solution, Verify Flakiness, Test Quality, Task
-Quality, Solution Quality, Description Quality), the minimum number of finished and current agent
+Quality, Solution Quality, Task Prompt Quality), the minimum number of finished and current agent
 rollouts with at least one legitimate pass, the FP check ("No false positives"), and a completed
 Auto Review. Nothing may be stale.
 
