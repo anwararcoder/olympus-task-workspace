@@ -1,0 +1,1217 @@
+diff --git a/src/pydicom/__init__.py b/src/pydicom/__init__.py
+index 0fd0836..58c675e 100644
+--- a/src/pydicom/__init__.py
++++ b/src/pydicom/__init__.py
+@@ -33,6 +33,15 @@ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+ import pydicom.examples
+ from pydicom.filereader import dcmread
+ from pydicom.filewriter import dcmwrite
++from pydicom.multiframe import (
++    MultiFrameError,
++    extract_frames,
++    frame_attributes,
++    group_frames,
++    merge_frames,
++    sort_frames,
++    varying_attributes,
++)
+ from pydicom.pixels.utils import pixel_array, iter_pixels
+ from pydicom.sequence import Sequence
+ 
+@@ -51,8 +60,15 @@ __all__ = [
+     "Sequence",
+     "dcmread",
+     "dcmwrite",
++    "MultiFrameError",
++    "extract_frames",
++    "frame_attributes",
++    "group_frames",
++    "merge_frames",
+     "pixel_array",
++    "sort_frames",
+     "iter_pixels",
++    "varying_attributes",
+     "__version__",
+     "__version_info__",
+     "__dicom_version__",
+diff --git a/src/pydicom/multiframe.py b/src/pydicom/multiframe.py
+new file mode 100644
+index 0000000..be1feda
+--- /dev/null
++++ b/src/pydicom/multiframe.py
+@@ -0,0 +1,1014 @@
++# Copyright 2008-2025 pydicom authors. See LICENSE file for details.
++"""Operations on enhanced multi-frame DICOM instances.
++
++The functions in this module work on the functional group representation used
++by enhanced multi-frame instances.  They deliberately operate on the encoded
++pixel data, rather than decoding and re-encoding it, so that frame operations
++do not require an optional pixel data handler.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable
++from copy import deepcopy
++from functools import cmp_to_key
++from io import BufferedIOBase
++from numbers import Integral
++from struct import unpack_from
++from typing import Any, NamedTuple
++
++from pydicom.dataelem import DataElement
++from pydicom.datadict import tag_for_keyword
++from pydicom.dataset import Dataset
++from pydicom.encaps import encapsulate
++from pydicom.fileutil import reset_buffer_position
++from pydicom.pixels.utils import concatenate_packed_frames, get_packed_frame
++from pydicom.sequence import Sequence
++from pydicom.tag import BaseTag, Tag
++from pydicom.uid import UID, generate_uid
++
++
++class MultiFrameError(ValueError):
++    """Raised when a dataset cannot be used for a multi-frame operation."""
++
++
++_SHARED_GROUPS = Tag("SharedFunctionalGroupsSequence")
++_PER_FRAME_GROUPS = Tag("PerFrameFunctionalGroupsSequence")
++_NUMBER_OF_FRAMES = Tag("NumberOfFrames")
++_SOP_CLASS = Tag("SOPClassUID")
++_SOP_INSTANCE = Tag("SOPInstanceUID")
++_IN_STACK = Tag("InStackPositionNumber")
++_STACK_ID = Tag("StackID")
++_DIMENSION_VALUES = Tag("DimensionIndexValues")
++_DIMENSION_SEQUENCE = Tag("DimensionIndexSequence")
++_PIXEL_TAGS = (
++    Tag("FloatPixelData"),
++    Tag("DoubleFloatPixelData"),
++    Tag("PixelData"),
++)
++_IMAGE_PIXEL_TAGS = {
++    Tag(keyword)
++    for keyword in (
++        "SamplesPerPixel",
++        "PhotometricInterpretation",
++        "PlanarConfiguration",
++        "Rows",
++        "Columns",
++        "BitsAllocated",
++        "BitsStored",
++        "HighBit",
++        "PixelRepresentation",
++    )
++}
++
++
++class _DatasetInfo(NamedTuple):
++    dataset: Dataset
++    number_of_frames: int
++    transfer_syntax: UID
++    compressed: bool
++    pixel_tag: BaseTag
++    pixel_element: DataElement
++    pixel_frames: list[bytes]
++    shared_macros: dict[BaseTag, DataElement]
++    frame_macros: list[dict[BaseTag, DataElement]]
++
++
++class _SelectedFrame(NamedTuple):
++    macros: dict[BaseTag, DataElement]
++    pixel_data: bytes
++
++
++_MISSING = object()
++
++
++def _error(message: str) -> MultiFrameError:
++    return MultiFrameError(message)
++
++
++def _as_bytes(value: Any) -> bytes:
++    """Return an element value as bytes without changing a buffer position."""
++
++    if isinstance(value, bytes):
++        return value
++    if isinstance(value, bytearray | memoryview):
++        return bytes(value)
++    if isinstance(value, BufferedIOBase):
++        try:
++            with reset_buffer_position(value):
++                value.seek(0)
++                return value.read()
++        except Exception as exc:
++            raise _error("The pixel data value is not a readable buffer") from exc
++
++    try:
++        return memoryview(value).tobytes()
++    except Exception as exc:
++        raise _error("The pixel data value is not byte data") from exc
++
++
++def _integer(value: Any, name: str) -> int:
++    if isinstance(value, bool):
++        raise _error(f"The value of '{name}' is invalid")
++    try:
++        result = int(value)
++    except Exception as exc:
++        raise _error(f"The value of '{name}' is invalid") from exc
++    if result != value or result <= 0:
++        raise _error(f"The value of '{name}' is invalid")
++    return result
++
++
++def _native_frame_length(ds: Dataset, pixel_tag: BaseTag) -> tuple[int, int]:
++    """Return the native frame and total pixel data lengths."""
++
++    required = ("Rows", "Columns", "SamplesPerPixel")
++    for keyword in required:
++        if keyword not in ds or getattr(ds, keyword, None) is None:
++            raise _error(f"The image pixel attribute '{keyword}' is missing")
++
++    rows = _integer(ds.Rows, "Rows")
++    columns = _integer(ds.Columns, "Columns")
++    samples = _integer(ds.SamplesPerPixel, "SamplesPerPixel")
++    pixels_per_frame = rows * columns * samples
++
++    if pixel_tag == Tag("FloatPixelData"):
++        bytes_per_sample = 4
++    elif pixel_tag == Tag("DoubleFloatPixelData"):
++        bytes_per_sample = 8
++    else:
++        if "BitsAllocated" not in ds or ds.BitsAllocated is None:
++            raise _error("The image pixel attribute 'BitsAllocated' is missing")
++        bits_allocated = _integer(ds.BitsAllocated, "BitsAllocated")
++        if bits_allocated != 1 and bits_allocated % 8:
++            raise _error("The value of 'BitsAllocated' is invalid")
++        if bits_allocated == 1:
++            bytes_per_sample = 0
++        else:
++            bytes_per_sample = bits_allocated // 8
++
++    if bytes_per_sample:
++        frame_length = pixels_per_frame * bytes_per_sample
++    else:
++        frame_length = (pixels_per_frame + 7) // 8
++
++    if pixel_tag == Tag("PixelData"):
++        if "PhotometricInterpretation" not in ds or not ds.PhotometricInterpretation:
++            raise _error(
++                "The image pixel attribute 'PhotometricInterpretation' is missing"
++            )
++        if ds.PhotometricInterpretation == "YBR_FULL_422":
++            if pixels_per_frame % 3:
++                raise _error("The native pixel data has an invalid YBR_FULL_422 size")
++            frame_length = pixels_per_frame // 3 * 2 * (
++                1 if bytes_per_sample == 0 else bytes_per_sample
++            )
++
++    return frame_length, frame_length
++
++
++def _split_native_pixel_data(
++    ds: Dataset, pixel_tag: BaseTag, number_of_frames: int, value: Any
++) -> list[bytes]:
++    data = _as_bytes(value)
++    frame_length, _ = _native_frame_length(ds, pixel_tag)
++
++    if pixel_tag == Tag("PixelData") and ds.BitsAllocated == 1:
++        pixels_per_frame = (
++            _integer(ds.Rows, "Rows")
++            * _integer(ds.Columns, "Columns")
++            * _integer(ds.SamplesPerPixel, "SamplesPerPixel")
++        )
++        expected = (pixels_per_frame * number_of_frames + 7) // 8
++    else:
++        expected = frame_length * number_of_frames
++
++    # Native pixel data may have one trailing padding byte when its true length
++    # is odd.  The padding is not part of any frame.
++    allowed = {expected}
++    if expected % 2:
++        allowed.add(expected + 1)
++    if len(data) not in allowed:
++        raise _error("The native pixel data length does not match the frame count")
++
++    if pixel_tag == Tag("PixelData") and ds.BitsAllocated == 1:
++        return [
++            get_packed_frame(data, index, pixels_per_frame, pad=False)
++            for index in range(number_of_frames)
++        ]
++
++    return [
++        data[start : start + frame_length]
++        for start in range(0, expected, frame_length)
++    ]
++
++
++def _parse_encapsulated(
++    data: bytes,
++    number_of_frames: int,
++    extended_offsets: bytes | None,
++    extended_lengths: bytes | None,
++) -> list[bytes]:
++    """Strictly parse an encapsulated pixel data value into frame values."""
++
++    if len(data) < 8:
++        raise _error("The encapsulated pixel data is too short")
++
++    try:
++        group, element, bot_length = unpack_from("<HHI", data, 0)
++    except Exception as exc:
++        raise _error("The encapsulated pixel data is malformed") from exc
++    if (group, element) != (0xFFFE, 0xE000):
++        raise _error("The encapsulated pixel data does not start with a basic offset")
++    if bot_length > len(data) - 8:
++        raise _error("The basic offset table is truncated")
++    if bot_length % 4:
++        raise _error("The basic offset table has an invalid length")
++
++    bot_offsets = list(
++        unpack_from(f"<{bot_length // 4}I", data, 8) if bot_length else ()
++    )
++    if bot_offsets and len(bot_offsets) != number_of_frames:
++        raise _error("The basic offset table does not match the frame count")
++
++    first_fragment = 8 + bot_length
++    position = first_fragment
++    fragments: list[bytes] = []
++    fragment_offsets: list[int] = []
++
++    while position < len(data):
++        if len(data) - position < 8:
++            raise _error("The encapsulated pixel data is truncated")
++        group, element, length = unpack_from("<HHI", data, position)
++        if (group, element) == (0xFFFE, 0xE0DD):
++            if length != 0:
++                raise _error("The encapsulated pixel data delimiter is malformed")
++            position += 8
++            if position != len(data):
++                raise _error("The encapsulated pixel data has trailing data")
++            break
++        if (group, element) != (0xFFFE, 0xE000):
++            raise _error("The encapsulated pixel data contains an invalid item")
++        if length == 0xFFFFFFFF or length == 0 or length % 2:
++            raise _error("The encapsulated pixel data item has an invalid length")
++        value_start = position + 8
++        value_end = value_start + length
++        if value_end > len(data):
++            raise _error("The encapsulated pixel data item is truncated")
++        fragment_offsets.append(position - first_fragment)
++        fragments.append(data[value_start:value_end])
++        position = value_end
++
++    # ``encapsulate()`` returns the value without a sequence delimiter; a value
++    # read from a file may include one.  Both forms are valid here.
++    if not fragments:
++        raise _error("The encapsulated pixel data contains no fragments")
++
++    offset_to_fragment = {offset: idx for idx, offset in enumerate(fragment_offsets)}
++
++    def from_offsets(offsets: list[int], lengths: list[int] | None) -> list[bytes]:
++        if len(offsets) != number_of_frames:
++            raise _error("The offset table does not match the frame count")
++        if offsets[0] != 0 or any(
++            first >= second for first, second in zip(offsets, offsets[1:])
++        ):
++            raise _error("The encapsulated frame offsets are invalid")
++        if any(offset not in offset_to_fragment for offset in offsets):
++            raise _error("The encapsulated frame offsets are invalid")
++
++        output: list[bytes] = []
++        for frame_nr, offset in enumerate(offsets):
++            start = offset_to_fragment[offset]
++            if lengths is None:
++                stop = (
++                    offset_to_fragment[offsets[frame_nr + 1]]
++                    if frame_nr + 1 < number_of_frames
++                    else len(fragments)
++                )
++                if stop <= start:
++                    raise _error("The encapsulated frame offsets are invalid")
++                output.append(b"".join(fragments[start:stop]))
++                continue
++
++            remaining = lengths[frame_nr]
++            if remaining <= 0:
++                raise _error("The extended offset table has an invalid length")
++            fragment_nr = start
++            frame_fragments: list[bytes] = []
++            while remaining:
++                if fragment_nr >= len(fragments):
++                    raise _error("The extended offset table is invalid")
++                fragment = fragments[fragment_nr]
++                if len(fragment) > remaining:
++                    raise _error("The extended offset table is invalid")
++                frame_fragments.append(fragment)
++                remaining -= len(fragment)
++                fragment_nr += 1
++            output.append(b"".join(frame_fragments))
++            if frame_nr + 1 < number_of_frames:
++                expected_start = fragment_offsets[fragment_nr]
++                if offsets[frame_nr + 1] != expected_start:
++                    raise _error("The extended offset table is invalid")
++            elif fragment_nr != len(fragments):
++                raise _error("The extended offset table is invalid")
++
++        return output
++
++    if extended_offsets is not None:
++        if extended_lengths is None:
++            raise _error("The extended offset table is incomplete")
++        if len(extended_offsets) % 8 or len(extended_lengths) % 8:
++            raise _error("The extended offset table has an invalid length")
++        offsets = list(
++            unpack_from(f"<{len(extended_offsets) // 8}Q", extended_offsets)
++        )
++        lengths = list(
++            unpack_from(f"<{len(extended_lengths) // 8}Q", extended_lengths)
++        )
++        if len(offsets) != number_of_frames or len(lengths) != number_of_frames:
++            raise _error("The extended offset table does not match the frame count")
++        return from_offsets(offsets, lengths)
++
++    if extended_lengths is not None:
++        raise _error("The extended offset table is incomplete")
++    if bot_offsets:
++        return from_offsets(bot_offsets, None)
++
++    if len(fragments) == number_of_frames:
++        return fragments
++    if number_of_frames == 1:
++        return [b"".join(fragments)]
++
++    # With neither offset table present, JPEG-family codestreams are delimited
++    # by their EOI marker.  This is the same fallback used by pydicom's pixel
++    # encapsulation helpers.
++    frames: list[bytes] = []
++    current: list[bytes] = []
++    for fragment in fragments:
++        current.append(fragment)
++        if b"\xff\xd9" in fragment[-10:]:
++            frames.append(b"".join(current))
++            current = []
++    if current:
++        frames.append(b"".join(current))
++    if len(frames) != number_of_frames:
++        raise _error("The encapsulated pixel data does not match the frame count")
++    return frames
++
++
++def _pixel_frames(
++    ds: Dataset,
++    pixel_tag: BaseTag,
++    pixel_element: DataElement,
++    number_of_frames: int,
++    transfer_syntax: UID,
++) -> list[bytes]:
++    data = _as_bytes(pixel_element.value)
++    if transfer_syntax.is_compressed:
++        if pixel_tag != Tag("PixelData"):
++            raise _error("Compressed data must use the PixelData element")
++        extended_offsets = (
++            _as_bytes(ds["ExtendedOffsetTable"].value)
++            if "ExtendedOffsetTable" in ds
++            else None
++        )
++        extended_lengths = (
++            _as_bytes(ds["ExtendedOffsetTableLengths"].value)
++            if "ExtendedOffsetTableLengths" in ds
++            else None
++        )
++        return _parse_encapsulated(
++            data, number_of_frames, extended_offsets, extended_lengths
++        )
++
++    return _split_native_pixel_data(ds, pixel_tag, number_of_frames, data)
++
++
++def _macro_elements(group: Dataset | None) -> dict[BaseTag, DataElement]:
++    if group is None:
++        return {}
++    macros: dict[BaseTag, DataElement] = {}
++    for element in group:
++        macros[element.tag] = deepcopy(element)
++    return macros
++
++
++def _shared_and_frame_macros(
++    ds: Dataset, number_of_frames: int
++) -> tuple[dict[BaseTag, DataElement], list[dict[BaseTag, DataElement]]]:
++    shared_group: Dataset | None = None
++    if _SHARED_GROUPS in ds:
++        sequence = ds[_SHARED_GROUPS].value
++        if not isinstance(sequence, (list, tuple, Sequence)) or len(sequence) != 1:
++            raise _error(
++                "The SharedFunctionalGroupsSequence must contain one item"
++            )
++        if not isinstance(sequence[0], Dataset):
++            raise _error("The shared functional group item is invalid")
++        shared_group = sequence[0]
++
++    per_frame = ds[_PER_FRAME_GROUPS].value
++    if (
++        not isinstance(per_frame, (list, tuple, Sequence))
++        or len(per_frame) != number_of_frames
++    ):
++        raise _error("The per-frame functional groups do not match the frame count")
++    if any(not isinstance(group, Dataset) for group in per_frame):
++        raise _error("The per-frame functional group item is invalid")
++
++    shared = _macro_elements(shared_group)
++    frames = [_macro_elements(group) for group in per_frame]
++    return shared, frames
++
++
++def _validate_dataset(ds: Dataset) -> _DatasetInfo:
++    if not isinstance(ds, Dataset):
++        raise _error("A Dataset is required")
++
++    try:
++        per_frame_element = ds[_PER_FRAME_GROUPS]
++    except Exception as exc:
++        raise _error("The dataset has no per-frame functional groups") from exc
++    try:
++        per_frame = per_frame_element.value
++        per_frame_count = len(per_frame)
++    except Exception as exc:
++        raise _error("The per-frame functional groups are invalid") from exc
++    if not per_frame_count:
++        raise _error("The dataset has no per-frame functional groups")
++
++    file_meta = getattr(ds, "file_meta", None)
++    transfer_value = file_meta.get("TransferSyntaxUID") if file_meta else None
++    if not transfer_value:
++        raise _error("The dataset has no transfer syntax")
++    try:
++        transfer_syntax = (
++            transfer_value
++            if isinstance(transfer_value, UID)
++            else UID(str(transfer_value))
++        )
++        if not transfer_syntax.is_transfer_syntax:
++            raise ValueError
++        compressed = transfer_syntax.is_compressed
++    except Exception as exc:
++        raise _error("The dataset has an invalid transfer syntax") from exc
++
++    if _SOP_CLASS not in ds or not ds[_SOP_CLASS].value:
++        raise _error("The dataset has no SOP class UID")
++    if _SOP_INSTANCE not in ds or not ds[_SOP_INSTANCE].value:
++        raise _error("The dataset has no SOP instance UID")
++
++    pixel_tags = [tag for tag in _PIXEL_TAGS if tag in ds]
++    if len(pixel_tags) != 1:
++        raise _error("The dataset must contain exactly one pixel data element")
++    pixel_tag = pixel_tags[0]
++    pixel_element = ds[pixel_tag]
++
++    if _NUMBER_OF_FRAMES not in ds or ds[_NUMBER_OF_FRAMES].value is None:
++        raise _error("The dataset has no NumberOfFrames")
++    number_of_frames = _integer(ds[_NUMBER_OF_FRAMES].value, "NumberOfFrames")
++    if number_of_frames != per_frame_count:
++        raise _error("The NumberOfFrames value does not match the frame groups")
++
++    shared, frames = _shared_and_frame_macros(ds, number_of_frames)
++    pixel_frames = _pixel_frames(
++        ds, pixel_tag, pixel_element, number_of_frames, transfer_syntax
++    )
++    if len(pixel_frames) != number_of_frames:
++        raise _error("The pixel data does not match the frame count")
++
++    return _DatasetInfo(
++        ds,
++        number_of_frames,
++        transfer_syntax,
++        compressed,
++        pixel_tag,
++        pixel_element,
++        pixel_frames,
++        shared,
++        frames,
++    )
++
++
++def _effective_macros(info: _DatasetInfo, index: int) -> dict[BaseTag, DataElement]:
++    macros = deepcopy(info.shared_macros)
++    macros.update(deepcopy(info.frame_macros[index]))
++    return macros
++
++
++def _attributes_from_macros(macros: dict[BaseTag, DataElement]) -> Dataset:
++    attributes = Dataset()
++    for macro in macros.values():
++        if macro.VR == "SQ":
++            for item in macro.value:
++                if not isinstance(item, Dataset):
++                    continue
++                for element in item:
++                    attributes.add(deepcopy(element))
++        else:
++            attributes.add(deepcopy(macro))
++    return attributes
++
++
++def _value_equal(first: Any, second: Any) -> bool:
++    if first is second:
++        return True
++    try:
++        result = first == second
++        if isinstance(result, bool):
++            return result
++        return bool(result)
++    except Exception as exc:
++        raise _error("The frame attribute values are incomparable") from exc
++
++
++def _element_equal(first: DataElement, second: DataElement) -> bool:
++    return first.VR == second.VR and _value_equal(first.value, second.value)
++
++
++def _tag_for_key(key: Any) -> BaseTag:
++    if isinstance(key, str) and tag_for_keyword(key) is not None:
++        return Tag(tag_for_keyword(key))
++    if isinstance(key, bool) or not isinstance(
++        key, (str, Integral, BaseTag, tuple, list)
++    ):
++        raise _error("Each key must be an attribute name or tag")
++    try:
++        tag = Tag(key)
++    except Exception as exc:
++        raise _error("Each key must be an attribute name or tag") from exc
++    if isinstance(key, str) and not key.strip().replace(" ", ""):
++        raise _error("Each key must be an attribute name or tag")
++    return tag
++
++
++def _keys(keys: Iterable[Any] | Any) -> list[BaseTag]:
++    if keys is None or isinstance(keys, bytes):
++        raise _error("At least one key is required")
++    if isinstance(keys, (str, BaseTag, Integral)):
++        values = [keys]
++    elif isinstance(keys, tuple) and len(keys) == 2 and all(
++        isinstance(value, Integral) for value in keys
++    ):
++        values = [keys]
++    else:
++        try:
++            values = list(keys)
++        except Exception as exc:
++            raise _error("At least one key is required") from exc
++    if not values:
++        raise _error("At least one key is required")
++    return [_tag_for_key(key) for key in values]
++
++
++def _indices(
++    indices: Iterable[int] | Any, number_of_frames: int
++) -> list[int]:
++    if indices is None or isinstance(indices, (str, bytes)):
++        raise _error("A non-empty frame selection is required")
++    try:
++        selected = list(indices)
++    except Exception as exc:
++        raise _error("A non-empty frame selection is required") from exc
++    if not selected:
++        raise _error("A non-empty frame selection is required")
++
++    output: list[int] = []
++    for index in selected:
++        if isinstance(index, bool) or not isinstance(index, Integral):
++            raise _error("A frame selection contains a missing frame")
++        index = int(index)
++        if index < 0 or index >= number_of_frames:
++            raise _error("A frame selection contains a missing frame")
++        output.append(index)
++    if len(set(output)) != len(output):
++        raise _error("A frame selection cannot repeat a frame")
++    return output
++
++
++def _source_references(
++    selections: list[tuple[_DatasetInfo, list[int]]]
++) -> Sequence:
++    references = Sequence()
++    for info, indices in selections:
++        item = Dataset()
++        item.ReferencedSOPClassUID = deepcopy(info.dataset.SOPClassUID)
++        item.ReferencedSOPInstanceUID = deepcopy(info.dataset.SOPInstanceUID)
++        item.ReferencedFrameNumber = [index + 1 for index in indices]
++        references.append(item)
++    return references
++
++
++def _find_attribute(
++    macros: dict[BaseTag, DataElement], tag: BaseTag
++) -> tuple[bool, Any]:
++    found = False
++    value: Any = None
++    for macro_tag, macro in macros.items():
++        if macro_tag == tag:
++            found = True
++            value = macro.value
++        elif macro.VR == "SQ":
++            for item in macro.value:
++                if isinstance(item, Dataset) and tag in item:
++                    found = True
++                    value = item[tag].value
++    return found, value
++
++
++def _set_attribute(
++    macros: dict[BaseTag, DataElement], tag: BaseTag, value: Any
++) -> bool:
++    found = False
++    for macro_tag, macro in macros.items():
++        if macro_tag == tag:
++            macro.value = value
++            found = True
++        elif macro.VR == "SQ":
++            for item in macro.value:
++                if isinstance(item, Dataset) and tag in item:
++                    item[tag].value = value
++                    found = True
++    return found
++
++
++def _remove_attribute(macros: dict[BaseTag, DataElement], tag: BaseTag) -> None:
++    for macro_tag in list(macros):
++        macro = macros[macro_tag]
++        if macro_tag == tag:
++            del macros[macro_tag]
++            continue
++        if macro.VR != "SQ":
++            continue
++        for item in macro.value:
++            if isinstance(item, Dataset) and tag in item:
++                del item[tag]
++        if not macro.value or all(
++            isinstance(item, Dataset) and not item for item in macro.value
++        ):
++            del macros[macro_tag]
++
++
++def _renumber_stack_positions(frames: list[_SelectedFrame]) -> None:
++    stacks: list[tuple[Any, list[_SelectedFrame]]] = []
++    for frame in frames:
++        has_position, _ = _find_attribute(frame.macros, _IN_STACK)
++        if not has_position:
++            continue
++        has_stack, stack = _find_attribute(frame.macros, _STACK_ID)
++        stack_value = stack if has_stack else _MISSING
++        for existing, stack_frames in stacks:
++            if existing is _MISSING and stack_value is _MISSING:
++                stack_frames.append(frame)
++                break
++            if (
++                existing is not _MISSING
++                and stack_value is not _MISSING
++                and _value_equal(existing, stack_value)
++            ):
++                stack_frames.append(frame)
++                break
++        else:
++            stacks.append((stack_value, [frame]))
++
++    for _, stack_frames in stacks:
++        for position, frame in enumerate(stack_frames, 1):
++            _set_attribute(frame.macros, _IN_STACK, position)
++
++
++def _dimension_values(value: Any) -> list[Any]:
++    if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
++        return [value]
++    try:
++        return list(value)
++    except Exception as exc:
++        raise _error("The dimension index values are malformed") from exc
++
++
++def _normalise_dimensions(result: Dataset, frames: list[_SelectedFrame]) -> None:
++    indexed: list[tuple[_SelectedFrame, list[Any]]] = []
++    for frame in frames:
++        present, value = _find_attribute(frame.macros, _DIMENSION_VALUES)
++        if not present:
++            continue
++        values = _dimension_values(value)
++        if values:
++            indexed.append((frame, values))
++        else:
++            _remove_attribute(frame.macros, _DIMENSION_VALUES)
++
++    if not indexed:
++        return
++
++    description: list[Dataset] = []
++    if _DIMENSION_SEQUENCE in result:
++        sequence = result[_DIMENSION_SEQUENCE].value
++        if not isinstance(sequence, (list, tuple, Sequence)):
++            raise _error("The dimension index sequence is malformed")
++        description = [item for item in sequence if isinstance(item, Dataset)]
++
++    dimension_count = len(description)
++    if not dimension_count:
++        dimension_count = max(len(values) for _, values in indexed)
++
++    dropped: list[int] = []
++    for dimension in range(dimension_count):
++        reached = [
++            values[dimension]
++            for _, values in indexed
++            if dimension < len(values)
++        ]
++        if len(reached) == len(indexed) and reached and all(
++            _value_equal(reached[0], value) for value in reached[1:]
++        ):
++            dropped.append(dimension)
++
++    if description:
++        kept_description = [
++            item for index, item in enumerate(description) if index not in dropped
++        ]
++        if kept_description:
++            result[_DIMENSION_SEQUENCE].value = Sequence(kept_description)
++        else:
++            del result[_DIMENSION_SEQUENCE]
++
++    maps: dict[int, list[tuple[Any, int]]] = {}
++    for _, values in indexed:
++        for dimension, value in enumerate(values):
++            if dimension in dropped:
++                continue
++            entries = maps.setdefault(dimension, [])
++            if not any(_value_equal(existing, value) for existing, _ in entries):
++                entries.append((value, len(entries) + 1))
++
++    for frame, values in indexed:
++        retained: list[Any] = []
++        for dimension, value in enumerate(values):
++            if dimension in dropped:
++                continue
++            for original, number in maps[dimension]:
++                if _value_equal(original, value):
++                    retained.append(number)
++                    break
++            else:
++                raise _error("The dimension index values are malformed")
++        if retained:
++            if not _set_attribute(frame.macros, _DIMENSION_VALUES, retained):
++                raise _error("The dimension index values are malformed")
++        else:
++            _remove_attribute(frame.macros, _DIMENSION_VALUES)
++
++
++def _functional_groups(result: Dataset, frames: list[_SelectedFrame]) -> None:
++    macro_tags: list[BaseTag] = []
++    for frame in frames:
++        for tag in frame.macros:
++            if tag not in macro_tags:
++                macro_tags.append(tag)
++
++    shared = Dataset()
++    shared_tags: set[BaseTag] = set()
++    for tag in macro_tags:
++        if all(tag in frame.macros for frame in frames):
++            first = frames[0].macros[tag]
++            if all(_element_equal(first, frame.macros[tag]) for frame in frames[1:]):
++                shared.add(deepcopy(first))
++                shared_tags.add(tag)
++
++    per_frame = Sequence()
++    for frame in frames:
++        group = Dataset()
++        for tag in macro_tags:
++            if tag in frame.macros and tag not in shared_tags:
++                group.add(deepcopy(frame.macros[tag]))
++        per_frame.append(group)
++
++    result.SharedFunctionalGroupsSequence = Sequence([shared])
++    result.PerFrameFunctionalGroupsSequence = per_frame
++
++
++def _derived(
++    selections: list[tuple[_DatasetInfo, list[int]]],
++) -> Dataset:
++    first_info = selections[0][0]
++    selected: list[_SelectedFrame] = []
++    for info, indices in selections:
++        for index in indices:
++            selected.append(
++                _SelectedFrame(
++                    _effective_macros(info, index),
++                    info.pixel_frames[index],
++                )
++            )
++
++    result = deepcopy(first_info.dataset)
++    _renumber_stack_positions(selected)
++    _normalise_dimensions(result, selected)
++    _functional_groups(result, selected)
++
++    result.NumberOfFrames = len(selected)
++    result.SourceImageSequence = _source_references(selections)
++
++    if first_info.compressed:
++        pixel_value = encapsulate([frame.pixel_data for frame in selected])
++    else:
++        if (
++            first_info.pixel_tag == Tag("PixelData")
++            and first_info.dataset.BitsAllocated == 1
++        ):
++            pixel_count = (
++                _integer(first_info.dataset.Rows, "Rows")
++                * _integer(first_info.dataset.Columns, "Columns")
++                * _integer(first_info.dataset.SamplesPerPixel, "SamplesPerPixel")
++            )
++            pixel_value = concatenate_packed_frames(
++                [frame.pixel_data for frame in selected], pixel_count
++            )
++        else:
++            pixel_value = b"".join(frame.pixel_data for frame in selected)
++            if len(pixel_value) % 2:
++                pixel_value += b"\x00"
++
++    pixel_element = deepcopy(first_info.pixel_element)
++    pixel_element.value = pixel_value
++    pixel_element.is_undefined_length = first_info.compressed
++    result[first_info.pixel_tag] = pixel_element
++
++    # The extended offset table describes the old frame order and therefore
++    # must not survive a frame operation.
++    for keyword in ("ExtendedOffsetTable", "ExtendedOffsetTableLengths"):
++        if keyword in result:
++            del result[keyword]
++
++    new_instance_uid = generate_uid()
++    result.SOPInstanceUID = new_instance_uid
++    if not getattr(result, "file_meta", None):
++        raise _error("The dataset has no file meta information")
++    result.file_meta.TransferSyntaxUID = first_info.transfer_syntax
++    result.file_meta.MediaStorageSOPClassUID = result.SOPClassUID
++    result.file_meta.MediaStorageSOPInstanceUID = new_instance_uid
++    return result
++
++
++def frame_attributes(ds: Dataset, index: int) -> Dataset:
++    """Return the effective functional-group attributes for one frame.
++
++    Parameters
++    ----------
++    ds : Dataset
++        An enhanced multi-frame dataset.
++    index : int
++        The zero-based frame index.
++    """
++
++    info = _validate_dataset(ds)
++    selected = _indices([index], info.number_of_frames)
++    return _attributes_from_macros(_effective_macros(info, selected[0]))
++
++
++def varying_attributes(ds: Dataset) -> set[BaseTag]:
++    """Return the effective attribute tags whose values vary by frame."""
++
++    info = _validate_dataset(ds)
++    if info.number_of_frames == 1:
++        return set()
++
++    attributes = [
++        _attributes_from_macros(_effective_macros(info, index))
++        for index in range(info.number_of_frames)
++    ]
++    tags: set[BaseTag] = set()
++    all_tags: set[BaseTag] = set().union(*(set(attrs.keys()) for attrs in attributes))
++    for tag in all_tags:
++        if any(tag not in attrs for attrs in attributes):
++            tags.add(tag)
++            continue
++        first = attributes[0][tag].value
++        if any(not _value_equal(first, attrs[tag].value) for attrs in attributes[1:]):
++            tags.add(tag)
++    return tags
++
++
++def extract_frames(ds: Dataset, indices: Iterable[int]) -> Dataset:
++    """Return a derived instance containing selected frames in given order."""
++
++    info = _validate_dataset(ds)
++    selected = _indices(indices, info.number_of_frames)
++    return _derived([(info, selected)])
++
++
++def merge_frames(datasets: Iterable[Dataset]) -> Dataset:
++    """Return a derived instance containing all frames from `datasets`."""
++
++    try:
++        source_datasets = list(datasets)
++    except Exception as exc:
++        raise _error("At least one dataset is required") from exc
++    if not source_datasets:
++        raise _error("At least one dataset is required")
++
++    infos = [_validate_dataset(ds) for ds in source_datasets]
++    first = infos[0]
++    image_pixel_tags = {
++        tag for tag in _IMAGE_PIXEL_TAGS if tag in first.dataset
++    }
++    for info in infos[1:]:
++        if info.transfer_syntax != first.transfer_syntax:
++            raise _error("The datasets have different transfer syntaxes")
++        if info.dataset.SOPClassUID != first.dataset.SOPClassUID:
++            raise _error("The datasets have different SOP classes")
++        if (
++            info.pixel_tag != first.pixel_tag
++            or info.pixel_element.VR != first.pixel_element.VR
++        ):
++            raise _error("The datasets have different pixel data elements")
++
++        other_tags = {tag for tag in _IMAGE_PIXEL_TAGS if tag in info.dataset}
++        if other_tags != image_pixel_tags:
++            raise _error("The datasets have different image pixel attributes")
++        for tag in image_pixel_tags:
++            if not _element_equal(first.dataset[tag], info.dataset[tag]):
++                raise _error("The datasets have different image pixel attributes")
++
++    selections = [
++        (info, list(range(info.number_of_frames)))
++        for info in infos
++    ]
++    return _derived(selections)
++
++
++def group_frames(ds: Dataset, keys: Iterable[Any]) -> list[Dataset]:
++    """Return one derived instance for each distinct key combination."""
++
++    info = _validate_dataset(ds)
++    tags = _keys(keys)
++    attributes = [
++        _attributes_from_macros(_effective_macros(info, index))
++        for index in range(info.number_of_frames)
++    ]
++
++    groups: list[tuple[list[Any], list[int]]] = []
++    for index, attrs in enumerate(attributes):
++        values = [attrs[tag].value if tag in attrs else _MISSING for tag in tags]
++        for existing, indices in groups:
++            if all(
++                (a is _MISSING and b is _MISSING)
++                or (a is not _MISSING and b is not _MISSING and _value_equal(a, b))
++                for a, b in zip(existing, values)
++            ):
++                indices.append(index)
++                break
++        else:
++            groups.append((values, [index]))
++
++    return [_derived([(info, indices)]) for _, indices in groups]
++
++
++def sort_frames(ds: Dataset, keys: Iterable[Any]) -> Dataset:
++    """Return a derived instance with frames sorted by effective attributes."""
++
++    info = _validate_dataset(ds)
++    tags = _keys(keys)
++    attributes = [
++        _attributes_from_macros(_effective_macros(info, index))
++        for index in range(info.number_of_frames)
++    ]
++
++    def compare(first_index: int, second_index: int) -> int:
++        first_attrs = attributes[first_index]
++        second_attrs = attributes[second_index]
++        for tag in tags:
++            first_missing = tag not in first_attrs
++            second_missing = tag not in second_attrs
++            if first_missing or second_missing:
++                if first_missing and second_missing:
++                    continue
++                return 1 if first_missing else -1
++
++            first_value = first_attrs[tag].value
++            second_value = second_attrs[tag].value
++            if _value_equal(first_value, second_value):
++                continue
++            try:
++                if first_value < second_value:
++                    return -1
++                if second_value < first_value:
++                    return 1
++            except Exception as exc:
++                raise _error("The frame attribute values are incomparable") from exc
++            raise _error("The frame attribute values are incomparable")
++        return 0
++
++    ordered = sorted(range(info.number_of_frames), key=cmp_to_key(compare))
++    return _derived([(info, ordered)])
++
++
++__all__ = [
++    "MultiFrameError",
++    "extract_frames",
++    "frame_attributes",
++    "group_frames",
++    "merge_frames",
++    "sort_frames",
++    "varying_attributes",
++]
+diff --git a/tests/test_multiframe.py b/tests/test_multiframe.py
+new file mode 100644
+index 0000000..a61b350
+--- /dev/null
++++ b/tests/test_multiframe.py
+@@ -0,0 +1,155 @@
++"""Tests for enhanced multi-frame operations."""
++
++import pytest
++
++from pydicom import Dataset, FileMetaDataset, Sequence
++from pydicom.encaps import encapsulate, generate_frames
++from pydicom.multiframe import (
++    MultiFrameError,
++    extract_frames,
++    frame_attributes,
++    group_frames,
++    merge_frames,
++    sort_frames,
++    varying_attributes,
++)
++from pydicom.tag import Tag
++from pydicom.uid import ExplicitVRLittleEndian, JPEGBaseline8Bit
++
++
++def _item(**values):
++    item = Dataset()
++    for keyword, value in values.items():
++        setattr(item, keyword, value)
++    return item
++
++
++def _dataset(number_of_frames=3, compressed=False):
++    ds = Dataset()
++    ds.file_meta = FileMetaDataset()
++    ds.file_meta.TransferSyntaxUID = (
++        JPEGBaseline8Bit if compressed else ExplicitVRLittleEndian
++    )
++    ds.SOPClassUID = "1.2.3"
++    ds.SOPInstanceUID = "1.2.3.4"
++    ds.NumberOfFrames = number_of_frames
++    ds.Rows = 1
++    ds.Columns = 2
++    ds.SamplesPerPixel = 1
++    ds.PhotometricInterpretation = "MONOCHROME2"
++    ds.BitsAllocated = 8
++
++    shared = Dataset()
++    shared.PlaneOrientationSequence = Sequence(
++        [_item(ImageOrientationPatient=[1, 0, 0, 0, 1, 0])]
++    )
++    ds.SharedFunctionalGroupsSequence = Sequence([shared])
++
++    groups = []
++    for index in range(number_of_frames):
++        group = Dataset()
++        group.FrameContentSequence = Sequence(
++            [_item(InStackPositionNumber=number_of_frames - index)]
++        )
++        group.PlanePositionSequence = Sequence(
++            [_item(ImagePositionPatient=[0, 0, index])]
++        )
++        groups.append(group)
++    ds.PerFrameFunctionalGroupsSequence = Sequence(groups)
++
++    frames = [bytes([65 + index, 65 + index]) for index in range(number_of_frames)]
++    if compressed:
++        ds.PixelData = encapsulate(frames)
++        ds["PixelData"].is_undefined_length = True
++    else:
++        ds.PixelData = b"".join(frames)
++    return ds
++
++
++def test_frame_attributes_uses_per_frame_macro_and_is_a_copy():
++    ds = _dataset()
++    ds.PerFrameFunctionalGroupsSequence[1].PlaneOrientationSequence = Sequence(
++        [_item(ImageOrientationPatient=[0, 1, 0, 1, 0, 0])]
++    )
++
++    attrs = frame_attributes(ds, 1)
++    assert attrs.ImageOrientationPatient == [0, 1, 0, 1, 0, 0]
++    attrs.ImagePositionPatient[0] = 99
++    assert (
++        ds.PerFrameFunctionalGroupsSequence[1]
++        .PlanePositionSequence[0]
++        .ImagePositionPatient[0]
++        == 0
++    )
++
++
++def test_varying_extract_and_normalise():
++    ds = _dataset()
++    varying = varying_attributes(ds)
++    assert Tag("ImagePositionPatient") in varying
++
++    result = extract_frames(ds, [2, 0])
++    assert result.PixelData == b"CCAA"
++    assert [
++        frame_attributes(result, index).InStackPositionNumber
++        for index in range(result.NumberOfFrames)
++    ] == [1, 2]
++    assert result.SourceImageSequence[0].ReferencedFrameNumber == [3, 1]
++    assert result.SOPInstanceUID == result.file_meta.MediaStorageSOPInstanceUID
++    assert ds.PixelData == b"AABBCC"
++
++
++def test_merge_group_sort_and_compressed_rebuild():
++    first = _dataset(2)
++    second = _dataset(1)
++    second.SOPInstanceUID = "1.2.3.5"
++
++    merged = merge_frames([first, second])
++    assert merged.NumberOfFrames == 3
++    assert merged.PixelData == b"AABBAA"
++    assert len(merged.SourceImageSequence) == 2
++    assert merged.SourceImageSequence[0].ReferencedFrameNumber == [1, 2]
++    assert merged.SourceImageSequence[1].ReferencedFrameNumber == 1
++
++    groups = group_frames(first, ["ImagePositionPatient"])
++    assert [group.PixelData for group in groups] == [b"AA", b"BB"]
++    assert sort_frames(first, "InStackPositionNumber").PixelData == b"BBAA"
++
++    compressed = extract_frames(_dataset(compressed=True), [2, 0])
++    assert list(generate_frames(compressed.PixelData, number_of_frames=2)) == [
++        b"CC",
++        b"AA",
++    ]
++
++
++@pytest.mark.parametrize(
++    "operation",
++    [
++        lambda ds: frame_attributes(ds, 0),
++        varying_attributes,
++        lambda ds: extract_frames(ds, [0]),
++        lambda ds: merge_frames([ds]),
++        lambda ds: group_frames(ds, ["Rows"]),
++        lambda ds: sort_frames(ds, ["Rows"]),
++    ],
++)
++def test_all_operations_reject_empty_per_frame_groups(operation):
++    ds = _dataset()
++    ds.PerFrameFunctionalGroupsSequence = Sequence()
++    with pytest.raises(MultiFrameError):
++        operation(ds)
++
++
++def test_invalid_selection_and_uncombinable_inputs():
++    ds = _dataset()
++    with pytest.raises(MultiFrameError):
++        extract_frames(ds, [])
++    with pytest.raises(MultiFrameError):
++        extract_frames(ds, [0, 0])
++    with pytest.raises(MultiFrameError):
++        sort_frames(ds, [])
++
++    other = _dataset()
++    other.Columns = 3
++    with pytest.raises(MultiFrameError):
++        merge_frames([ds, other])

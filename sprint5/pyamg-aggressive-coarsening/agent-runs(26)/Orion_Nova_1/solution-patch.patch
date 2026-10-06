@@ -1,0 +1,711 @@
+diff --git a/pyamg/classical/__init__.py b/pyamg/classical/__init__.py
+index 33e3b7f..87ed1b9 100644
+--- a/pyamg/classical/__init__.py
++++ b/pyamg/classical/__init__.py
+@@ -5,16 +5,29 @@ from . import classical
+ from . import split
+ from . import interpolate
+ from . import cr
++from . import sparsify
+ 
+ from .classical import ruge_stuben_solver
+ from .air import air_solver
++from .split import aggressive_strength_of_connection, aggressive_coarsening
++from .interpolate import (multipass_interpolation, interpolation_passes,
++                          truncate_interpolation, jacobi_improve_interpolation)
++from .sparsify import sparsify_coarse_operator
+ 
+ __all__ = [
+     'air',
+     'air_solver',
+     'classical',
+     'cr',
++    'aggressive_coarsening',
++    'aggressive_strength_of_connection',
+     'interpolate',
++    'interpolation_passes',
++    'jacobi_improve_interpolation',
++    'multipass_interpolation',
+     'ruge_stuben_solver',
++    'sparsify',
++    'sparsify_coarse_operator',
+     'split',
++    'truncate_interpolation',
+ ]
+diff --git a/pyamg/classical/classical.py b/pyamg/classical/classical.py
+index b9eb3ef..6f5380f 100644
+--- a/pyamg/classical/classical.py
++++ b/pyamg/classical/classical.py
+@@ -11,7 +11,9 @@ from pyamg.strength import classical_strength_of_connection, \
+     symmetric_strength_of_connection, evolution_strength_of_connection, \
+     distance_strength_of_connection, energy_based_strength_of_connection, \
+     algebraic_distance, affinity_distance
+-from pyamg.classical.interpolate import direct_interpolation, classical_interpolation
++from pyamg.classical.interpolate import (direct_interpolation, classical_interpolation,
++                                         multipass_interpolation)
++from pyamg.classical.sparsify import sparsify_coarse_operator
+ from . import split
+ from .cr import CR
+ from ..util.utils import asfptype
+@@ -21,6 +23,7 @@ def ruge_stuben_solver(A,
+                        strength=('classical', {'theta': 0.25}),
+                        CF=('RS', {'second_pass': False}),
+                        interpolation='classical',
++                       aggressive_levels=None, sparsify=None,
+                        presmoother=('gauss_seidel', {'sweep': 'symmetric'}),
+                        postsmoother=('gauss_seidel', {'sweep': 'symmetric'}),
+                        max_levels=30, max_coarse=10, keep=False, **kwargs):
+@@ -39,9 +42,16 @@ def ruge_stuben_solver(A,
+         strength=None, all nonzero entries of the matrix are considered strong.
+     CF : str or tuple, default 'RS'
+         Method used for coarse grid selection (C/F splitting).
+-        Supported methods are RS, PMIS, PMISc, CLJP, CLJPc, and CR.
++        Supported methods are RS, PMIS, PMISc, CLJP, CLJPc, CR, and aggressive.
+     interpolation : str, default 'classical'
+-        Method for interpolation. Options include 'direct', 'classical'.
++        Method for interpolation. Options include 'direct', 'classical', and
++        'multipass'.
++    aggressive_levels : int or None, default None
++        Number of leading levels on which aggressive coarsening is used.  None
++        uses it on every level and zero uses RS coarsening throughout.
++    sparsify : str, tuple, or None, default None
++        Coarse-operator sparsification.  ``'lump'`` selects lumped
++        sparsification; method arguments may be supplied in a tuple.
+     presmoother : str or dict
+         Method used for presmoothing at each level.  Method-specific parameters
+         may be passed in using a tuple, e.g.
+@@ -91,6 +101,27 @@ def ruge_stuben_solver(A,
+     >>> ml = ruge_stuben_solver(A,max_coarse=3)
+ 
+     """
++    if isinstance(aggressive_levels, (bool, np.bool_)) or \
++            (aggressive_levels is not None
++             and not isinstance(aggressive_levels, (int, np.integer))):
++        raise ValueError('aggressive_levels must be a whole number or None')
++    if aggressive_levels is not None and aggressive_levels < 0:
++        raise ValueError('aggressive_levels must be nonnegative')
++
++    def validate_method_arg(value, name):
++        if isinstance(value, tuple):
++            if len(value) != 2 or not isinstance(value[1], dict):
++                raise ValueError(f'{name} must be a method or (method, dict)')
++            return value[0]
++        return value
++
++    cf_name = validate_method_arg(CF, 'CF')
++    if cf_name not in ('RS', 'PMIS', 'PMISc', 'CLJP', 'CLJPc', 'CR', 'aggressive'):
++        raise ValueError(f'Unknown C/F splitting method {cf_name}')
++    sparsify_name = validate_method_arg(sparsify, 'sparsify')
++    if sparsify_name not in (None, 'lump'):
++        raise ValueError(f'Unknown sparsification method {sparsify_name}')
++
+     levels = [MultilevelSolver.Level()]
+ 
+     # convert A to csr
+@@ -109,7 +140,8 @@ def ruge_stuben_solver(A,
+     levels[-1].A = A
+ 
+     while len(levels) < max_levels and levels[-1].A.shape[0] > max_coarse:
+-        bottom = _extend_hierarchy(levels, strength, CF, interpolation, keep)
++        bottom = _extend_hierarchy(levels, strength, CF, interpolation, keep,
++                                   aggressive_levels, sparsify)
+ 
+         if bottom:
+             break
+@@ -120,7 +152,8 @@ def ruge_stuben_solver(A,
+ 
+ 
+ # internal function
+-def _extend_hierarchy(levels, strength, CF, interpolation, keep):
++def _extend_hierarchy(levels, strength, CF, interpolation, keep,
++                      aggressive_levels=None, sparsify=None):
+     """Extend the multigrid hierarchy."""
+     def unpack_arg(v):
+         if isinstance(v, tuple):
+@@ -153,7 +186,13 @@ def _extend_hierarchy(levels, strength, CF, interpolation, keep):
+ 
+     # Generate the C/F splitting
+     fn, kwargs = unpack_arg(CF)
+-    if fn == 'RS':
++    if fn == 'aggressive':
++        level = len(levels) - 1
++        if aggressive_levels is None or level < aggressive_levels:
++            splitting = split.aggressive_coarsening(C, **kwargs)
++        else:
++            splitting = split.RS(C)
++    elif fn == 'RS':
+         splitting = split.RS(C, **kwargs)
+     elif fn == 'PMIS':
+         splitting = split.PMIS(C, **kwargs)
+@@ -181,6 +220,8 @@ def _extend_hierarchy(levels, strength, CF, interpolation, keep):
+         P = classical_interpolation(A, C, splitting, **kwargs)
+     elif fn == 'direct':
+         P = direct_interpolation(A, C, splitting, **kwargs)
++    elif fn == 'multipass':
++        P = multipass_interpolation(A, C, splitting, **kwargs)
+     else:
+         raise ValueError(f'Unknown interpolation method {interpolation}')
+ 
+@@ -199,5 +240,10 @@ def _extend_hierarchy(levels, strength, CF, interpolation, keep):
+     # Form next level through Galerkin product
+     levels.append(MultilevelSolver.Level())
+     A = R @ A @ P
++    fn, kwargs = unpack_arg(sparsify)
++    if fn == 'lump':
++        A = sparsify_coarse_operator(A.tocsr(), **kwargs)
++    elif fn is not None:
++        raise ValueError(f'Unknown sparsification method {fn}')
+     levels[-1].A = A
+     return False
+diff --git a/pyamg/classical/interpolate.py b/pyamg/classical/interpolate.py
+index f5a771a..59f1664 100644
+--- a/pyamg/classical/interpolate.py
++++ b/pyamg/classical/interpolate.py
+@@ -1,5 +1,6 @@
+ """Classical AMG Interpolation methods."""
+ 
++from numbers import Integral, Real
+ from warnings import warn
+ 
+ import numpy as np
+@@ -9,6 +10,273 @@ from .. import amg_core
+ from ..strength import classical_strength_of_connection
+ 
+ 
++def _require_csr(matrix, name):
++    if not issparse(matrix) or matrix.format != 'csr':
++        raise TypeError(f'expected csr_array for {name}')
++
++
++def _whole_number(value, name, minimum=0):
++    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
++        raise ValueError(f'{name} must be a whole number')
++    value = int(value)
++    if value < minimum:
++        raise ValueError(f'{name} must be at least {minimum}')
++    return value
++
++
++def _multipass_connections(A, C, theta, norm):
++    """Return entries of A selected by the requested strength pattern."""
++    _require_csr(A, 'A')
++    _require_csr(C, 'C')
++    if A.shape[0] != A.shape[1] or C.shape != A.shape:
++        raise ValueError('A and C must be square matrices of the same shape')
++    if norm not in ('min', 'abs'):
++        raise ValueError("norm must be 'min' or 'abs'")
++    if theta is not None:
++        pattern = classical_strength_of_connection(A, theta=theta, norm=norm)
++    else:
++        pattern = C.copy()
++    pattern.sum_duplicates()
++    pattern.eliminate_zeros()
++    pattern.data[:] = 1
++    pattern = pattern.multiply(A).tocsr()
++    pattern.setdiag(0)
++    pattern.eliminate_zeros()
++    pattern.sort_indices()
++    return pattern
++
++
++def interpolation_passes(A, C, splitting, theta=None, norm='min'):
++    """Return the pass on which each point is available to multipass interpolation."""
++    strong = _multipass_connections(A, C, theta, norm)
++    n = A.shape[0]
++    splitting = np.asarray(splitting)
++    if splitting.ndim != 1 or splitting.size != n:
++        raise ValueError('splitting must have one entry per point')
++    passes = np.full(n, -1, dtype='intc')
++    passes[splitting != 0] = 0
++    current = 1
++    while True:
++        newly_settled = []
++        for i in np.flatnonzero(passes < 0):
++            neighbors = strong.indices[strong.indptr[i]:strong.indptr[i + 1]]
++            if np.any((passes[neighbors] >= 0) & (passes[neighbors] < current)):
++                newly_settled.append(int(i))
++        if not newly_settled:
++            break
++        passes[newly_settled] = current
++        current += 1
++    return passes
++
++
++def multipass_interpolation(A, C, splitting, theta=None, norm='min', trunc=None,
++                            improve=0, strict=False, lump=False, max_passes=None):
++    """Construct interpolation recursively over successive strong-neighbor passes."""
++    strong = _multipass_connections(A, C, theta, norm)
++    n = A.shape[0]
++    splitting = np.asarray(splitting)
++    if splitting.ndim != 1 or splitting.size != n:
++        raise ValueError('splitting must have one entry per point')
++    coarse = splitting != 0
++    improve = _whole_number(improve, 'improve', 0)
++    if not isinstance(strict, (bool, np.bool_)):
++        raise ValueError('strict must be boolean')
++    if not isinstance(lump, (bool, np.bool_)):
++        raise ValueError('lump must be boolean')
++    if max_passes is not None:
++        max_passes = _whole_number(max_passes, 'max_passes', 1)
++
++    pass_number = np.full(n, -1, dtype='intc')
++    pass_number[coarse] = 0
++    current = 1
++    while max_passes is None or current <= max_passes:
++        newly_settled = []
++        for i in np.flatnonzero(pass_number < 0):
++            js = strong.indices[strong.indptr[i]:strong.indptr[i + 1]]
++            if np.any((pass_number[js] >= 0) & (pass_number[js] < current)):
++                newly_settled.append(int(i))
++        if not newly_settled:
++            break
++        pass_number[newly_settled] = current
++        current += 1
++
++    if strict and np.any(pass_number < 0):
++        raise ValueError('some fine points cannot be interpolated')
++
++    cpts = np.flatnonzero(coarse)
++    coarse_column = np.full(n, -1, dtype=np.int64)
++    coarse_column[cpts] = np.arange(cpts.size)
++    dtype = np.result_type(A.dtype, np.float64)
++    unscaled = [None] * n
++    for i in cpts:
++        unscaled[int(i)] = {int(coarse_column[i]): dtype.type(1)}
++
++    for p in range(1, current):
++        for i in np.flatnonzero(pass_number == p):
++            row = {}
++            start, end = strong.indptr[i], strong.indptr[i + 1]
++            for j, aij in zip(strong.indices[start:end], strong.data[start:end], strict=True):
++                j = int(j)
++                if pass_number[j] < 0 or pass_number[j] >= p:
++                    continue
++                if coarse[j]:
++                    col = int(coarse_column[j])
++                    row[col] = row.get(col, 0) + aij
++                else:
++                    for col, value in unscaled[j].items():
++                        row[col] = row.get(col, 0) + aij * value
++            unscaled[int(i)] = row
++
++    Awork = A.copy()
++    Awork.sum_duplicates()
++    Awork.sort_indices()
++    rows = []
++    cols = []
++    values = []
++    for i in range(n):
++        if pass_number[i] < 0:
++            continue
++        row = unscaled[i]
++        if coarse[i]:
++            rows.append(i)
++            cols.append(int(coarse_column[i]))
++            values.append(dtype.type(1))
++            continue
++
++        astart, aend = Awork.indptr[i], Awork.indptr[i + 1]
++        ajs = Awork.indices[astart:aend]
++        avs = Awork.data[astart:aend]
++        diagonal = np.sum(avs[ajs == i], dtype=dtype)
++        offdiag_sum = np.sum(avs[ajs != i], dtype=dtype)
++        if lump:
++            sstart, send = strong.indptr[i], strong.indptr[i + 1]
++            for j, aij in zip(strong.indices[sstart:send], strong.data[sstart:send],
++                              strict=True):
++                if pass_number[int(j)] < 0 or pass_number[int(j)] >= pass_number[i]:
++                    diagonal += aij
++        row_sum = sum(row.values(), dtype.type(0))
++        scale = dtype.type(1)
++        if diagonal != 0 and row_sum != 0:
++            scale = -offdiag_sum / (diagonal * row_sum)
++        for col, value in row.items():
++            value = value * scale
++            if value != 0:
++                rows.append(i)
++                cols.append(col)
++                values.append(value)
++
++    index_dtype = A.indices.dtype
++    P = csr_array((np.asarray(values, dtype=dtype),
++                   (np.asarray(rows, dtype=index_dtype),
++                    np.asarray(cols, dtype=index_dtype))), shape=(n, cpts.size))
++    P.sum_duplicates()
++    P.eliminate_zeros()
++    P.sort_indices()
++    if trunc is not None:
++        P = truncate_interpolation(P, trunc)
++    if improve:
++        P = jacobi_improve_interpolation(A, P, splitting, degree=improve, C=strong)
++    return P
++
++
++def truncate_interpolation(P, theta):
++    """Drop relatively small interpolation weights while preserving row sums."""
++    _require_csr(P, 'P')
++    if not isinstance(theta, Real) or isinstance(theta, (bool, np.bool_)) \
++            or not 0 <= theta < 1:
++        raise ValueError('theta must be in [0, 1)')
++    P = P.copy()
++    P.sum_duplicates()
++    rows = []
++    cols = []
++    values = []
++    for i in range(P.shape[0]):
++        start, end = P.indptr[i], P.indptr[i + 1]
++        js, vals = P.indices[start:end], P.data[start:end]
++        if vals.size == 0:
++            continue
++        keep = np.abs(vals) >= theta * np.max(np.abs(vals))
++        old_sum = np.sum(vals)
++        kept_sum = np.sum(vals[keep])
++        if kept_sum == 0:
++            keep = np.ones(vals.size, dtype=bool)
++            factor = 1
++        else:
++            factor = old_sum / kept_sum
++        for j, value in zip(js[keep], vals[keep] * factor, strict=True):
++            if value != 0:
++                rows.append(i)
++                cols.append(int(j))
++                values.append(value)
++    index_dtype = P.indices.dtype
++    result = csr_array((np.asarray(values, dtype=P.dtype),
++                        (np.asarray(rows, dtype=index_dtype),
++                         np.asarray(cols, dtype=index_dtype))), shape=P.shape)
++    result.eliminate_zeros()
++    result.sort_indices()
++    return result
++
++
++def jacobi_improve_interpolation(A, P, splitting, omega=4.0 / 3.0,
++                                 degree=1, C=None):
++    """Apply weighted-Jacobi improvement sweeps to an interpolation matrix."""
++    _require_csr(A, 'A')
++    _require_csr(P, 'P')
++    if A.shape[0] != A.shape[1] or P.shape[0] != A.shape[0]:
++        raise ValueError('incompatible A and P shapes')
++    if not isinstance(omega, Real) or isinstance(omega, (bool, np.bool_)) \
++            or not np.isfinite(omega) or omega <= 0:
++        raise ValueError('omega must be positive')
++    degree = _whole_number(degree, 'degree', 0)
++    splitting = np.asarray(splitting)
++    if splitting.ndim != 1 or splitting.size != A.shape[0]:
++        raise ValueError('splitting must have one entry per point')
++    coarse = splitting != 0
++
++    operator = A.copy()
++    operator.sum_duplicates()
++    if C is not None:
++        _require_csr(C, 'C')
++        if C.shape != A.shape:
++            raise ValueError('C must have the same shape as A')
++        pattern = C.copy()
++        pattern.sum_duplicates()
++        pattern.eliminate_zeros()
++        pattern.data[:] = 1
++        kept = pattern.multiply(operator).tocsr()
++        kept.setdiag(0)
++        kept.eliminate_zeros()
++        original_row_sum = np.asarray(operator.sum(axis=1)).ravel()
++        kept_row_sum = np.asarray(kept.sum(axis=1)).ravel()
++        operator = kept
++        operator.setdiag(original_row_sum - kept_row_sum)
++    operator.sort_indices()
++
++    result = P.copy().astype(np.result_type(A.dtype, P.dtype, np.float64))
++    if degree:
++        diagonal = operator.diagonal()
++        if np.any(diagonal == 0):
++            raise ValueError('zero diagonal in A')
++        cpts = np.flatnonzero(coarse)
++        if P.shape[1] != cpts.size:
++            raise ValueError('P must have one column per coarse point')
++        for _ in range(degree):
++            diag_indices = np.arange(A.shape[0], dtype=A.indices.dtype)
++            result = (result - csr_array((omega / diagonal,
++                                          (diag_indices, diag_indices)),
++                                         shape=A.shape) @ (operator @ result)).tocsr()
++            result = result.tolil()
++            for col, i in enumerate(cpts):
++                result.rows[int(i)] = [col]
++                result.data[int(i)] = [result.dtype.type(1)]
++            result = result.tocsr()
++            result.eliminate_zeros()
++            result.sort_indices()
++    result.eliminate_zeros()
++    result.sort_indices()
++    return result
++
++
+ def direct_interpolation(A, C, splitting, theta=None, norm='min'):
+     """Create prolongator using direct interpolation.
+ 
+diff --git a/pyamg/classical/sparsify.py b/pyamg/classical/sparsify.py
+new file mode 100644
+index 0000000..33c6380
+--- /dev/null
++++ b/pyamg/classical/sparsify.py
+@@ -0,0 +1,135 @@
++"""Sparsification tools for classical AMG coarse operators."""
++
++from numbers import Real
++
++import numpy as np
++from scipy.sparse import csr_array, issparse
++
++
++def sparsify_coarse_operator(A, theta=0.1, lump='diagonal', symmetric=True,
++                             B=None, protect=None):
++    """Drop weak coarse-operator entries and optionally lump their action."""
++    if not issparse(A) or A.format != 'csr':
++        raise TypeError('expected csr_array for A')
++    if A.shape[0] != A.shape[1]:
++        raise ValueError('A must be square')
++    if not isinstance(theta, Real) or isinstance(theta, (bool, np.bool_)) \
++            or not 0 <= theta < 1:
++        raise ValueError('theta must be in [0, 1)')
++    if lump not in ('diagonal', 'strong', 'none'):
++        raise ValueError("lump must be 'diagonal', 'strong', or 'none'")
++    if not isinstance(symmetric, (bool, np.bool_)):
++        raise ValueError('symmetric must be boolean')
++    n = A.shape[0]
++    if protect is not None:
++        if not issparse(protect) or protect.format != 'csr':
++            raise TypeError('expected csr_array for protect')
++        if protect.shape != A.shape:
++            raise ValueError('protect must have the same shape as A')
++
++    if B is None:
++        B = np.ones(n, dtype=np.result_type(A.dtype, np.float64))
++    else:
++        B = np.asarray(B)
++        if B.size != n or B.ndim > 2 or (B.ndim == 2 and 1 not in B.shape):
++            raise ValueError('B must hold one entry per point')
++        B = B.reshape(-1).copy()
++    if lump != 'none' and np.any(B == 0):
++        raise ValueError('B must have no zero entries when lumping')
++
++    M = A.copy()
++    M.sum_duplicates()
++    M.sort_indices()
++    # A boolean matrix records positions that were actually present in A.
++    present = M.copy()
++    present.data = np.ones(present.nnz, dtype=bool)
++    protection = None
++    if protect is not None:
++        protection = protect.copy()
++        protection.sum_duplicates()
++        protection.data = np.ones(protection.nnz, dtype=bool)
++        protection = protection.multiply(present).tocsr()
++
++    keep_by_row = []
++    for i in range(n):
++        start, end = M.indptr[i], M.indptr[i + 1]
++        js, vals = M.indices[start:end], M.data[start:end]
++        off = js != i
++        maximum = np.max(np.abs(vals[off]), initial=0)
++        keep = np.zeros(vals.size, dtype=bool)
++        if maximum > 0:
++            keep[off] = np.abs(vals[off]) >= theta * maximum
++        if protection is not None:
++            protected = set(
++                protection.indices[protection.indptr[i]:protection.indptr[i + 1]])
++            keep |= np.fromiter((j in protected for j in js), dtype=bool, count=js.size)
++        keep[js == i] = True
++        # Explicit off-diagonal zeros are never stored in the result.
++        keep &= (vals != 0) | (js == i)
++        keep_by_row.append(keep)
++
++    if symmetric:
++        positions = {}
++        for i in range(n):
++            start, end = M.indptr[i], M.indptr[i + 1]
++            for local, j in enumerate(M.indices[start:end]):
++                positions[(i, int(j))] = (i, local)
++        for i in range(n):
++            start, end = M.indptr[i], M.indptr[i + 1]
++            for local, j in enumerate(M.indices[start:end]):
++                j = int(j)
++                transpose = positions.get((j, i))
++                if transpose is not None and keep_by_row[transpose[0]][transpose[1]]:
++                    if M.data[start + local] != 0:
++                        keep_by_row[i][local] = True
++
++    dtype = np.result_type(A.dtype, B.dtype)
++    rows = []
++    cols = []
++    data = []
++    for i in range(n):
++        start, end = M.indptr[i], M.indptr[i + 1]
++        js, vals = M.indices[start:end], M.data[start:end]
++        keep = keep_by_row[i]
++        dropped = (~keep) & (js != i)
++        dropped_action = np.sum(vals[dropped] * B[js[dropped]], dtype=dtype)
++
++        additions = np.zeros(vals.size, dtype=dtype)
++        diagonal_addition = dtype.type(0)
++        if lump == 'diagonal':
++            diagonal_addition = dropped_action / B[i]
++        elif lump == 'strong' and dropped_action != 0:
++            strong = keep & (js != i)
++            share = np.sum(np.abs(vals[strong]) * B[js[strong]], dtype=dtype)
++            if share == 0:
++                diagonal_addition = dropped_action / B[i]
++            else:
++                additions[strong] = dropped_action * np.abs(vals[strong]) / share
++
++        diagonal_written = False
++        for local, (j, value) in enumerate(zip(js, vals, strict=True)):
++            j = int(j)
++            if j == i:
++                value = value + diagonal_addition
++                rows.append(i)
++                cols.append(i)
++                data.append(value)
++                diagonal_written = True
++            elif keep[local]:
++                value = value + additions[local]
++                if value != 0:
++                    rows.append(i)
++                    cols.append(j)
++                    data.append(value)
++        if not diagonal_written:
++            rows.append(i)
++            cols.append(i)
++            data.append(diagonal_addition)
++
++    index_dtype = A.indices.dtype
++    result = csr_array((np.asarray(data, dtype=dtype),
++                        (np.asarray(rows, dtype=index_dtype),
++                         np.asarray(cols, dtype=index_dtype))), shape=A.shape)
++    result.sum_duplicates()
++    result.sort_indices()
++    return result
+diff --git a/pyamg/classical/split.py b/pyamg/classical/split.py
+index f22dd24..58c1b09 100644
+--- a/pyamg/classical/split.py
++++ b/pyamg/classical/split.py
+@@ -88,6 +88,8 @@ References
+     SIAM: Philadelphia, PA, 1987; 73-130.
+ 
+ """
++from numbers import Integral
++
+ import numpy as np
+ from scipy.sparse import csr_array, issparse
+ 
+@@ -96,6 +98,112 @@ from pyamg import amg_core
+ from pyamg.util.utils import remove_diagonal
+ 
+ 
++def _whole_number(value, name, minimum):
++    """Validate integer-valued algorithm parameters."""
++    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
++        raise ValueError(f'{name} must be a whole number')
++    value = int(value)
++    if value < minimum:
++        raise ValueError(f'{name} must be at least {minimum}')
++    return value
++
++
++def aggressive_strength_of_connection(S, splitting, degree=2, paths=1):
++    """Build the long-range coarse-point graph used by aggressive AMG.
++
++    The value at ``(i, j)`` is the number of distinct fine points which lie
++    on a directed strong path from coarse point ``i`` to coarse point ``j``.
++    Only paths of length at most ``degree`` having exclusively fine interior
++    points are considered.
++    """
++    if not issparse(S) or S.format != 'csr':
++        raise TypeError('expected csr_array for S')
++    if S.shape[0] != S.shape[1]:
++        raise ValueError(f'expected square matrix, shape={S.shape}')
++    degree = _whole_number(degree, 'degree', 2)
++    paths = _whole_number(paths, 'paths', 1)
++
++    n = S.shape[0]
++    splitting = np.asarray(splitting)
++    if splitting.ndim != 1 or splitting.size != n:
++        raise ValueError('splitting must have one entry per point')
++    coarse = splitting != 0
++
++    # Work solely with the off-diagonal sparsity pattern.  Canonicalizing a
++    # copy also ensures explicit zeros and duplicate entries cannot affect it.
++    G = S.copy()
++    G.sum_duplicates()
++    G.eliminate_zeros()
++    G = remove_diagonal(G)
++    G.sort_indices()
++    cpts = np.flatnonzero(coarse)
++    rows = []
++    cols = []
++    data = []
++    for i in cpts:
++        through = {}
++        source = int(i)
++        stack = [(source, 0, (), frozenset((source,)))]
++        while stack:
++            u, depth, fine_path, visited = stack.pop()
++            if depth == degree:
++                continue
++            for v in G.indices[G.indptr[u]:G.indptr[u + 1]]:
++                v = int(v)
++                if v in visited:
++                    continue
++                if coarse[v]:
++                    if v != source:
++                        through.setdefault(v, set()).update(fine_path)
++                    continue
++                stack.append((v, depth + 1, fine_path + (v,), visited | {v}))
++        for j, fine_points in through.items():
++            count = len(fine_points)
++            if count >= paths:
++                rows.append(int(i))
++                cols.append(int(j))
++                data.append(count)
++
++    index_dtype = S.indices.dtype
++    result = csr_array((np.asarray(data, dtype=np.intc),
++                        (np.asarray(rows, dtype=index_dtype),
++                         np.asarray(cols, dtype=index_dtype))),
++                       shape=S.shape)
++    result.eliminate_zeros()
++    result.sort_indices()
++    return result
++
++
++def aggressive_coarsening(S, degree=2, paths=1, second_pass=False, method='RS'):
++    """Compute a two-stage aggressive C/F splitting."""
++    if not issparse(S) or S.format != 'csr':
++        raise TypeError('expected csr_array for S')
++    if S.shape[0] != S.shape[1]:
++        raise ValueError(f'expected square matrix, shape={S.shape}')
++    degree = _whole_number(degree, 'degree', 2)
++    paths = _whole_number(paths, 'paths', 1)
++    if not isinstance(second_pass, (bool, np.bool_)):
++        raise ValueError('second_pass must be boolean')
++    if method not in ('RS', 'PMIS', 'CLJP'):
++        raise ValueError(f'unknown aggressive coarsening method {method!r}')
++
++    coarsener = {'RS': RS, 'PMIS': PMIS, 'CLJP': CLJP}[method]
++    first = (coarsener(S, second_pass=second_pass) if method == 'RS'
++             else coarsener(S))
++    long_range = aggressive_strength_of_connection(S, first, degree, paths)
++    second = (coarsener(long_range, second_pass=second_pass) if method == 'RS'
++              else coarsener(long_range))
++
++    result = np.zeros(S.shape[0], dtype='intc')
++    initial_coarse = np.asarray(first) != 0
++    connected = np.diff(long_range.indptr) != 0
++    connected |= np.diff(long_range.tocsc().indptr) != 0
++    result[initial_coarse & ~connected] = 1
++    result[initial_coarse & connected] = (np.asarray(second)[initial_coarse & connected]
++                                                  != 0).astype('intc')
++    return result
++
++
+ def RS(S, second_pass=False):
+     """Compute a C/F splitting using Ruge-Stuben coarsening.
+ 
