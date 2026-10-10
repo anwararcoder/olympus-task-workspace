@@ -3093,3 +3093,43 @@ lines" adds an LF entry and leaves the CRLF one pointing at the moved-away file.
 **Verification:** `grep "^diff --git"` over both local patches: the solution touches four production Java files plus two docs files; the test patch touches build.gradle, the hidden test class and test.sh. Hunk headers `+1,3633` and `+1,173` exist only in the test patch.
 **Applies to:** Any quality check whose findings describe files the reviewed artifact should not contain.
 **Seen in:** freeze-store-integrity v20 Solution Quality after the FP-closure test, 2026-09-30.
+
+### Measure the idea's golden with a full spike before writing the plan; the first cut can land far under the floor
+**Trigger:** Idea phase for nikola-post-page-breaks. A first spike of the obvious core (split at markers, page paths, one task per page, retargeting links inside the post text, navigation templates) measured 142 effective Python lines plus 64 template lines against a 250-line golden floor.
+**Root cause:** The repository's primitives (lxml tree operations, existing path helpers, doit task dicts, template engines) collapse each requirement into a short branch, so a feature that touches many layers can still be thin. Eyeballed estimates of the same scope had assumed 400+.
+**Solution:** Spike every clause the description will state, then count with the strict list (no blanks, comments, docstrings, imports, punctuation-only lines; count generated twins such as `jinjify.py` output separately). When short, deepen only with requirements the feature genuinely needs or the issue thread asked for (here: moving link retargeting to the site-wide `url_replacer` so index pages, feeds and other posts follow it, registrations the sitemap and deploy depend on, output collisions, rebuild dependencies, the single-page version a core developer requested). Report the strict and lenient counts and the remaining margin to the owner instead of rounding up.
+**Verification:** Second spike 204 Python + 47 Mako (+47 generated Jinja, +61 message stubs); repo suite 473 passed, flake8 and pydocstyle clean.
+**Applies to:** Idea crafting in any repository, before the plan's LOC section is written.
+**Seen in:** nikola-post-page-breaks idea phase, 2026-10-06.
+
+### lxml elements built with `makeelement` share the source document, so serializing a split part prints the original tree
+**Trigger:** After splitting an lxml fragment into parts, `utils.html_tostring_fragment(part)` in Nikola returned the same markup for every part (the original document's remnants), while `lxml.html.tostring(part)` looked right.
+**Root cause:** `element.makeelement(...)` creates the new element inside the source element's document; helpers that navigate via `.body` / `getroottree()` then find the original document instead of the new part.
+**Solution:** Create split roots with `lxml.html.Element(tag, attrib)`, which gives each part its own document, then move children into it.
+**Verification:** Probe build: page 1 and page 2 bodies became distinct and correct; unchanged everything else.
+**Applies to:** Any lxml code that splits or rebuilds HTML fragments and serializes the pieces with document-level helpers.
+**Seen in:** nikola-post-page-breaks Gate B spike, 2026-10-06.
+
+### Bulk edits over a repo's translation files must skip symlinked files
+**Trigger:** Adding one message key to every `messages_*.py` file produced a duplicated key in `messages_cs.py`.
+**Root cause:** `messages_cz.py` is a symlink to `messages_cs.py`; a glob loop edited the same file twice.
+**Solution:** Skip `os.path.islink` paths (or dedupe by real path) in any scripted multi-file edit; check `find <dir> -type l` first.
+**Verification:** 61 files changed, 61 insertions, one key per file.
+**Applies to:** Scripted edits across localization or generated file sets in any repository.
+**Seen in:** nikola-post-page-breaks Gate B spike, 2026-10-06.
+
+### Docker Desktop cannot bind-mount the session scratchpad; pipe probe scripts over stdin
+**Trigger:** `docker run -v <scratchpad>:/probe` failed with "mounts denied: The path ... is not shared from the host".
+**Root cause:** Docker Desktop only mounts paths listed in its file-sharing settings; the scratchpad under `/tmp/claude-...` is not one of them.
+**Solution:** Feed scripts with `docker run --rm -i --network none IMAGE bash -l < script.sh`, build images with the repo as build context, and copy results out with `docker create` + `docker cp`.
+**Verification:** All probes and the repo suite ran this way, offline and as non-root.
+**Applies to:** Local Docker verification on this machine.
+**Seen in:** nikola-post-page-breaks idea phase, 2026-10-06.
+
+### Before claiming "output unchanged", normalize the base's own nondeterminism and diff two base builds first
+**Trigger:** Building Nikola's demo site on base and on the spike gave different hashes for several HTML pages.
+**Root cause:** The base itself is nondeterministic: random `rest_code_<uuid>` anchors in code blocks, gallery image order from directory listing, build timestamps in `article:published_time`, sitemap `lastmod` and feeds. Two base builds already differ.
+**Solution:** Diff base against base first; normalize the noisy tokens (ids, timestamps, whitespace) and compare the remaining differences one file at a time before attributing them to the change. Keep hidden tests away from galleries and timestamps.
+**Verification:** After normalization the remaining differences were the base noise only (gallery order, timestamps).
+**Applies to:** Any "unchanged default output" claim and any byte-level determinism check.
+**Seen in:** nikola-post-page-breaks idea phase, 2026-10-06.
