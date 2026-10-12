@@ -78,7 +78,7 @@ Never remove a valid discriminator merely to turn its FP candidate into the solv
 ## 4. Know when you are done iterating
 
 GO to QA when all gates for the current task mode are in band, at least one legitimate passer
-exists, the required false-positive evaluation is clean after independent adjudication, fairness
+exists (on the standard Olympus bar: an Orion or Vega pass and no unhinted Nova pass), the required false-positive evaluation is clean after independent adjudication, fairness
 is clean, and auto-review has no blocking band. For Diamond mode, also apply its rollout ceiling.
 ESCALATE to the owner (pivot / kill / mode decision) when the ceiling check says the
 bar is unreachable fairly — say it plainly with the arithmetic; the most expensive sentence in

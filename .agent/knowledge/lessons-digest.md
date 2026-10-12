@@ -36,6 +36,10 @@ rule wins. Update this digest when a log entry is promoted (see `.agent/rules/pr
 - Search upstream PRs in every state, issues, and Discussions (declined, removed on purpose) using both
   API names and internal architecture terms. Public core architecture = pivot.
 - Run a quick check early; the agent batch is the only real difficulty measurement.
+- The bar is agent-relative (official docs, 2026-10-12): no unhinted Nova run may solve the task,
+  Nova runs must average a long sequence length, and Orion or Vega must solve it only occasionally.
+  The standard bar has no LOC floor: size an idea by the exploration it forces, not by diff lines.
+  "Zero pass" in this digest means no legitimate Orion/Vega pass; zero Nova passes is the target.
 
 ## 2. Description
 

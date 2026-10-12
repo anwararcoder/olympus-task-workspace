@@ -6,11 +6,11 @@ description: Official Olympus submission requirements and platform process (repo
 # Olympus Platform Requirements
 
 Source: the official Olympus docs ("Creating Olympus Challenges" and "The Olympus Process"),
-captured 2026-09-27, refreshed 2026-10-06. This file is the authority for what the platform requires and in what order
-it checks it. Numeric bars (pass rate, LOC, messages, files, minimum finished rollouts) are NOT
-restated here: read the submission's "Submission criteria" panel, then
-`my-review-workflow/rules/platform-panel.md`. Other `.agent` rules add stricter house practice on
-top of this file; where they disagree on a platform requirement, this file wins.
+captured 2026-09-27, refreshed 2026-10-06 and 2026-10-12. This file is the authority for what the
+platform requires and in what order it checks it. The numbers quoted in section 9a are the docs'
+values at capture; the submission's "Submission criteria" panel and
+`my-review-workflow/rules/platform-panel.md` win when they differ. Other `.agent` rules add stricter
+house practice on top of this file; where they disagree on a platform requirement, this file wins.
 
 Naming: the platform now calls the description the **task prompt** (form field, prechecks, and the
 Task Prompt Quality check). House files keep the `*-description.md` name, and "description" means
@@ -74,7 +74,11 @@ be pinned down without it, state it. A task nobody can implement is worse than o
 field.
 
 Prechecks also validate length, formatting, no leftover URLs, and that it matches its category.
-See `description-writing.md` for house style.
+Length is not graded below the hard cap of 1,000 words, title included (the length precheck warns
+above 500). Scope is graded: the Task Prompt Quality check fails a task that asks for too many
+distinct things at once, and that failure cannot be contested; cut the task down and rerun the
+check. One coherent change with a few load-bearing details beats a long list of small asks. See
+`description-writing.md` for house style.
 
 ## 4. Tests
 
@@ -129,11 +133,12 @@ The official approved frostdb example puts its tests under `challenge/` and call
 - **S4** no AI-generated artifacts: weird comments, unexplained defensive code, new coding
   patterns.
 
-LOC counts only the effective solution: lines an agent must write to implement the task and pass
-the tests. Blank lines, comments, generated files, padding (reordering unrelated code), and test
-code are excluded. Improving tests never moves LOC. If agents solve it in noticeably fewer lines
-than the golden, the real count is probably lower than it looks. Judge ideas by the solution they
-force, not the size of the diff.
+Solution size: the standard Olympus bar has no lines-of-code floor. Diff size is not a criterion,
+and review and payout do not price it; what counts is how hard the task is for the agents (section
+9a). Other submission types (Mars, Diamond) still have a minimum solution size, shown in their
+criteria panel. Effective lines remain a scope signal: if an agent solves the task in noticeably
+fewer lines than the golden, the task is probably smaller than it looks. Comments, blank lines,
+generated files, padding, and test code never count as solution.
 
 ## 7. Dockerfile
 
@@ -172,9 +177,11 @@ Before submitting, read the agent runs the way a reviewer will:
 - **Are the failures fair?** An agent should fail because the task is genuinely hard, not because
   a sentence was ambiguous, a requirement was hidden, or a test asked for something the task
   prompt never stated. Fix what you did not intend now; after submission it returns as a revision.
-- **Still clearing the LOC bar?** If agents solve it in noticeably fewer lines than the golden,
-  the real effective count is probably lower than it looks (comments, blanks, generated files,
-  and test code do not count).
+- **Did the agents really have to work for it?** Open a Nova run and check its sequence length
+  (shown on every rollout). A short sequence means the agent found a shortcut or the task only
+  touches a couple of files; either way it is not forcing the long exploration the bar asks for.
+  If an agent solves it in noticeably fewer lines than the golden, the task is probably smaller
+  than it looks (comments, blanks, generated files, and test code never count as solution).
 
 ## 9. Platform flow
 
@@ -207,11 +214,14 @@ The "Submission criteria" panel tracks everything live; when it is all green you
    graded by the hidden tests. A minimum number of finished rollouts is required (see criteria
    panel). Quick check = one cheap run for iterating; full batch = several runs, configurable
    agents and counts. Trust the results banner (quick check / full batch / too easy / looks broken
-   / ready). Usually ~15 minutes, up to 90 on big or hard tasks. At least one agent must pass
-   before you can submit; if none ever passes, the tests are too strict, the task prompt is
-   missing something, or the task is unfair. Read the fails: failing because the task is hard is
-   the goal; failing on an ambiguous sentence is a revision waiting to happen. Passing too often
-   means make it harder before spending the remaining runs.
+   / ready). Usually ~15 minutes, up to 90 on big or hard tasks. Solvability: Orion or Vega must
+   solve it, but only occasionally, and no unhinted Nova run may (section 9a). If no agent ever
+   passes, the tests are too strict, the task prompt is missing something, or the task is unfair.
+   Read the fails: failing because the task is hard is the goal; failing on an ambiguous sentence
+   is a revision waiting to happen. Any unhinted Nova solve, or Orion and Vega solving more than
+   25% of the time, means the task is too easy: make it harder before spending the remaining
+   runs. Every finished rollout shows its sequence length; a batch of short Nova runs means the
+   task is smaller than it looks, even when every run fails.
 6. **FP check**: reviews every passing run; a single pass judged false fails the "No false
    positives" criterion. Run it only after the run set is settled. If it finds a false positive,
    strengthen the tests (and check the description so the new tests stay discoverable), then
@@ -223,6 +233,29 @@ The "Submission criteria" panel tracks everything live; when it is all green you
    is green. May grant a **queue skip** straight to manager final approval. Can be run earlier as
    a helper, but it goes stale.
 8. **Submit**: locks the submission for editing.
+
+### 9a. Submission criteria (standard Olympus bar)
+
+The "Submission criteria" panel in the form shows the exact bar for the assignment, with live
+numbers from the rollouts. For the standard Olympus bar the agents themselves are the measure, and
+three rows must go green:
+
+- **Nova rollouts**: at least 8 unhinted Nova runs must complete and none of them may solve the
+  task. Hinted runs never count toward the bar. Nova is the long-horizon agent; if it can solve
+  the task, the task is not hard enough.
+- **Long horizon**: those Nova runs must average more than 256K tokens of **sequence length**:
+  the agent's largest request (the whole prompt plus the model's output) plus everything its
+  harness compacted or trimmed out of the context along the way. Real exploration of a large
+  codebase, long test cycles, and many iterations push it up; a task an agent can finish after
+  reading two files does not. Averages above the bar also raise the payout: the scope share of
+  the reward keeps growing up to 500K.
+- **Orion / Vega rollouts**: at least 4 runs on Orion or 4 runs on Vega (the stronger agents)
+  must solve it more than 0% and at most 25% of the time. One of them proves the task is
+  solvable, but it must not be routine.
+
+Only runs made against the current task and the current agent line-up count (section 11). The
+standard bar has no lines-of-code floor (section 6); Mars and Diamond submissions still have a
+minimum solution size, and their panel shows it.
 
 ## 10. After submitting
 
@@ -248,6 +281,10 @@ unanswered flag and the submission comes back.
   does not refund tokens.
 - **Staleness**: every result is pinned to the exact content it ran on. Editing any field after a
   check, rollout, or review completes makes it stale: it stops counting and must be rerun.
+- **Agent line-up**: rollouts are also pinned to the agent line-up they ran under. When the agents
+  are updated (a new model or harness behind Nova, Orion, or Vega), rollouts from the previous
+  line-up stop counting toward the bar and must be rerun, and the FP check that reviewed their
+  passes has to run again.
 - Batch edits: fix everything in one pass, then rerun once. One rollout batch at a time; read
   results first, edit second. Triggering more rollouts while a batch is in flight risks staling
   all of them at once.
@@ -268,8 +305,9 @@ step above applies to real submissions.
    architecture first, it is easy to end up too trivial for the difficulty criteria. The bar moves
    quickly; find out the task is too easy before writing 600 lines of solution.
 2. **Consider cross-cutting changes.** A solution spanning several layers or subsystems tends to
-   be harder for agents and carries more effective LOC than one confined to a single spot. Not
-   required, but the best lever when an idea keeps landing short on difficulty or LOC.
+   be harder for agents, and pushes their sequence length up because they must hold more of the
+   codebase in context, than one confined to a single spot. Not required, but one of the better
+   levers when an idea keeps landing short on difficulty or context.
 3. **Spend tokens smartly.** Clear checks first, then a small batch for a signal: 100% pass means
    too easy; 0% on a vague point or unfair test means fix before a full run.
 4. **Read the check and run outputs.** A 0% pass rate is not always a bad task; it can be one

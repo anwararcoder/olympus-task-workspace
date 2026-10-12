@@ -6,7 +6,8 @@ description: Diagnose and recover from zero-pass results without creating a fals
 
 ## When to Use
 
-Run whenever a current platform batch has zero legitimate passes. Prefer exact saved runs and
+Run whenever a current platform batch has zero legitimate Orion or Vega passes (zero Nova passes is
+the target on the standard bar, not a defect). Prefer exact saved runs and
 current auto-review/FP artifacts over older summaries. Read
 `../rules/false-positive-calibration.md` before changing anything.
 
@@ -15,7 +16,8 @@ current auto-review/FP artifacts over older summaries. Read
 ## Goal
 
 Identify the primary cause and make one coherent class-level correction that can restore at least
-one legitimate passer while preserving the live pass-rate, fairness, reference, and FP gates.
+one legitimate Orion or Vega passer while keeping Nova unsolved and preserving the live solve band,
+fairness, reference, and FP gates.
 
 ## Step 1: Confirm Signal Quality
 
@@ -60,7 +62,7 @@ Before editing, state:
 - which legitimate or near-solver architecture should become green;
 - which wrong architecture must remain red;
 - which confirmed FP candidate must remain red or be repaired at its root;
-- why the expected pass rate remains inside the live panel for the actual tier mix.
+- why Nova stays unsolved and the expected Orion/Vega solve rate stays inside the live band.
 
 "One lever" means one diagnosis or defect class; dependent prose/test/golden edits belong in the
 same round.

@@ -32,15 +32,17 @@ not graded: environment adequacy is the bar. Standing fraud check: when the base
 BASE..HEAD for upstream work landing the same feature; a pin used to reintroduce landed work gets
 the author a heavy warning.
 
-**R1 - LOC gate.** Use the current golden-solution floor in `rules/platform-panel.md`, counted the
-way managers count: strip blanks, comments, braces and punctuation-only lines, imports,
-export-only wiring, type-only declarations, boilerplate, and test code. Run
-`reference/count_loc.py` only as a lenient screen; historical hard-coded floors in older lessons
-are not current authority. The criteria panel's successful-run LOC row describes agent diffs, so
-also compute the meaningful golden count with the same exact-state manifest used by the review.
-Strict count under the live floor = Request Changes; note-and-approve is not an option. Compare the
-golden to each passing agent's diff as a padding or weak-test signal, not as a substitute for the
-floor.
+**R1 - LOC gate (Mars/Diamond only).** Since the 2026-10-12 docs the standard Olympus bar has no
+LOC floor, and review and payout do not price diff size: do not request changes for golden size on
+a standard Olympus submission; judge difficulty by the three agent rows in `rules/platform-panel.md`
+and use the counts below only as a scope or padding signal. For a submission type with a size floor,
+use the floor its panel shows, counted the way managers count: strip blanks, comments, braces and
+punctuation-only lines, imports, export-only wiring, type-only declarations, boilerplate, and test
+code. Run `reference/count_loc.py` only as a lenient screen; historical hard-coded floors in older
+lessons are not current authority. Compute the meaningful golden count with the same exact-state
+manifest used by the review. Strict count under a live size floor = Request Changes;
+note-and-approve is not an option. Compare the golden to each passing agent's diff as a padding or
+weak-test signal, not as a substitute for the floor.
 
 **R2 - Description.** Judge with `reference/check_description.md` criteria against the current
 0-3 rubric, and phrase description feedback in the vocabulary of

@@ -1,4 +1,9 @@
-# LOC Verification (Mandatory First Check)
+# LOC Verification (Mars/Diamond size floor only)
+
+> SCOPE (2026-10-12): the standard Olympus bar has no LOC floor; diff size is not a criterion and
+> review and payout do not price it. Use this file only for a submission type whose criteria panel
+> shows a minimum solution size (Mars, Diamond), or as a scope signal next to passing agents'
+> diffs. Never stop a standard Olympus review on line count.
 
 > STALE NUMBERS (2026-07-02): the live floor is 400 meaningful LOC, and the exclusion list also
 > strips imports, export-only wiring, and boilerplate. This file and count_loc.py keep the old

@@ -129,9 +129,9 @@ func tryEmbeddedGetHook(v, index) { coerce(index); call(method, index) }
 
 ## LOC Metrics
 
-The official bar counts only the **effective solution**: the lines an agent must actually write to implement the task and pass the tests. Blank lines, comments, generated files, padding (such as reordering unrelated code), and all test code are excluded; improving tests never moves LOC. The numeric bar lives in the submission's criteria panel (see `my-review-workflow/rules/platform-panel.md` for the current value and the manager's exclusion list). If agents solve the task in noticeably fewer lines than the golden, the golden's real count is probably lower than it looks.
+Since the 2026-10-12 docs, the standard Olympus bar has **no lines-of-code floor**: diff size is not a criterion, and review and payout do not price it. Difficulty is measured by the agents (`olympus-platform.md` section 9a), and the long-horizon row is the Nova average sequence length, not a line count. Mars and Diamond submissions still have a minimum solution size, shown in their criteria panel and counted with the manager's exclusion list in `my-review-workflow/rules/platform-panel.md`.
 
-The panel's long-horizon row for agent runs reads raw diff lines (ADDED lines starting with `+`), which is why a green agent-LOC row does not clear the golden's effective-LOC check. Human reviewers may measure NET.
+Effective lines remain a scope signal: only the lines an agent must actually write to implement the task and pass the tests count. Blank lines, comments, generated files, padding (such as reordering unrelated code), and all test code are excluded; improving tests never moves LOC. If agents solve the task in noticeably fewer lines than the golden, the task is probably smaller than it looks. Human reviewers may measure NET.
 
 When agents restructure existing code (replacing infrastructure), they can have high ADDED but low NET. This is legitimate work, not low effort — look at the number of files modified and agent messages as supporting evidence.
 

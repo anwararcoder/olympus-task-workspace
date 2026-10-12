@@ -6,7 +6,8 @@ description: Rules for diagnosing zero-pass results without trading solvability 
 
 ## Core Rule
 
-When pass rate is zero, identify the cause before selecting a lever. Follow
+When no Orion or Vega run passes legitimately, identify the cause before selecting a lever. (Zero
+Nova passes is the target on the standard bar, not a defect.) Follow
 `false-positive-calibration.md`, especially its exact-state manifest, run-family matrix, and
 zero-pass decision tree. A hint is one possible branch, not the default remedy.
 
@@ -92,5 +93,5 @@ After any update:
 ## Expected Outcome
 
 The target is not a fixed historical count. The next exact state must have at least one legitimate
-pass, remain within the current live bar, preserve fairness, and pass the required FP and quality
+Orion or Vega pass and no unhinted Nova pass, remain within the current live bar, preserve fairness, and pass the required FP and quality
 gates. If one coherent change cannot plausibly do that, stop and redesign before spending a batch.

@@ -25,7 +25,7 @@ Run before submitting any problem to verify all standards are met.
 - [ ] No existing PR solves it: open, merged, or closed/unmerged
 - [ ] Not declined by maintainers in issues or GitHub Discussions; not removed on purpose
 - [ ] Fits the project's philosophy (README read)
-- [ ] Effective solution LOC clears the criteria panel bar (house target: 6+ files)
+- [ ] Scope forces long exploration: expected Nova sequence length clears the panel's context bar; no LOC floor on the standard bar (house target: 6+ files)
 - [ ] Cannot describe solution in one sentence
 
 ### Description
@@ -83,7 +83,7 @@ Run before submitting any problem to verify all standards are met.
 - [ ] No regressions; follows existing code patterns (S2)
 - [ ] No irrelevant changes (S3)
 - [ ] No unexplained defensive code or new coding patterns (S4)
-- [ ] Effective LOC (excluding blanks, comments, generated files, padding, tests) clears the criteria panel bar
+- [ ] Effective LOC (excluding blanks, comments, generated files, padding, tests) is not noticeably above what passing agents needed (scope signal; only Mars/Diamond have a size floor)
 - [ ] 6+ files modified (house target)
 - [ ] No AI-style comments
 - [ ] No AI slop
@@ -137,8 +137,10 @@ git apply ../../my-work/{problem}/solution-{name}.patch
 
 Before clicking Submit, the "Submission criteria" panel must be fully green: Prechecks, Scope Gate,
 Build, all Quality checks (Verify Tests, Verify Solution, Verify Flakiness, Test Quality, Task
-Quality, Solution Quality, Task Prompt Quality), the minimum number of finished and current agent
-rollouts with at least one legitimate pass, the FP check ("No false positives"), and a completed
+Quality, Solution Quality, Task Prompt Quality), the three agent rows on current runs under the
+current agent line-up (unhinted Nova runs with none solving, their average sequence length above
+the context bar, Orion or Vega solving occasionally inside the band; see
+`../rules/olympus-platform.md` section 9a), the FP check ("No false positives"), and a completed
 Auto Review. Nothing may be stale.
 
 Human reviewers score Problem Description, Tests, and Solution & Code on a 0-3 scale each (see
@@ -146,8 +148,9 @@ Human reviewers score Problem Description, Tests, and Solution & Code on a 0-3 s
 21-item / "5 of 7" rubric is historical Diamond context only.
 
 Be your own reviewer first: read the agent runs the way a reviewer will. Are failures fair (hard,
-not ambiguous or hidden)? Are agents solving it in noticeably fewer lines than the golden (a sign
-the effective LOC is lower than it looks)?
+not ambiguous or hidden)? Did the agents really have to work for it: are the Nova sequence lengths
+long, and are agents not solving it in noticeably fewer lines than the golden (a sign the task is
+smaller than it looks)?
 
 ## Compare Against Accepted Work
 

@@ -90,7 +90,7 @@ When responding to human reviewers via Discord, write conversationally and conci
 - Start with "Hey, thanks for the review!" or similar
 - Group fixed items together ("I've resolved points 1 and 3:")
 - For justified items, give one-line reasoning ("Regarding point 2, ...")
-- Include specific data when justifying (LOC counts, pass rates, file counts)
+- Include specific data when justifying (per-agent solve rates, Nova sequence lengths, file counts, LOC as a scope signal)
 - Don't over-explain — reviewers are technical professionals
 
 

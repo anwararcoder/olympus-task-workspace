@@ -55,9 +55,11 @@ For a current normal Olympus task, the live numeric and panel authority is:
 
 `Shipd - Olympus/my-review-workflow/rules/platform-panel.md`
 
-As of its 2026-07-11 entry, the default Olympus bar is pass rate `<= 40%`, successful-run medians
-of `>= 250` LOC, `>= 40` messages, and `>= 2` files, with at least one legitimate pass, no unfair
-run, no environment blocker, and a required False Positive evaluation. Re-read that file before
+As of its 2026-10-12 entry, the default Olympus bar is measured by the agents: at least 8
+unhinted Nova runs with none solving, a Nova average sequence length above 256K tokens, and a
+legitimate Orion or Vega solve rate above 0% and at most 25% over at least 4 runs, with no unfair
+run, no environment blocker, and a required False Positive evaluation. The standard bar has no LOC
+floor. Re-read that file before
 every round. Older Diamond, Castor, Mars, or rollout documents remain historical or mode-specific;
 they control only when the current task panel explicitly selects that mode.
 
@@ -78,8 +80,8 @@ Do not optimize a single score. A submission must satisfy independent questions:
 
 | Question | What it measures | Typical failure |
 | --- | --- | --- |
-| Solvability | Can at least one capable agent implement the stated task? | Zero legitimate passes |
-| Difficulty | Do enough agents still fail for substantive reasons? | Pass rate above the live bar |
+| Solvability | Can Orion or Vega legitimately implement the stated task? | Zero legitimate Orion/Vega passes |
+| Difficulty | Do Nova and most Orion/Vega runs still fail for substantive reasons? | Any unhinted Nova pass, or Orion/Vega above the live band |
 | False-positive safety | Does every counted passer satisfy the whole stated contract? | A passing patch has a fair discriminator |
 | Reference correctness | Does the golden implement every stated behavior? | Candidate and reference both fail, or golden contradicts prose |
 | Test quality | Does the suite reject wrong behavior without hidden requirements? | Conditional, weak, or over-pinned assertions |
@@ -750,8 +752,9 @@ Do not call a task ready until all are true for the same hashed state:
 - base plus tests passes, new plus tests fails for the intended behavior, and both golden states pass;
 - universal compatibility claims are exercised against candidate states through the applicable
   regression suite or representative independent decision sites;
-- at least one legitimate current-state passer exists and the pass rate meets the live panel;
-- successful-run medians meet the live panel, with tier mix reported;
+- at least one legitimate current-state Orion or Vega passer exists, their solve rate sits inside
+  the live band, and no unhinted Nova run passes;
+- the Nova average sequence length clears the live context bar, with tier mix reported;
 - every confirmed FP discriminator is closed and every warning independently adjudicated;
 - auto-review, AI evaluation, prechecks, human actions, and required FP evaluation are fresh;
 - no unresolved band-0/band-1, fairness, environment, or repo-fit blocker remains;

@@ -33,8 +33,10 @@ From the official process (`../rules/olympus-platform.md` sections 9-11):
   Runs count only once finished (~15 minutes typical, up to 90 on big or hard tasks).
 - **Staleness**: results are pinned to exact content. Editing any field after a rollout, check, or
   review finishes makes it stale and it stops counting. One batch at a time; read results before
-  editing; never trigger more rollouts while a batch is in flight.
-- **Solvability**: at least one agent must pass before the platform allows submission.
+  editing; never trigger more rollouts while a batch is in flight. Rollouts are also pinned to the
+  agent line-up: an agent update stales them and the FP check over their passes.
+- **Solvability**: Orion or Vega must solve it, but only occasionally (at most 25% over at least 4
+  runs on one of them), and no unhinted Nova run may; hinted runs never count.
 - **FP check**: run only after the run set is settled; a single false pass fails "No false
   positives". Set **Protected source folders** first if real source sits under `build`, `dist`,
   `target`, `node_modules`, `__pycache__`, or `.venv`.
@@ -53,7 +55,7 @@ Platform review artifacts contain multiple check types that must all be addresse
 | Check Type | Priority | What It Checks |
 |------------|----------|----------------|
 | **False Positive** | Required | Whether every counted passing patch satisfies the stated contract |
-| **Difficulty** | Required | Solvability, pass rate, and successful-run medians from the live panel |
+| **Difficulty** | Required | Nova rollouts (no unhinted solve), Nova average sequence length, and the Orion/Vega solve band from the live panel |
 | **Precision** | High | Description alignment with tests |
 | **Quality** | Medium | Code standards, style adherence |
 | **Sanity** | Medium | Basic requirements, format |
@@ -217,15 +219,15 @@ namespaces. Do not prune or stop a forge until it is clear no other task is acti
 
 | Situation | Action |
 |-----------|--------|
-| Pass rate above the live panel | Apply the tiered approach after the FP and contract-closure audit |
-| 0% pass rate | Run `/handle-zero-pass`; distinguish harness, one blocker, breadth, golden, and repo-fit causes |
+| Any unhinted Nova pass, or Orion/Vega above the live band | Apply the tiered approach after the FP and contract-closure audit |
+| No legitimate Orion/Vega pass | Run `/handle-zero-pass`; distinguish harness, one blocker, breadth, golden, and repo-fit causes |
 | Problem faults | Clarify description, ensure alignment with tests |
 | Precision errors | Rephrase description to align or accept if behavior is inferable |
 | Quality issues | Check human-reviews patterns, fix code |
 | 0% with agent faults only | Not enough to call it appropriately hard; run the breadth and discoverability audit |
-| In-band legitimate passes | Continue only after FP, medians, freshness, and other gates also clear |
+| In-band legitimate passes | Continue only after FP, sequence length, freshness, and other gates also clear |
 | Test collision (TEST_MISMATCH) | Reclassify only when exact artifacts prove an evaluator/name collision |
-| Metric below threshold | Use the live panel; solvability and required medians cannot be inferred away |
+| Metric below threshold | Use the live panel; solvability and the sequence-length bar cannot be inferred away |
 | Many DID_NOT_RUN / missing verdicts | Re-run checks before modifying problem design |
 | Dominant FAIL_TEST_MISMATCH | Audit exact-vs-contains contract alignment first |
 
@@ -255,15 +257,16 @@ A helper label may be overturned only when exact artifacts prove it is an evalua
 classification error; record that evidence. Numeric panel gates, legitimate solvability, fairness,
 repo fit, and the required FP evaluation are not bypassed by an explanation.
 
-If pass rate is zero, use `/handle-zero-pass` and `../rules/false-positive-calibration.md`. A short
+If no Orion or Vega run passes legitimately, use `/handle-zero-pass` and `../rules/false-positive-calibration.md`. A short
 behavioral hint is only the single-dominant-discoverability branch. Harness defects, excessive
 independent breadth, golden/contract defects, and rejected repo seams require different actions.
 Check the current platform authority before using a formal hint.
 
 ## Long-Horizon Metric
 
-Use the successful-run LOC, message, and file medians in the live criteria panel. Do not copy old
-Diamond, Castor, or pre-2026 Olympus thresholds into a current decision.
+The panel measures long horizon as the Nova average sequence length (see
+`../rules/olympus-platform.md` section 9a); the standard bar has no LOC, message, or file median.
+Do not copy old Diamond, Castor, or pre-2026-10-12 Olympus thresholds into a current decision.
 
 Agent assignments and outcomes are stochastic, so compare exact state, tier mix, and architecture
 families rather than percentages alone.

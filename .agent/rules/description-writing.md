@@ -26,7 +26,11 @@ Official platform requirements (P1-P7, see `olympus-platform.md` section 3):
 - No bulleted requirement lists, no headings, no code snippets doing the describing.
 - Self-contained (repo plus description is enough), unambiguous, objectively verifiable, not
   prescriptive, and not a duplicate of an existing submission or upstream PR.
-- No leftover URLs; prechecks also check length and formatting.
+- No leftover URLs; prechecks also check length and formatting. Length is not graded below the
+  hard cap of 1,000 words, title included (the length precheck warns above 500), but scope is: Task
+  Prompt Quality fails a task that asks for too many distinct things at once, and that failure
+  cannot be contested. One coherent change with a few load-bearing details beats a long list of
+  small asks.
 - Judgment clause: if a detail (a config key, a public type name, an exact value) is genuinely part
   of the contract and the task cannot be pinned down without it, state it. A task nobody can
   implement is worse than one that names a field.

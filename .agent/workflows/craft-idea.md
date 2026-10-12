@@ -203,7 +203,7 @@ Before committing to one idea, produce a shortlist of 3 validated ideas with:
 | Local overlap risk (heuristic only) | Low |
 | AI familiarity with pattern | Low (ideally misleading) |
 | "Simple version" bypass | None |
-| Target pass rate | At least one legitimate pass within the current live panel |
+| Target agent result | No unhinted Nova solve, long Nova sequences, and an occasional legitimate Orion/Vega solve inside the live band |
 
 ### Comparative Ranking
 

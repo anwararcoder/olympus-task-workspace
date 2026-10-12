@@ -27,8 +27,8 @@ of the same branding class is gone.
 This always-on file contains design lessons from older Diamond work, not current Olympus numeric
 authority. For every active task, read `olympus-platform.md` (official platform requirements and
 check order), `false-positive-calibration.md`, and `my-review-workflow/rules/platform-panel.md`
-first. The current criteria panel controls pass rate,
-successful-run medians, required checks, and batch interpretation.
+first. The current criteria panel controls the agent rows (Nova solves, Nova sequence length,
+Orion/Vega solve band), required checks, and batch interpretation.
 
 ## Historical Diamond Sizing Heuristics
 
@@ -38,8 +38,8 @@ successful-run medians, required checks, and batch interpretation.
 | Files modified | 6+ | 6-8+ (5+ layers) |
 | Test count | 30+ | 50+ |
 | Test patch lines | 700+ | 900-1200+ |
-| AI pass rate | See the current task panel | At least one legitimate pass within the live bar |
-| Median solver messages | See the current task panel | Substantive architecture and trajectory evidence |
+| Agent results | See the current task panel | No unhinted Nova pass; an occasional legitimate Orion/Vega pass within the live band |
+| Nova sequence length | See the current task panel | Average above the context bar; long, exploratory trajectories |
 
 > **Note:** The remaining size and test-count values are historical Diamond risk heuristics, not
 > current platform gates. Use them only when that mode is explicitly selected. Current normal
@@ -47,14 +47,16 @@ successful-run medians, required checks, and batch interpretation.
 
 > **Behaviorally simple, deeply hard (the Diamond essence):** The best problems describe in a few plain behavioral sentences but require deep investigation across the codebase to solve. Each added requirement reads as ~1 sentence of description yet is a distinct, INDEPENDENT fork of implementation work that forces the solver to study how the feature integrates with the whole system (the Matchstick Metaphor below). LoC is an OUTPUT of those forks -- you reach the line count by adding depth (forks/layers), never by padding the diff.
 
-> **Pass rate and solvability:** Use the live panel and actual tier mix. At least one legitimate pass
-> is required. A zero-pass round must enter the five-way diagnosis in
+> **Pass rate and solvability:** Use the live panel and actual tier mix. Orion or Vega must
+> legitimately solve it, but only occasionally, and no unhinted Nova run may. A round with no
+> legitimate Orion/Vega pass must enter the five-way diagnosis in
 > `false-positive-calibration.md`; a hint is only the single-discoverability-blocker branch.
 
 > **False-positive gate:** Every passing patch is provisional until the required FP evaluation and
 > independent contract-class audit clear it. A low pass rate does not excuse an incorrect passer.
 
-> **Long horizon:** Use the live LOC, message, and file medians. AI evaluation is stochastic, so
+> **Long horizon:** The panel measures it as the Nova average sequence length; the standard bar
+> has no LOC, message, or file median. AI evaluation is stochastic, so
 > compare exact hashes, tier mix, and architecture families rather than raw percentages alone.
 
 > **Sanity runs:** Use the platform's **quick check** (one cheap rollout) to catch build/test
@@ -150,7 +152,7 @@ Each layer constrains the others. Single-layer solutions are too easy for AI.
 6. Follow the platform order: Prechecks -> Scope Gate -> Build Image -> Quality checks -> quick check -> full batch -> FP check -> Auto Review -> Submit. Never spend on a later step while an earlier one fails.
 7. Iterate based on results (never commit until results received)
 
-At least one agent must pass before the platform allows submission.
+Orion or Vega must solve it occasionally, and no unhinted Nova run may, before the platform allows submission.
 
 ## Workspace Isolation
 

@@ -19,7 +19,8 @@ edit this file and its changelog, nothing else.
   flagged, with a one-line why in the review doc.
 - Downgrade to Mars checkbox: flips the submission to Mars on finalization. Use when Olympus
   targets are not met and the author would rather land it than bump scope; surface the choice to
-  the author first.
+  the author first. (Removed 2026-07-11; whether it is back with Mars as of 2026-10-12 is
+  unverified, see Tier bars.)
 
 ## Score definitions (verbatim hover text)
 
@@ -51,29 +52,47 @@ findings in notes; do not drop to 1 for cosmetics. Approve with 2s is normal and
 
 ## Tier bars (read the criteria panel per submission; these are the current defaults)
 
-- 2026-07-11 criteria change (owner + lazygit round): Olympus is now pass rate <= 40%, median of
-  successful runs >= 250 LOC, >= 40 messages, >= 2 files. Mars is RETIRED; submissions created in
-  the old UI may still carry a stale "Mars" task-type tag in prechecks, ignore it and grade
-  against the new Olympus bar. The Downgrade-to-Mars checkbox is dead with it.
+- 2026-10-12 official docs ("Submission criteria"): the standard Olympus bar is measured by the
+  agents. Three rows must go green:
+  - Nova rollouts: >= 8 unhinted Nova runs complete and none solves the task. Hinted runs never
+    count toward the bar.
+  - Long horizon: those Nova runs average > 256K tokens of sequence length (largest request,
+    prompt plus output, plus everything the harness compacted or trimmed). The payout's scope
+    share keeps growing up to 500K.
+  - Orion / Vega rollouts: >= 4 runs on Orion or >= 4 on Vega, solved > 0% and <= 25% of the time.
+- Only runs against the current task and the current agent line-up count. An agent update (new
+  model or harness behind Nova, Orion or Vega) stales earlier rollouts and the FP check over their
+  passes.
+- No LOC floor on the standard Olympus bar: diff size is not a criterion, and review and payout
+  do not price it. Do not request changes for golden size on a standard Olympus submission; judge
+  difficulty by the three agent rows, and use golden-versus-agent line counts only as a scope or
+  padding signal. Mars and Diamond submissions still have a minimum solution size; read it from
+  their panel.
+- Mars is listed again as a separate submission type, next to Diamond. Whether the
+  Downgrade-to-Mars checkbox is back is unverified; check the panel before offering it.
 - The tier is defined by the criteria panel targets, never the docker base image name.
-- Golden-solution effective LOC floor tracks the criteria LOC row (now 250 meaningful production
-  lines), counted with the manager's exclusion list (msw-rooms revert): blanks, comments, braces
-  and punctuation-only lines, imports, export-only wiring, type-only declarations, boilerplate,
+- Golden effective-LOC counting, for submission types with a size floor (and as a scope signal
+  elsewhere): the manager's exclusion list (msw-rooms revert) strips blanks, comments, braces and
+  punctuation-only lines, imports, export-only wiring, type-only declarations, boilerplate, and
   tests. count_loc.py is a lenient screen only (it passed at 505 a golden the manager counted at
-  360-371). Strict count under the floor = Request Changes with the bump choice put to the
+  360-371). Strict count under a size floor = Request Changes with the bump choice put to the
   author, never approve-with-note.
-- New required check (2026-07-11): False Positive evaluation must run and pass.
+- Required check (since 2026-07-11): False Positive evaluation must run and pass.
   PASSED_WITH_WARNINGS means solo dissents were overruled; re-derive every caveat yourself, and
   treat a SPEC_GAP_REFERENCE_ALSO_FAILS tag as a golden-vs-description mismatch lead (Solution 2
   territory), per lessons/LESSONS.md 2026-07-11.
-- General gates on the panel: fair task (no run flagged unfair), solvable (>= 1 legit pass), cheat
-  rate < 20%, no environment blockers.
+- General gates carried over from the 2026-07 panels (confirm on the live panel): fair task (no
+  run flagged unfair), solvable (a legitimate Orion or Vega pass inside its band), cheat rate
+  < 20%, no environment blockers.
 
-## Superseded numbers (pre-2026-07-11, kept for reading old rounds)
+## Superseded numbers (kept for reading old rounds)
 
-- Olympus: >= 10 completed runs, pass rate <= 20%, long-horizon median >= 3 files, >= 80
-  messages, >= 400 LOC; golden strict floor 400.
-- Mars: >= 10 completed runs, pass rate <= 30%, median successful-run LOC >= 100.
+- 2026-07-11 to 2026-10-12: Olympus pass rate <= 40%, median of successful runs >= 250 LOC,
+  >= 40 messages, >= 2 files; golden strict floor 250 meaningful LOC; Mars retired and the
+  Downgrade-to-Mars checkbox removed.
+- Pre-2026-07-11 Olympus: >= 10 completed runs, pass rate <= 20%, long-horizon median >= 3 files,
+  >= 80 messages, >= 400 LOC; golden strict floor 400.
+- Pre-2026-07-11 Mars: >= 10 completed runs, pass rate <= 30%, median successful-run LOC >= 100.
 
 ## Decision mapping
 
@@ -86,6 +105,11 @@ findings in notes; do not drop to 1 for cosmetics. Approve with 2s is normal and
 
 ## Changelog
 
+- 2026-10-12: official docs refresh. The standard Olympus bar is now agent-relative: >= 8 unhinted
+  Nova runs with none solving, Nova average sequence length > 256K (payout grows to 500K), and
+  >= 4 Orion or >= 4 Vega runs solving > 0% and <= 25%. No LOC floor on the standard bar (review
+  and payout do not price diff size); Mars and Diamond keep a minimum solution size. Runs and the
+  FP check go stale when the agent line-up changes. The 2026-07-11 numbers moved to Superseded.
 - 2026-07-11: criteria change per owner + live panels: Olympus <= 40% pass, median >= 2 files /
   >= 40 messages / >= 250 LOC; Mars retired (old-UI submissions may carry a stale Mars tag,
   ignore it); golden LOC floor tracks the 250 row; False Positive evaluation added as a required

@@ -7,7 +7,7 @@ Where things live in this workspace:
 - Official Olympus docs ("Creating Olympus Challenges" and "The Olympus Process"): captured in [.agent/rules/olympus-platform.md](.agent/rules/olympus-platform.md). It is the authority on platform requirements and the order of checks. Read it in full first; the R/P/T/S codes below refer to it.
 - Rules, workflows and knowledge: [.agent/](.agent/) (`rules/`, `workflows/`, `knowledge/lessons-digest.md`, `knowledge/problem-solution-log.md`).
 - The newer authoring system: [new-dot-agent/](new-dot-agent/). Read `WORKFLOW.md`, `rules/repo-selection.md`, `workflows/w0-select-repo.md` and `lessons/INDEX.md`.
-- Live platform numbers: [my-review-workflow/rules/platform-panel.md](my-review-workflow/rules/platform-panel.md). The current Olympus bar is pass rate <= 40%, median of successful runs >= 250 effective LOC, >= 40 messages, >= 2 files. The "Submission criteria" panel on the submission form is the final word; if anything older disagrees (Mars, Diamond numbers), the panel wins.
+- Live platform numbers: [my-review-workflow/rules/platform-panel.md](my-review-workflow/rules/platform-panel.md). The current Olympus bar (official docs, 2026-10-12) is measured by the agents: at least 8 unhinted Nova runs and none of them solves it, those Nova runs average more than 256K tokens of sequence length, and at least 4 Orion or 4 Vega runs solve it more than 0% and at most 25% of the time. There is no LOC floor on the standard bar. The "Submission criteria" panel on the submission form is the final word; if anything older disagrees (pass-rate, LOC, message or file medians, Mars, Diamond numbers), the panel wins.
 - Standards: [standards/](standards/), especially `Java-C++-Support-Overview.md` and `Olympus-Diamond-Tier-Failure-Analysis-Guide.md`.
 - Accepted tasks: [sprint4/](sprint4/) and [sprint5/](sprint5/). These are the most recent ones and the reference for what a good task looks like. Most are Java (immutables, mapstruct, jte, vineflower). The Python ones in sprint5 (model_defaults, pyamg, pydicom, pyparsing) use a slightly different layout.
 - My current in-progress task: [freeze-store-integrity/](freeze-store-integrity/) (archunit). Don't recommend anything that overlaps with it.
@@ -20,7 +20,7 @@ Repo requirements (official floor, `olympus-platform.md` section 2, all checked 
 - Language is one of TypeScript, JavaScript, Python, Go, Rust, C++ or Java. Java is preferred because it gives good variety, but don't exclude a clearly better non-Java candidate.
 - License is on the allowed list (MIT, BSD family, BSL-1.0, BLAS, GNU-All-permissive, Apache-2.0 variants, CC-BY). Check the actual LICENSE file, not just the GitHub badge.
 - The floor isn't the goal. Depth is: a thin or flat repo caps the difficulty no matter how good the idea is. Look for a real build (Maven/Gradle for Java), a fast deterministic test suite that runs offline in the `olympus-base-<language>` image, and room for a STATE or EDIT feature shape (see the digest, section 1). READ-shaped features hit the ceiling and get rejected.
-- The repo must have room for cross-cutting changes across several layers. That is the best lever for difficulty and effective LOC.
+- The repo must have room for cross-cutting changes across several layers. That is one of the best levers for difficulty and for the long Nova sequence length the bar asks for.
 - Prefer repos my accepted tasks haven't used yet (immutables, mapstruct, jte, vineflower, archunit). A heavily used repo makes it harder to clear the duplicate check and the Scope Gate, and repos can't be reserved. Only suggest one of those if it still has a large untouched subsystem, and say which one and why it doesn't overlap.
 
 Then recommend 3 repos. For each one, give: stars, license and last-commit date; build and test harness fitness (W0 gate: builds offline in the base image, base tests pass, no flaky or network tests in the area you'd touch); candidate subsystems with a STATE/EDIT shape; why agents would find it hard; existing tests/logging/diagnostics that support it; risks (harness, ceiling, maintainer philosophy from README/issues/Discussions, prior PRs); and your confidence.
@@ -39,7 +39,7 @@ You can't know what a good task looks like without analyzing the full history of
 
 Skipping this step or doing it lazily is not acceptable, because it ends in incomplete or wrong insights.
 
-Plan the scope before anything else. Models are stronger than you expect, so if you think something is challenging, push it a notch further. The time to find out a task is too easy is now, not after 600 lines of solution. Judge the idea by the effective solution LOC it forces (no blanks, comments, padding or test code), and prefer an idea that cuts across several layers or subsystems.
+Plan the scope before anything else. Models are stronger than you expect, so if you think something is challenging, push it a notch further. The time to find out a task is too easy is now, not after 600 lines of solution. Judge the idea by how hard it is for the agents and how much exploration it forces (no unhinted Nova run may solve it, and Nova runs must be long), not by diff size: the standard bar has no LOC floor. Prefer an idea that cuts across several layers or subsystems.
 
 The idea has to clear the Scope Gate on the first try, so do its homework now (R2-R4, P1, P2, P7):
 - No existing PR implements it: open, merged or closed/unmerged. A PR that never landed still rules it out. This is the #1 rejection reason.
@@ -49,7 +49,7 @@ The idea has to clear the Scope Gate on the first try, so do its homework now (R
 
 Once you understand the agents' capabilities and our past mistakes, create a directory at the workspace root named `{repo-name}-{task-name}/` and put everything in it:
 
-1. `{task-name}-plan.md`: every aspect, design choice and detail needed to implement it directly. Include files to change, layers touched, semantic forks, edge cases, test plan (30+ trap tests, each mapped to a description clause or something discoverable in the repo), expected golden effective LOC against the 250 floor, and the Dockerfile/test.sh approach. Mention every small detail, so a zero-context agent can't miss anything.
+1. `{task-name}-plan.md`: every aspect, design choice and detail needed to implement it directly. Include files to change, layers touched, semantic forks, edge cases, test plan (30+ trap tests, each mapped to a description clause or something discoverable in the repo), why Nova would need a long sequence and fail while Orion or Vega solve it only occasionally, the expected golden effective LOC as a scope signal (no floor), and the Dockerfile/test.sh approach. Mention every small detail, so a zero-context agent can't miss anything.
 2. `{task-name}-description.md`: a draft description following [.agent/rules/description-writing.md](.agent/rules/description-writing.md) and the structure of the accepted descriptions (for example `freeze-store-integrity/freeze-store-integrity-description.md`). Per the official docs (P3-P6), write it the way a maintainer writes an issue: natural prose and full sentences, opening with the ask itself ("Add X to Y"), and the first line has to make sense without the title. No motivation preamble, no bulleted requirement lists, no headings and no code snippets doing the describing. It must be self-contained, clear, unambiguous and objectively verifiable. Describe behavior, not implementation: don't name internal classes, helpers, fields or file layout unless they're truly part of the contract. Run the `humanizer` skill on it. I'll submit this first to make sure the idea isn't plagiarized.
 3. `{task-name}-repo-fit.md`: the repo-fit check following [my-review-workflow/guides/upstream-repo-fit.md](my-review-workflow/guides/upstream-repo-fit.md), recording the evidence for each Scope Gate point above (searches run, PRs/issues/discussions checked, README quotes).
 
@@ -94,17 +94,17 @@ Before declaring it ready, do the reviewer's local check exactly as the official
 2. Run the container with `--network none`. `base` must pass and `new` must fail.
 3. Apply the solution, rebuild, and rerun both modes. Both must pass.
 4. Rerun to confirm nothing is flaky.
-5. Count effective solution LOC with `count_loc.py` against the 250 floor.
+5. Count effective solution LOC with `count_loc.py` as a scope signal only (the standard bar has no LOC floor).
 
 Then give me the platform plan in the official order, where each step unlocks the next and costs more, so nothing gets spent on a later step while an earlier one fails:
 1. Prechecks.
 2. Scope Gate.
 3. Build Image.
 4. Quality checks (Verify Tests, Verify Solution, Verify Flakiness, Test Quality, Task Quality, Solution Quality, Task Prompt Quality).
-5. One quick-check rollout first, then a full batch.
+5. One quick-check rollout first, then a full batch configured to cover the criteria rows: at least 8 unhinted Nova runs and at least 4 Orion or 4 Vega runs.
 6. FP check, once the run set is settled.
 7. Auto Review, last.
 
-Remind me that any edit stales every completed check and rollout. So batch the fixes, rerun once, and never start more rollouts while a batch is still in flight. If the repo keeps real source under a folder named `build`, `dist`, `target`, `node_modules`, `__pycache__` or `.venv`, tell me the path to list under Protected source folders before the FP check.
+Remind me that any edit stales every completed check and rollout, and that an agent line-up update stales the rollouts and the FP check too. So batch the fixes, rerun once, and never start more rollouts while a batch is still in flight. If the repo keeps real source under a folder named `build`, `dist`, `target`, `node_modules`, `__pycache__` or `.venv`, tell me the path to list under Protected source folders before the FP check.
 
 Log every new problem you solve along the way in `.agent/knowledge/problem-solution-log.md`.
