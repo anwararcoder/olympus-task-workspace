@@ -1,346 +1,332 @@
 # Test Quality
 Verdict
 
-FAIL
-5 of 46 unfair
-Verdict: most assertions are predictable from the prompt and repository conventions. Six tests also assert that targets of broken entries (an empty directory, an outside file, a nested file, an outside symlink target, or a dangling link object) survive. The prompt says to discard broken entries but does not specify those target objects' fate; searches found no repo convention requiring their preservation. Those extra co-assertions are therefore not fair under the strict evidence rule. Unfair tests: 6. Shared environment advisory: tests constructing symbolic/hard links require link support; the deletion-failure test requires POSIX permissions and may invoke `setpriv`/UID 65534. These are platform assumptions; the deletion test skips only if `setpriv` is unavailable, not if POSIX permissions or link creation are unsupported.
+PASS
+All 48 tests fair
+All 46 tests constrain behavior stated in the prompt or discoverable in the existing store/freezing APIs. I find no unfair tests. Several symbolic-link, hard-link, and POSIX-permission cases assume filesystem capabilities; those are test-quality/environment concerns, not unfair expectations. The only clear coverage matrix gap is hard-link sharing when the shared file is outside the store folder.
 
-Unfair Tests
-
-Not fair
-anEntryRecordingADirectoryIsBroken
-Verifies: Repair removes the directory-recording entry and also requires the directory itself to remain a directory.
-
-Evidence: The entry-removal assertion follows the prompt, but directory preservation is unstated. Refutation search: searched prompt terms “directory,” “regular file,” and “broken”; searched repo source/tests/docs for `isDirectory`, `delete`, `repair`, and preservation. No same-form behavior found; production only creates/checks the parent directory at `TextFileBasedViolationStore.java:231-233`. Removing the empty broken target is not forbidden by the prompt.
-
-Quality: The broken-entry assertion is fair; the co-assertion that the directory survives pins an unspecified cleanup choice.
-
-Not fair
-anEntryEscapingTheStoreFolderIsBrokenAndNothingOutsideIsTouched
-Verifies: Repair removes the `../outside.txt` entry and requires the outside file to retain its exact `precious` contents.
-
-Evidence: The prompt requires the escaping entry to be broken and removed, but does not explicitly require preserving its referenced target. Refutation search: searched prompt terms “outside,” “folder,” “broken,” and “discarded”; searched repo source/tests/docs for outside-path handling, deletion, and preservation. No same-form behavior found; deleting the target while removing the broken entry is not expressly ruled out.
-
-Quality: Correctly tests the broken entry; outside-target preservation is an additional unstated requirement.
-
-Not fair
-anEntryRecordingANestedNameIsBrokenAndThatFileSurvives
-Verifies: Repair removes the nested-path entry and also requires the nested file to continue existing.
-
-Evidence: The prompt supports removal of the nested-path entry but does not state that its target survives. Refutation search: searched prompt terms “nested,” “directly within,” “broken,” and “discarded”; searched repo source/tests/docs for nested-path repair, deletion, and preservation. No same-form behavior found; deleting the nested target while cleaning the broken reference is not forbidden.
-
-Quality: Entry removal is prompt-supported; target preservation is an unstated co-assertion.
-
-Not fair
-anEntryNamingALinkOutOfTheStoreFolderIsBrokenAndItsTargetSurvives
-Verifies: Repair removes the link-recording entry and requires the outside target to retain the exact `precious` contents.
-
-Evidence: The prompt supports classifying the outside-reaching entry as broken but does not explicitly state that the external target survives. Refutation search: searched prompt terms “symbolic,” “outside,” “broken,” “discarded,” and “file”; searched repo source/tests/docs for symlink repair, outside-target preservation, and deletion. No same-form behavior found; removing the target while discarding its broken reference is not expressly excluded.
-
-Quality: The broken-link classification is fair; the test adds a target-preservation assertion not stated for broken entries.
-
-Not fair
-anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThatEntry
-Verifies: Repair removes both entries and also requires the dangling symlink itself to remain a symlink.
-
-Evidence: The prompt supports removing both broken entries but does not require retaining the symlink object. Refutation search: searched prompt terms “dangling,” “symbolic,” “broken,” and “discarded”; searched repo source/tests/docs for dangling-link preservation or repair deletion. No same-form behavior found; removing the dangling link while discarding its broken entry is not prohibited.
-
-Quality: Both entries being discarded is fair; the surviving-symlink assertion is an unspecified filesystem-cleanup choice.
-
-Requirement Coverage (10/13 covered)
+Requirement Coverage (7/9 covered)
 
 Advisory only — prompt-stated requirements and whether the hidden tests pin them.
 
 covered
-Repair checks the on-disk index and folder during initialization, including after earlier initialization of the same folder.
+Repair checks the current on-disk index/folder at initialization, even after earlier initialization; ignore is the default and checks nothing.
 
-"Setting `default.integrity` to `repair` will check the index and folder as they are on disk during initialization, even if the same folder was initialized before."
+"Setting `default.integrity` to `repair` will check the index and folder as they are on disk during initialization, even if the same folder was initialized before. Defaulting to `ignore` which checks nothing."
 
-absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingSoRepairStillFindsEveryCondition, repairLeavesAConsistentStoreUntouchedAndRepairsAnInconsistentOne, repairExaminesTheIndexAsItIsOnDiskAfterAnEarlierInitializationOfTheSameFolder
+absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingSoRepairStillFindsEveryCondition, repairExaminesTheIndexAsItIsOnDiskAfterAnEarlierInitializationOfTheSameFolder
 
 covered
-The default integrity mode is ignore and checks nothing.
-
-"Defaulting to `ignore` which checks nothing."
-
-absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingSoRepairStillFindsEveryCondition
-
-partial
-An entry is broken if its path is not a regular file directly within the folder or its name is not a valid path.
+An entry is broken if its target is not a regular file directly within the folder, including an invalid path/name.
 
 "If an entry points to a path that is not a regular file directly within the folder, it is broken. This also applies if the file name is not a valid path."
 
 anEntryWhoseFileIsAbsentIsBroken, everyBrokenEntryIsDiscarded, anEntryRecordingADirectoryIsBroken, anEntryEscapingTheStoreFolderIsBrokenAndNothingOutsideIsTouched, anEntryRecordingAnAbsolutePathIsBrokenAndThatFileSurvives, anEntryRecordingANestedNameIsBrokenAndThatFileSurvives, anEntryRecordingANameNoPathCanHoldIsBrokenBesideAHealthyOne, anEntryRecordingAnotherSpellingOfAFileDirectlyInTheFolderIsNotBroken, anEntryNamingALinkOutOfTheStoreFolderIsBrokenAndItsTargetSurvives, anEntryNamingALinkToAFileInTheStoreOwnsThatFile, anEntryNamingADanglingLinkIsBroken, anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThatEntry, entriesRecordingTwoSpellingsOfAnAbsentNameAreBothBroken
 
 covered
-A non-broken entry with no violations is resolved.
+A nonbroken entry with no violations is resolved; line-break-only files are also resolved.
 
-"If an entry is not broken and its file has no violations it is resolved."
+"If an entry is not broken and its file has no violations it is resolved. Files that only contain line breaks are also resolved."
 
-anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile, aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt, aSharedNameHoldingNoViolationsIsNotDiscardedEither, storingNoViolationsUnderRepairForgetsTheEntryAndItsFile
+anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile, aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt, aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry, aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks, anEntryHoldingOneViolationIsNotResolvedWhileAnEmptyOneIs
 
 partial
-Files containing only line breaks are resolved.
+Entries sharing the same filename or same underlying file (including symlinks/hard links and outside-folder targets) are shared.
 
-"Files that only contain line breaks are also resolved."
+"Entries that point to the same file name are shared, even if nothing exists with that name. If multiple entries point to the same file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder."
 
-aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry, aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks
-
-covered
-Entries with the same filename are shared even if no file exists under that name.
-
-"Entries that point to the same file name are shared, even if nothing exists with that name."
-
-aNameRecordedTwiceIsSharedAndNeitherEntryNorFileIsDiscarded, anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair
+aNameRecordedTwiceIsSharedAndNeitherEntryNorFileIsDiscarded, twoEntriesReachingOneFileByDifferentNamesShareItAndNeitherIsDiscarded, twoEntriesNamingOneFileThroughHardLinksShareItAndNeitherIsDiscarded, aSharedNameHoldingNoViolationsIsNotDiscardedEither, anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair, anEntryReachingAnotherEntrysFileThroughALinkIsNeverMovedAndRepairStaysSettled, forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside, forgettingARuleKeepsTheFileAnotherEntryStillRecords, forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink, savingViolationsUnderRepairLeavesAFileAnotherEntrySharesUntouched
 
 covered
-Entries reaching the same file are shared, including through symbolic/hard links and when the file is outside the folder.
-
-"If multiple entries point to the same file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder."
-
-twoEntriesReachingOneFileByDifferentNamesShareItAndNeitherIsDiscarded, twoEntriesNamingOneFileThroughHardLinksShareItAndNeitherIsDiscarded, forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside, forgettingARuleKeepsTheFileAnotherEntryStillRecords
-
-covered
-Shared entries/files and unowned files are not touched; shared entries remain shared even if another condition applies.
+Repair does not touch shared entries/files or unreferenced files; a shared entry stays shared despite another condition.
 
 "The `TextFileBasedViolationStore` will not touch any shared entries or files that no entry points to. If an entry is shared and anything else it will remain shared."
 
-ignoreExaminesNothingSoRepairStillFindsEveryCondition, aLinkNoEntryRecordsSurvivesRepairTogetherWithItsTarget, aNameRecordedTwiceIsSharedAndNeitherEntryNorFileIsDiscarded, twoEntriesReachingOneFileByDifferentNamesShareItAndNeitherIsDiscarded, twoEntriesNamingOneFileThroughHardLinksShareItAndNeitherIsDiscarded, aSharedNameHoldingNoViolationsIsNotDiscardedEither, anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair, anUnownedFileSurvivesRepairWhileABrokenEntryIsDiscarded, aFileInsideADirectoryInTheStoreFolderIsNeverACondition, anEntryReachingAnotherEntrysFileThroughALinkIsNeverMovedAndRepairStaysSettled, forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside, forgettingARuleKeepsTheFileAnotherEntryStillRecords
+ignoreExaminesNothingSoRepairStillFindsEveryCondition, aLinkNoEntryRecordsSurvivesRepairTogetherWithItsTarget, aNameRecordedTwiceIsSharedAndNeitherEntryNorFileIsDiscarded, twoEntriesReachingOneFileByDifferentNamesShareItAndNeitherIsDiscarded, twoEntriesNamingOneFileThroughHardLinksShareItAndNeitherIsDiscarded, aSharedNameHoldingNoViolationsIsNotDiscardedEither, anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair, anUnownedFileSurvivesRepairWhileABrokenEntryIsDiscarded, aFileInsideADirectoryInTheStoreFolderIsNeverACondition, forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside, forgettingARuleKeepsTheFileAnotherEntryStillRecords, forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink, savingViolationsUnderRepairLeavesAFileAnotherEntrySharesUntouched
 
 covered
-Repair discards broken entries.
+Repair discards broken entries without touching their targets.
 
-"When set to `repair` broken entries will be discarded."
+"When set to `repair` broken entries will be discarded without touching whatever they point to."
 
-absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry, ignoreExaminesNothingSoRepairStillFindsEveryCondition, repairLeavesAConsistentStoreUntouchedAndRepairsAnInconsistentOne, anEntryWhoseFileIsAbsentIsBroken, everyBrokenEntryIsDiscarded, anEntryRecordingADirectoryIsBroken, anEntryEscapingTheStoreFolderIsBrokenAndNothingOutsideIsTouched, anEntryRecordingAnAbsolutePathIsBrokenAndThatFileSurvives, anEntryRecordingANestedNameIsBrokenAndThatFileSurvives, anEntryRecordingANameNoPathCanHoldIsBrokenBesideAHealthyOne, anEntryNamingALinkOutOfTheStoreFolderIsBrokenAndItsTargetSurvives, anEntryNamingADanglingLinkIsBroken, anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThat, entriesRecordingTwoSpellingsOfAnAbsentNameAreBothBroken
+anEntryWhoseFileIsAbsentIsBroken, everyBrokenEntryIsDiscarded, anEntryRecordingADirectoryIsBroken, anEntryEscapingTheStoreFolderIsBrokenAndNothingOutsideIsTouched, anEntryRecordingAnAbsolutePathIsBrokenAndThatFileSurvives, anEntryRecordingANestedNameIsBrokenAndThatFileSurvives, anEntryNamingALinkOutOfTheStoreFolderIsBrokenAndItsTargetSurvives, anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThatEntry
 
 covered
-Repair discards resolved entries/files and deletes the target too for a resolved symbolic link.
+Repair discards resolved entries and files, and deletes a resolved symbolic link's target.
 
 "When set to `repair` resolved entries and the file they point to will be discarded. If a resolved entry is a symbolic link the file it points to will be deleted as well."
 
-anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile, aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt, aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry, aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks
+anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile, aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt, forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile
+
+covered
+In repair mode, an empty save forgets a known rule (except a shared file leaves the file/peer entry); an empty save for an unknown rule saves nothing.
+
+"If using `repair` and saving no violations for a known rule it will forget the rule. Its entry will be removed and its file as well. Unless another entry is sharing that file. In which case only the entry will be removed. Even if it points outside the folder. If using `repair` and saving no violations for an unknown rule nothing will be saved."
+
+storingNoViolationsUnderRepairForgetsTheEntryAndItsFile, forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside, forgettingARuleKeepsTheFileAnotherEntryStillRecords, forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink, forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile, forgettingARuleTheIndexNeverKnewStoresNothingForIt
 
 partial
-Saving no violations for a known rule under repair removes its entry/file unless another entry shares that file, in which case only the entry is removed.
-
-"If using `repair` and saving no violations for a known rule it will forget the rule. Its entry will be removed and its file as well. Unless another entry is sharing that file. In which case only the entry will be removed. Even if it points outside the folder."
-
-storingNoViolationsUnderRepairForgetsTheEntryAndItsFile, forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside, forgettingARuleKeepsTheFileAnotherEntryStillRecords, forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile
-
-covered
-Saving no violations for an unknown rule under repair saves nothing.
-
-"If using `repair` and saving no violations for an unknown rule nothing will be saved."
-
-forgettingARuleTheIndexNeverKnewStoresNothingForIt
-
-covered
-If the file cannot be deleted while forgetting a rule, saving fails and the entry remains.
+If the file cannot be deleted during forgetting, saving fails and the entry remains.
 
 "If it cannot delete the file of a rule it is forgetting it will fail to save and leave the entry."
 
 forgettingARuleWhoseFileCannotBeDeletedKeepsItsEntry
 
-Coverage Suggestions (1)
+Coverage Suggestions (2)
 
 Advisory only — these don't affect the check result.
 
-Save-time sharing through hard links
-untested
+Shared hard link whose file is outside the store folder
+single point
 Prompt-stated
-Requirement: Saving no violations for a known rule under repair removes its entry/file unless another entry shares that file.
+Requirement: Entries sharing the same filename or same underlying file (including symlinks/hard links and outside-folder targets) are shared.
 
-Add a repair-mode empty-save case where the forgotten rule's path is hard-linked to a second indexed name, then assert only the forgotten entry is removed and the shared file remains. Current hard-link coverage is during initialization repair; save-time sharing uses symlink/outside paths.
+Add an outside file with an in-folder hard link to the same inode, index both names, then verify repair preserves both shared entries and the file. Existing tests cover in-folder hard links and symbolic links to outside targets, but not this combination.
 
-Quality Notes (41)
+Additional deletion-failure cause
+single point
+Prompt-stated
+Requirement: If the file cannot be deleted during forgetting, saving fails and the entry remains.
+
+If a deterministic alternative is available, exercise deletion failure for a cause other than POSIX directory permissions, so the only failure case does not depend on the platform-specific permission/subprocess setup.
+
+Quality Notes (48)
 
 Prompt-stated
 absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry
-Direct, useful contrast of the default and repair mode.
+Direct contrast of default and repair.
 
 Prompt-stated
 ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry
-Redundant with the absent-setting test, but it separately verifies the explicit ignore value.
+Directly checks both modes.
 
-Repo-discoverable
+Prompt-stated
 ignoreExaminesNothingSoRepairStillFindsEveryCondition
-Broad test of ignore's no-change behavior and several repair cases; its multi-condition setup is useful but makes failures less localized.
+Broad multi-condition check; byte preservation also follows existing initialization behavior.
 
 Prompt-stated
 repairLeavesAConsistentStoreUntouchedAndRepairsAnInconsistentOne
-Good basic healthy-versus-broken contrast.
+Useful consistency and repair contrast.
 
 Prompt-stated
 anEntryWhoseFileIsAbsentIsBroken
-Clear representative missing-file case.
+Representative missing-file case.
 
 Prompt-stated
 everyBrokenEntryIsDiscarded
-Adds a useful multiple-broken-entry check beyond the single missing-file test.
+Adds multiple broken entries; somewhat overlaps the absent-file case.
+
+Prompt-stated
+anEntryRecordingADirectoryIsBroken
+Direct directory edge case.
+
+Prompt-stated
+anEntryEscapingTheStoreFolderIsBrokenAndNothingOutsideIsTouched
+Directly checks outside-target protection.
 
 Prompt-stated
 anEntryRecordingAnAbsolutePathIsBrokenAndThatFileSurvives
-Useful absolute-path case plus a no-entry file preservation check.
+Tests two absolute-path spellings.
+
+Prompt-stated
+anEntryRecordingANestedNameIsBrokenAndThatFileSurvives
+Direct nested-path case.
 
 Prompt-stated
 anEntryRecordingANameNoPathCanHoldIsBrokenBesideAHealthyOne
-Tests several invalid-name forms and checks repair continues to preserve a healthy entry.
+Tests multiple invalid-name examples.
+
+Standard external semantics
+anEntryRecordingAnotherSpellingOfAFileDirectlyInTheFolderIsNotBroken
+One normalized spelling; API retrieval form is established by existing tests.
 
 Prompt-stated
-anEntryRecordingAnotherSpellingOfAFileDirectlyInTheFolderIsNotBroken
-Good path-normalization case; the reader assertion also checks the surviving entry is usable.
+anEntryNamingALinkOutOfTheStoreFolderIsBrokenAndItsTargetSurvives
+Fair link case; symbolic-link creation depends on filesystem support.
 
+env assumption
 Prompt-stated
 anEntryNamingALinkToAFileInTheStoreOwnsThatFile
-Useful positive symlink case complementing the broken outside-link case.
+Fair converse case; symbolic-link creation can be restricted.
 
+env assumption
 Prompt-stated
 aLinkNoEntryRecordsSurvivesRepairTogetherWithItsTarget
-Checks an unowned link separately from an indexed link.
+Direct orphan/link preservation check; link support is assumed.
 
+env assumption
 Prompt-stated
 anEntryNamingADanglingLinkIsBroken
-Useful dangling-link classification case.
+Direct dangling-link case; link support is assumed.
 
+env assumption
+Prompt-stated
+anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThatEntry
+Checks link itself survives broken-entry removal.
+
+env assumption
 Prompt-stated
 entriesRecordingTwoSpellingsOfAnAbsentNameAreBothBroken
-Good check that syntactically different absent paths do not become shared merely by normalization.
+Useful contrast with identical absent names.
 
 Prompt-stated
 anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile
-Direct test of the basic resolved-file case.
+Direct empty-file case.
 
 Prompt-stated
 aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt
-Strongly discriminates deleting the target, not merely unlinking the symlink.
+Explicit link-target behavior; link creation is environment-dependent.
 
+env assumption
 Prompt-stated
 aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry
-Clear representative line-break-only case.
+Representative line-break and nonempty cases.
 
-Standard external semantics
+Prompt-stated
 aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks
-Useful coverage of common line-ending forms; does not test less common Unicode separators.
+Good representative coverage of common newline forms.
 
 Prompt-stated
 anEntryHoldingOneViolationIsNotResolvedWhileAnEmptyOneIs
-A basic contrast between zero and nonzero violations.
+Simple boundary case.
 
 Prompt-stated
 aNameRecordedTwiceIsSharedAndNeitherEntryNorFileIsDiscarded
-Directly covers identical-name sharing with an existing empty file.
+Checks same-name sharing with an existing empty file.
 
 Prompt-stated
 twoEntriesReachingOneFileByDifferentNamesShareItAndNeitherIsDiscarded
-Broad but useful test of two distinct symlink-sharing scenarios.
+Excellent alias/outside case; relies on symbolic-link support.
 
+env assumption
 Prompt-stated
 twoEntriesNamingOneFileThroughHardLinksShareItAndNeitherIsDiscarded
-Adds the hard-link case not exercised by the symlink tests.
+Hard-link behavior is explicit; hard-link creation may be unsupported.
 
+env assumption
 Prompt-stated
 aSharedNameHoldingNoViolationsIsNotDiscardedEither
-Good interaction test for sharing and resolution.
+Covers shared-empty versus unshared-empty.
 
 Prompt-stated
 anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair
-Direct test of the prompt's shared-plus-broken rule.
+Directly checks shared-but-absent edge case.
 
 Prompt-stated
 anUnownedFileSurvivesRepairWhileABrokenEntryIsDiscarded
-Clear unowned-file check.
+Direct orphan-file check.
 
 Prompt-stated
 aFileInsideADirectoryInTheStoreFolderIsNeverACondition
-Useful check that repair does not recursively treat buried files as indexed store files.
+Adds an unowned nested-file case.
 
 Prompt-stated
 aSecondInitializationOfARepairedFolderDiscardsNothing
-Checks settled repeated repair behavior; compares filenames rather than every byte.
+Checks settled/idempotent repair state.
 
 Prompt-stated
 anEntryReachingAnotherEntrysFileThroughALinkIsNeverMovedAndRepairStaysSettled
-Useful repeat-repair check for a shared alias and a valid entry.
+Useful repeated-repair check; requires symbolic-link support.
 
+env assumption
 Prompt-stated
 aSeparatelyCreatedStoreObservesTheRepairedIndex
-Checks the public API view after disk repair, not just the properties file.
+Checks persisted, user-visible index state.
 
 Prompt-stated
 aRepairedFolderHoldsOnlyTheIndexAndTheFilesItsSurvivingEntriesRecord
-Good end-state assertion; exact filename continuity is also grounded in the existing mapping convention.
+Direct post-repair folder/index consistency check.
 
 Prompt-stated
 aRuleWhoseEntryWasDiscardedIsNoLongerFrozen
-Simple API-level check of the repaired index.
+Public API consequence of index removal.
 
-Prompt-stated
+Repo-discoverable
 repairKeepsAStillViolatingRuleFrozenWithItsViolations
-Checks both index membership and usable violation data.
+Integration check; list retrieval is established by existing tests.
 
-Prompt-stated
+Repo-discoverable
 aRepairedStoreCanFreezeARuleAgain
-Good lifecycle integration check after repair.
+Good refreeze integration check; the filename assertion follows the default naming strategy.
 
 Repo-discoverable
 aRuleDiscardedByRepairFreezesAfreshOnTheNextFreezingArchRuleEvaluation
-Useful integration test of the public freezing flow rather than only direct store calls.
+End-to-end integration assertion; more expansive than direct store unit tests.
 
-Repo-discoverable
+Prompt-stated
 storingNoViolationsUnderRepairForgetsTheEntryAndItsFile
-Good contrast, though it combines repair behavior with pre-existing ignore-mode save behavior.
+Useful repair-versus-ignore contrast.
 
 Prompt-stated
 forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside
-Strong test of the outside-folder sharing exception.
+Directly checks shared outside-file preservation.
 
 Prompt-stated
 forgettingARuleKeepsTheFileAnotherEntryStillRecords
-Useful save-time symbolic-sharing case; related hard-link save coverage is absent.
+Sharing assertion is fair; symbolic-link setup may be restricted.
 
+env assumption
+Prompt-stated
+forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink
+Hard-link setup may be unsupported by the filesystem.
+
+env assumption
 Prompt-stated
 forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile
-Checks link and target cleanup together with remaining-rule usability.
+Tests link-target deletion on save; requires symbolic-link support.
 
+env assumption
 Prompt-stated
 forgettingARuleWhoseFileCannotBeDeletedKeepsItsEntry
-The behavioral assertion is direct, but its POSIX/privilege setup has an environment assumption noted overall.
+Uses POSIX permissions and optional `setpriv`; can be skipped or fail on unsupported systems.
 
+env assumption
 Prompt-stated
 forgettingARuleTheIndexNeverKnewStoresNothingForIt
-Direct test of the unknown-rule case.
+Direct unknown-rule case.
+
+Repo-discoverable
+aStillViolatedRuleKeepsItsEntryUnderRepair
+One nonempty save case; existing tests establish retrieval semantics.
 
 Prompt-stated
-aStillViolatedRuleKeepsItsEntryUnderRepair
-Checks the nonempty save path and surviving violation content.
+savingViolationsUnderRepairLeavesAFileAnotherEntrySharesUntouched
+Tests several sharing mechanisms; link creation is environment-dependent.
 
+env assumption
 Prompt-stated
 repairExaminesTheIndexAsItIsOnDiskAfterAnEarlierInitializationOfTheSameFolder
-Directly tests the on-disk re-read requirement.
+Direct stale-cache/reinitialization case.
 
 Task Summary
 
-The task asks the agent to add integrity handling to TextFileBasedViolationStore: default to ignoring integrity checks, optionally repair the on-disk index and violation files, reject broken paths, remove resolved entries/files, preserve shared and unowned data, and forget rules saved with no violations under repair. The patch adds tests spanning initialization, path validity, empty/line-break-only files, sharing through names and links, saving, failures, and FreezingArchRule integration.
+The task asks TextFileBasedViolationStore to maintain its on-disk index: ignore is the default and does no integrity check; repair rechecks the folder/index at initialization, removes broken or resolved unshared entries safely, preserves shared/unowned files, and forgets known rules saved with no violations while respecting shared files and deletion failures.
 
-Completed in 389.6s
+Completed in 279.2s
 
-Hide raw output
+```json
 {
   "completed": true,
   "coverageSuggestions": [
     {
-      "area": "Save-time sharing through hard links",
-      "gapKind": "untested",
-      "requirement": "Saving no violations for a known rule under repair removes its entry/file unless another entry shares that file.",
+      "area": "Shared hard link whose file is outside the store folder",
+      "gapKind": "single_point",
+      "requirement": "Entries sharing the same filename or same underlying file (including symlinks/hard links and outside-folder targets) are shared.",
       "sourceIfAdded": "Prompt-stated",
-      "suggestion": "Add a repair-mode empty-save case where the forgotten rule's path is hard-linked to a second indexed name, then assert only the forgotten entry is removed and the shared file remains. Current hard-link coverage is during initialization repair; save-time sharing uses symlink/outside paths."
+      "suggestion": "Add an outside file with an in-folder hard link to the same inode, index both names, then verify repair preserves both shared entries and the file. Existing tests cover in-folder hard links and symbolic links to outside targets, but not this combination."
+    },
+    {
+      "area": "Additional deletion-failure cause",
+      "gapKind": "single_point",
+      "requirement": "If the file cannot be deleted during forgetting, saving fails and the entry remains.",
+      "sourceIfAdded": "Prompt-stated",
+      "suggestion": "If a deterministic alternative is available, exercise deletion failure for a cause other than POSIX directory permissions, so the only failure case does not depend on the platform-specific permission/subprocess setup."
     }
   ],
   "error": "",
-  "executionTimeSeconds": 389.594023,
-  "message": "5 tests flagged as not fair.",
-  "overall": "Verdict: most assertions are predictable from the prompt and repository conventions. Six tests also assert that targets of broken entries (an empty directory, an outside file, a nested file, an outside symlink target, or a dangling link object) survive. The prompt says to discard broken entries but does not specify those target objects' fate; searches found no repo convention requiring their preservation. Those extra co-assertions are therefore not fair under the strict evidence rule. Unfair tests: 6. Shared environment advisory: tests constructing symbolic/hard links require link support; the deletion-failure test requires POSIX permissions and may invoke `setpriv`/UID 65534. These are platform assumptions; the deletion test skips only if `setpriv` is unavailable, not if POSIX permissions or link creation are unsupported.",
+  "executionTimeSeconds": 279.225665,
+  "message": "All hidden tests are fair.",
+  "overall": "All 46 tests constrain behavior stated in the prompt or discoverable in the existing store/freezing APIs. I find no unfair tests. Several symbolic-link, hard-link, and POSIX-permission cases assume filesystem capabilities; those are test-quality/environment concerns, not unfair expectations. The only clear coverage matrix gap is hard-link sharing when the shared file is outside the store folder.",
   "requirements": [
     {
       "covered": "yes",
@@ -348,24 +334,13 @@ Hide raw output
         "absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
         "ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
         "ignoreExaminesNothingSoRepairStillFindsEveryCondition",
-        "repairLeavesAConsistentStoreUntouchedAndRepairsAnInconsistentOne",
         "repairExaminesTheIndexAsItIsOnDiskAfterAnEarlierInitializationOfTheSameFolder"
       ],
-      "requirement": "Repair checks the on-disk index and folder during initialization, including after earlier initialization of the same folder.",
-      "sourceQuote": "Setting `default.integrity` to `repair` will check the index and folder as they are on disk during initialization, even if the same folder was initialized before."
+      "requirement": "Repair checks the current on-disk index/folder at initialization, even after earlier initialization; ignore is the default and checks nothing.",
+      "sourceQuote": "Setting `default.integrity` to `repair` will check the index and folder as they are on disk during initialization, even if the same folder was initialized before. Defaulting to `ignore` which checks nothing."
     },
     {
       "covered": "yes",
-      "coveringTests": [
-        "absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
-        "ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
-        "ignoreExaminesNothingSoRepairStillFindsEveryCondition"
-      ],
-      "requirement": "The default integrity mode is ignore and checks nothing.",
-      "sourceQuote": "Defaulting to `ignore` which checks nothing."
-    },
-    {
-      "covered": "partial",
       "coveringTests": [
         "anEntryWhoseFileIsAbsentIsBroken",
         "everyBrokenEntryIsDiscarded",
@@ -381,7 +356,7 @@ Hide raw output
         "anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThatEntry",
         "entriesRecordingTwoSpellingsOfAnAbsentNameAreBothBroken"
       ],
-      "requirement": "An entry is broken if its path is not a regular file directly within the folder or its name is not a valid path.",
+      "requirement": "An entry is broken if its target is not a regular file directly within the folder, including an invalid path/name.",
       "sourceQuote": "If an entry points to a path that is not a regular file directly within the folder, it is broken. This also applies if the file name is not a valid path."
     },
     {
@@ -389,40 +364,29 @@ Hide raw output
       "coveringTests": [
         "anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile",
         "aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt",
-        "aSharedNameHoldingNoViolationsIsNotDiscardedEither",
-        "storingNoViolationsUnderRepairForgetsTheEntryAndItsFile"
+        "aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry",
+        "aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks",
+        "anEntryHoldingOneViolationIsNotResolvedWhileAnEmptyOneIs"
       ],
-      "requirement": "A non-broken entry with no violations is resolved.",
-      "sourceQuote": "If an entry is not broken and its file has no violations it is resolved."
+      "requirement": "A nonbroken entry with no violations is resolved; line-break-only files are also resolved.",
+      "sourceQuote": "If an entry is not broken and its file has no violations it is resolved. Files that only contain line breaks are also resolved."
     },
     {
       "covered": "partial",
       "coveringTests": [
-        "aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry",
-        "aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks"
-      ],
-      "requirement": "Files containing only line breaks are resolved.",
-      "sourceQuote": "Files that only contain line breaks are also resolved."
-    },
-    {
-      "covered": "yes",
-      "coveringTests": [
         "aNameRecordedTwiceIsSharedAndNeitherEntryNorFileIsDiscarded",
-        "anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair"
-      ],
-      "requirement": "Entries with the same filename are shared even if no file exists under that name.",
-      "sourceQuote": "Entries that point to the same file name are shared, even if nothing exists with that name."
-    },
-    {
-      "covered": "yes",
-      "coveringTests": [
         "twoEntriesReachingOneFileByDifferentNamesShareItAndNeitherIsDiscarded",
         "twoEntriesNamingOneFileThroughHardLinksShareItAndNeitherIsDiscarded",
+        "aSharedNameHoldingNoViolationsIsNotDiscardedEither",
+        "anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair",
+        "anEntryReachingAnotherEntrysFileThroughALinkIsNeverMovedAndRepairStaysSettled",
         "forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside",
-        "forgettingARuleKeepsTheFileAnotherEntryStillRecords"
+        "forgettingARuleKeepsTheFileAnotherEntryStillRecords",
+        "forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink",
+        "savingViolationsUnderRepairLeavesAFileAnotherEntrySharesUntouched"
       ],
-      "requirement": "Entries reaching the same file are shared, including through symbolic/hard links and when the file is outside the folder.",
-      "sourceQuote": "If multiple entries point to the same file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder."
+      "requirement": "Entries sharing the same filename or same underlying file (including symlinks/hard links and outside-folder targets) are shared.",
+      "sourceQuote": "Entries that point to the same file name are shared, even if nothing exists with that name. If multiple entries point to the same file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder."
     },
     {
       "covered": "yes",
@@ -436,449 +400,480 @@ Hide raw output
         "anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair",
         "anUnownedFileSurvivesRepairWhileABrokenEntryIsDiscarded",
         "aFileInsideADirectoryInTheStoreFolderIsNeverACondition",
-        "anEntryReachingAnotherEntrysFileThroughALinkIsNeverMovedAndRepairStaysSettled",
         "forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside",
-        "forgettingARuleKeepsTheFileAnotherEntryStillRecords"
+        "forgettingARuleKeepsTheFileAnotherEntryStillRecords",
+        "forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink",
+        "savingViolationsUnderRepairLeavesAFileAnotherEntrySharesUntouched"
       ],
-      "requirement": "Shared entries/files and unowned files are not touched; shared entries remain shared even if another condition applies.",
+      "requirement": "Repair does not touch shared entries/files or unreferenced files; a shared entry stays shared despite another condition.",
       "sourceQuote": "The `TextFileBasedViolationStore` will not touch any shared entries or files that no entry points to. If an entry is shared and anything else it will remain shared."
     },
     {
       "covered": "yes",
       "coveringTests": [
-        "absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
-        "ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
-        "ignoreExaminesNothingSoRepairStillFindsEveryCondition",
-        "repairLeavesAConsistentStoreUntouchedAndRepairsAnInconsistentOne",
         "anEntryWhoseFileIsAbsentIsBroken",
         "everyBrokenEntryIsDiscarded",
         "anEntryRecordingADirectoryIsBroken",
         "anEntryEscapingTheStoreFolderIsBrokenAndNothingOutsideIsTouched",
         "anEntryRecordingAnAbsolutePathIsBrokenAndThatFileSurvives",
         "anEntryRecordingANestedNameIsBrokenAndThatFileSurvives",
-        "anEntryRecordingANameNoPathCanHoldIsBrokenBesideAHealthyOne",
         "anEntryNamingALinkOutOfTheStoreFolderIsBrokenAndItsTargetSurvives",
-        "anEntryNamingADanglingLinkIsBroken",
-        "anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThat",
-        "entriesRecordingTwoSpellingsOfAnAbsentNameAreBothBroken"
+        "anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThatEntry"
       ],
-      "requirement": "Repair discards broken entries.",
-      "sourceQuote": "When set to `repair` broken entries will be discarded."
+      "requirement": "Repair discards broken entries without touching their targets.",
+      "sourceQuote": "When set to `repair` broken entries will be discarded without touching whatever they point to."
     },
     {
       "covered": "yes",
       "coveringTests": [
         "anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile",
         "aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt",
-        "aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry",
-        "aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks"
+        "forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile"
       ],
-      "requirement": "Repair discards resolved entries/files and deletes the target too for a resolved symbolic link.",
+      "requirement": "Repair discards resolved entries and files, and deletes a resolved symbolic link's target.",
       "sourceQuote": "When set to `repair` resolved entries and the file they point to will be discarded. If a resolved entry is a symbolic link the file it points to will be deleted as well."
     },
     {
-      "covered": "partial",
+      "covered": "yes",
       "coveringTests": [
         "storingNoViolationsUnderRepairForgetsTheEntryAndItsFile",
         "forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside",
         "forgettingARuleKeepsTheFileAnotherEntryStillRecords",
-        "forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile"
-      ],
-      "requirement": "Saving no violations for a known rule under repair removes its entry/file unless another entry shares that file, in which case only the entry is removed.",
-      "sourceQuote": "If using `repair` and saving no violations for a known rule it will forget the rule. Its entry will be removed and its file as well. Unless another entry is sharing that file. In which case only the entry will be removed. Even if it points outside the folder."
-    },
-    {
-      "covered": "yes",
-      "coveringTests": [
+        "forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink",
+        "forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile",
         "forgettingARuleTheIndexNeverKnewStoresNothingForIt"
       ],
-      "requirement": "Saving no violations for an unknown rule under repair saves nothing.",
-      "sourceQuote": "If using `repair` and saving no violations for an unknown rule nothing will be saved."
+      "requirement": "In repair mode, an empty save forgets a known rule (except a shared file leaves the file/peer entry); an empty save for an unknown rule saves nothing.",
+      "sourceQuote": "If using `repair` and saving no violations for a known rule it will forget the rule. Its entry will be removed and its file as well. Unless another entry is sharing that file. In which case only the entry will be removed. Even if it points outside the folder. If using `repair` and saving no violations for an unknown rule nothing will be saved."
     },
     {
-      "covered": "yes",
+      "covered": "partial",
       "coveringTests": [
         "forgettingARuleWhoseFileCannotBeDeletedKeepsItsEntry"
       ],
-      "requirement": "If the file cannot be deleted while forgetting a rule, saving fails and the entry remains.",
+      "requirement": "If the file cannot be deleted during forgetting, saving fails and the entry remains.",
       "sourceQuote": "If it cannot delete the file of a rule it is forgetting it will fail to save and leave the entry."
     }
   ],
-  "taskSummary": "The task asks the agent to add integrity handling to TextFileBasedViolationStore: default to ignoring integrity checks, optionally repair the on-disk index and violation files, reject broken paths, remove resolved entries/files, preserve shared and unowned data, and forget rules saved with no violations under repair. The patch adds tests spanning initialization, path validity, empty/line-break-only files, sharing through names and links, saving, failures, and FreezingArchRule integration.",
+  "taskSummary": "The task asks TextFileBasedViolationStore to maintain its on-disk index: ignore is the default and does no integrity check; repair rechecks the folder/index at initialization, removes broken or resolved unshared entries safely, preserves shared/unowned files, and forgets known rules saved with no violations while respecting shared files and deletion failures.",
   "tests": [
     {
       "concerns": [],
-      "evidence": "Prompt: “Defaulting to `ignore` which checks nothing” and “When set to `repair` broken entries will be discarded.”",
+      "evidence": "“Defaulting to `ignore` which checks nothing” and “When set to `repair` broken entries will be discarded without touching whatever they point to.”",
       "fairness": "Prompt-stated",
       "name": "absentSettingExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
-      "qualityCheck": "Direct, useful contrast of the default and repair mode.",
-      "verifies": "With no integrity property, the broken index entry remains; with repair, the index has no entries."
+      "qualityCheck": "Direct contrast of default and repair.",
+      "verifies": "With no integrity setting, the `a rule` entry remains; after repair, the index has no entries."
     },
     {
       "concerns": [],
-      "evidence": "Prompt explicitly says ignore checks nothing and repair discards broken entries.",
+      "evidence": "“Defaulting to `ignore` which checks nothing” and “When set to `repair` broken entries will be discarded without touching whatever they point to.”",
       "fairness": "Prompt-stated",
       "name": "ignoreExaminesNothingWhileRepairDiscardsTheSameBrokenEntry",
-      "qualityCheck": "Redundant with the absent-setting test, but it separately verifies the explicit ignore value.",
-      "verifies": "With `default.integrity=ignore`, the broken entry remains; with `repair`, it is removed."
+      "qualityCheck": "Directly checks both modes.",
+      "verifies": "After ignore, the broken entry remains; after repair, it is removed."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says ignore checks nothing and shared/unowned files are not touched. Existing-index initialization loads properties at `TextFileBasedViolationStore.java:105-122`; filesystem writes are in save at `:146-181`, not initialization.",
-      "fairness": "Repo-discoverable",
+      "evidence": "“Defaulting to `ignore` which checks nothing”; “even if the same folder was initialized before”; “If an entry is not broken and its file has no violations it is resolved”; and “will not touch any shared entries or files that no entry points to.” Existing initialization/load code is non-writing when the index exists: `TextFileBasedViolationStore.java:109-119,230-245`.",
+      "fairness": "Prompt-stated",
       "name": "ignoreExaminesNothingSoRepairStillFindsEveryCondition",
-      "qualityCheck": "Broad test of ignore's no-change behavior and several repair cases; its multi-condition setup is useful but makes failures less localized.",
-      "verifies": "Ignore leaves the captured file names and bytes unchanged; repair removes broken/resolved entries and files while retaining the shared entries, violating entry, and unowned file and contents."
+      "qualityCheck": "Broad multi-condition check; byte preservation also follows existing initialization behavior.",
+      "verifies": "Ignore leaves the file-name list and every file's bytes unchanged; later repair removes broken/resolved entries and files but retains shared entries, the violating file, and the unowned file/content."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says repair checks the index/folder and discards broken entries; a direct regular file with violations is neither broken nor resolved under the stated resolved-entry definition.",
+      "evidence": "“Setting `default.integrity` to `repair` will check the index and folder as they are on disk during initialization” and a non-regular-file path “is broken.”",
       "fairness": "Prompt-stated",
       "name": "repairLeavesAConsistentStoreUntouchedAndRepairsAnInconsistentOne",
-      "qualityCheck": "Good basic healthy-versus-broken contrast.",
-      "verifies": "Repair retains the consistent rule entry/file name and removes the entry pointing to an absent file."
+      "qualityCheck": "Useful consistency and repair contrast.",
+      "verifies": "Repair retains the consistent store's entry and file names, but removes the entry pointing to an absent file in the inconsistent store."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says a path that is not a regular file directly within the folder is broken and repair discards broken entries.",
+      "evidence": "“If an entry points to a path that is not a regular file directly within the folder, it is broken.”",
       "fairness": "Prompt-stated",
       "name": "anEntryWhoseFileIsAbsentIsBroken",
-      "qualityCheck": "Clear representative missing-file case.",
-      "verifies": "Repair removes the absent-file entry and leaves the present-file entry and file."
+      "qualityCheck": "Representative missing-file case.",
+      "verifies": "Repair removes the absent-file entry and retains the healthy entry and its file."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says broken entries are discarded under repair; every absent-file entry is broken.",
+      "evidence": "“When set to `repair` broken entries will be discarded without touching whatever they point to.”",
       "fairness": "Prompt-stated",
       "name": "everyBrokenEntryIsDiscarded",
-      "qualityCheck": "Adds a useful multiple-broken-entry check beyond the single missing-file test.",
-      "verifies": "All three entries to absent files are removed; the present-file entry remains."
+      "qualityCheck": "Adds multiple broken entries; somewhat overlaps the absent-file case.",
+      "verifies": "Three absent-file entries are all removed while the healthy entry remains."
     },
     {
       "concerns": [],
-      "evidence": "The entry-removal assertion follows the prompt, but directory preservation is unstated. Refutation search: searched prompt terms “directory,” “regular file,” and “broken”; searched repo source/tests/docs for `isDirectory`, `delete`, `repair`, and preservation. No same-form behavior found; production only creates/checks the parent directory at `TextFileBasedViolationStore.java:231-233`. Removing the empty broken target is not forbidden by the prompt.",
-      "fairness": "Not fair",
+      "evidence": "A directory is not a “regular file directly within the folder”; broken entries are discarded “without touching whatever they point to.”",
+      "fairness": "Prompt-stated",
       "name": "anEntryRecordingADirectoryIsBroken",
-      "qualityCheck": "The broken-entry assertion is fair; the co-assertion that the directory survives pins an unspecified cleanup choice.",
-      "verifies": "Repair removes the directory-recording entry and also requires the directory itself to remain a directory."
+      "qualityCheck": "Direct directory edge case.",
+      "verifies": "Repair removes the directory-valued entry while leaving the directory present."
     },
     {
       "concerns": [],
-      "evidence": "The prompt requires the escaping entry to be broken and removed, but does not explicitly require preserving its referenced target. Refutation search: searched prompt terms “outside,” “folder,” “broken,” and “discarded”; searched repo source/tests/docs for outside-path handling, deletion, and preservation. No same-form behavior found; deleting the target while removing the broken entry is not expressly ruled out.",
-      "fairness": "Not fair",
+      "evidence": "A path not “directly within the folder” is broken; repair discards it “without touching whatever they point to.”",
+      "fairness": "Prompt-stated",
       "name": "anEntryEscapingTheStoreFolderIsBrokenAndNothingOutsideIsTouched",
-      "qualityCheck": "Correctly tests the broken entry; outside-target preservation is an additional unstated requirement.",
-      "verifies": "Repair removes the `../outside.txt` entry and requires the outside file to retain its exact `precious` contents."
+      "qualityCheck": "Directly checks outside-target protection.",
+      "verifies": "Repair removes the `../outside.txt` entry and preserves the outside file with content `precious`."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says paths not directly within the folder are broken and files that no entry points to are not touched; the in-store `rooted` file has no valid entry pointing to it.",
+      "evidence": "A path not “directly within the folder” is broken; repair discards broken entries “without touching whatever they point to.”",
       "fairness": "Prompt-stated",
       "name": "anEntryRecordingAnAbsolutePathIsBrokenAndThatFileSurvives",
-      "qualityCheck": "Useful absolute-path case plus a no-entry file preservation check.",
-      "verifies": "Repair removes both broken entries; the separate store file `rooted-e448f3` retains its contents."
+      "qualityCheck": "Tests two absolute-path spellings.",
+      "verifies": "Repair removes the absolute and root-prefixed entries, preserves the outside file/content, and retains the in-store violation file/content."
     },
     {
       "concerns": [],
-      "evidence": "The prompt supports removal of the nested-path entry but does not state that its target survives. Refutation search: searched prompt terms “nested,” “directly within,” “broken,” and “discarded”; searched repo source/tests/docs for nested-path repair, deletion, and preservation. No same-form behavior found; deleting the nested target while cleaning the broken reference is not forbidden.",
-      "fairness": "Not fair",
+      "evidence": "A path must be a regular file “directly within the folder”; broken entries are discarded “without touching whatever they point to.”",
+      "fairness": "Prompt-stated",
       "name": "anEntryRecordingANestedNameIsBrokenAndThatFileSurvives",
-      "qualityCheck": "Entry removal is prompt-supported; target preservation is an unstated co-assertion.",
-      "verifies": "Repair removes the nested-path entry and also requires the nested file to continue existing."
+      "qualityCheck": "Direct nested-path case.",
+      "verifies": "Repair removes the `nested/violations` entry and leaves that nested file present."
     },
     {
       "concerns": [],
-      "evidence": "Prompt explicitly says invalid path names are broken and repair discards broken entries; the healthy entry points to a direct regular file with a violation.",
+      "evidence": "“This also applies if the file name is not a valid path” and repair discards broken entries “without touching whatever they point to.”",
       "fairness": "Prompt-stated",
       "name": "anEntryRecordingANameNoPathCanHoldIsBrokenBesideAHealthyOne",
-      "qualityCheck": "Tests several invalid-name forms and checks repair continues to preserve a healthy entry.",
-      "verifies": "Entries with NUL, an unpaired surrogate, and a too-long name are removed while the healthy entry/file/content remain."
+      "qualityCheck": "Tests multiple invalid-name examples.",
+      "verifies": "Repair removes the NUL name, unpaired-surrogate name, and long name, retaining only the healthy entry/file and its content."
     },
     {
       "concerns": [],
-      "evidence": "The prompt's rule is whether the path identifies a regular file directly within the folder; `./violations` resolves to that file. Exact line reading is established by `TextFileBasedViolationStore.java:198-203` and existing tests at `TextFileBasedViolationStoreTest.java:79-84`.",
-      "fairness": "Prompt-stated",
+      "evidence": "Java filesystem path semantics resolve `./violations` to the same direct child as `violations`; that resolved path is a regular file directly in the folder. Existing filename-relative read logic is at `TextFileBasedViolationStore.java:198-208`, and retrieval is exercised at `TextFileBasedViolationStoreTest.java:78-91`.",
+      "fairness": "Standard external semantics",
       "name": "anEntryRecordingAnotherSpellingOfAFileDirectlyInTheFolderIsNotBroken",
-      "qualityCheck": "Good path-normalization case; the reader assertion also checks the surviving entry is usable.",
-      "verifies": "Repair retains the `./violations` entry/file contents, and a reader returns exactly `a remaining violation`."
+      "qualityCheck": "One normalized spelling; API retrieval form is established by existing tests.",
+      "verifies": "Repair retains the `./violations` entry/file; a reader returns exactly `a remaining violation`."
     },
     {
-      "concerns": [],
-      "evidence": "The prompt supports classifying the outside-reaching entry as broken but does not explicitly state that the external target survives. Refutation search: searched prompt terms “symbolic,” “outside,” “broken,” “discarded,” and “file”; searched repo source/tests/docs for symlink repair, outside-target preservation, and deletion. No same-form behavior found; removing the target while discarding its broken reference is not expressly excluded.",
-      "fairness": "Not fair",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "A path not “a regular file directly within the folder” is broken; repair discards it “without touching whatever they point to.”",
+      "fairness": "Prompt-stated",
       "name": "anEntryNamingALinkOutOfTheStoreFolderIsBrokenAndItsTargetSurvives",
-      "qualityCheck": "The broken-link classification is fair; the test adds a target-preservation assertion not stated for broken entries.",
-      "verifies": "Repair removes the link-recording entry and requires the outside target to retain the exact `precious` contents."
+      "qualityCheck": "Fair link case; symbolic-link creation depends on filesystem support.",
+      "verifies": "Repair removes the entry whose in-folder name is a symbolic link to an outside target and preserves the target content."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt says a direct regular file with violations is not resolved and identifies symbolic links as a way entries can reach the same file.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "The prompt makes an entry broken only when its path is not a regular file directly within the folder; this link reaches an in-folder regular file.",
       "fairness": "Prompt-stated",
       "name": "anEntryNamingALinkToAFileInTheStoreOwnsThatFile",
-      "qualityCheck": "Useful positive symlink case complementing the broken outside-link case.",
-      "verifies": "Repair removes the unrelated broken entry, retains the link entry, and leaves the target's exact violation contents intact."
+      "qualityCheck": "Fair converse case; symbolic-link creation can be restricted.",
+      "verifies": "Repair retains the entry whose symbolic link reaches an in-folder file and preserves the target's violation content."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt says the store will not touch files no entry points to; no entry records the stray link. It also says broken entries are discarded.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "“The TextFileBasedViolationStore will not touch any shared entries or files that no entry points to.”",
       "fairness": "Prompt-stated",
       "name": "aLinkNoEntryRecordsSurvivesRepairTogetherWithItsTarget",
-      "qualityCheck": "Checks an unowned link separately from an indexed link.",
-      "verifies": "Repair removes the broken index entry but leaves the unowned symlink path and its outside target/content intact."
+      "qualityCheck": "Direct orphan/link preservation check; link support is assumed.",
+      "verifies": "Repair removes the broken index entry but leaves the unowned symbolic link and outside target content unchanged."
     },
     {
-      "concerns": [],
-      "evidence": "A dangling link does not reach a regular file directly within the folder, so it meets the prompt's broken-entry definition.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "A dangling link does not point to a regular file directly within the folder, so it is “broken.”",
       "fairness": "Prompt-stated",
       "name": "anEntryNamingADanglingLinkIsBroken",
-      "qualityCheck": "Useful dangling-link classification case.",
-      "verifies": "Repair removes the entry naming a dangling symlink."
+      "qualityCheck": "Direct dangling-link case; link support is assumed.",
+      "verifies": "Repair removes the entry naming the dangling symbolic link."
     },
     {
-      "concerns": [],
-      "evidence": "The prompt supports removing both broken entries but does not require retaining the symlink object. Refutation search: searched prompt terms “dangling,” “symbolic,” “broken,” and “discarded”; searched repo source/tests/docs for dangling-link preservation or repair deletion. No same-form behavior found; removing the dangling link while discarding its broken entry is not prohibited.",
-      "fairness": "Not fair",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "Both entries fail the “regular file directly within the folder” condition; broken entries are discarded “without touching whatever they point to.”",
+      "fairness": "Prompt-stated",
       "name": "anEntryNamingADanglingLinkToAnotherEntrysAbsentNameIsBrokenLikeThatEntry",
-      "qualityCheck": "Both entries being discarded is fair; the surviving-symlink assertion is an unspecified filesystem-cleanup choice.",
-      "verifies": "Repair removes both entries and also requires the dangling symlink itself to remain a symlink."
+      "qualityCheck": "Checks link itself survives broken-entry removal.",
+      "verifies": "Repair removes both entries and leaves the dangling link itself as a symbolic link."
     },
     {
       "concerns": [],
-      "evidence": "The prompt makes absent/non-regular targets broken; the two distinct spellings do not reach a file and are not the same recorded filename.",
+      "evidence": "A missing target is not a regular file directly within the folder; the explicit absent-name sharing exception applies to entries with “the same file name,” not these distinct names.",
       "fairness": "Prompt-stated",
       "name": "entriesRecordingTwoSpellingsOfAnAbsentNameAreBothBroken",
-      "qualityCheck": "Good check that syntactically different absent paths do not become shared merely by normalization.",
-      "verifies": "Both entries (`gone` and `./gone`) are removed because neither spelling reaches a file."
+      "qualityCheck": "Useful contrast with identical absent names.",
+      "verifies": "Repair removes both `gone` and `./gone` entries because neither reaches a file."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says a non-broken entry with no violations is resolved and repair discards resolved entries and their files.",
+      "evidence": "“If an entry is not broken and its file has no violations it is resolved” and repair discards resolved entries and their files.",
       "fairness": "Prompt-stated",
       "name": "anEntryWhoseFileHoldsNoViolationsIsDiscardedTogetherWithItsFile",
-      "qualityCheck": "Direct test of the basic resolved-file case.",
-      "verifies": "Repair removes the entry and leaves only the index file."
+      "qualityCheck": "Direct empty-file case.",
+      "verifies": "Repair leaves an empty index and only the index file; the empty violation file and entry are removed."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt explicitly says repair discards resolved entries and their files, and that for a resolved symbolic link its target is deleted as well.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "“When set to `repair` resolved entries and the file they point to will be discarded. If a resolved entry is a symbolic link the file it points to will be deleted as well.”",
       "fairness": "Prompt-stated",
       "name": "aResolvedEntryNamingALinkDiscardsTheFileTheLinkPointsAt",
-      "qualityCheck": "Strongly discriminates deleting the target, not merely unlinking the symlink.",
-      "verifies": "Repair removes the entry, symlink name, and empty target, leaving only the index file."
+      "qualityCheck": "Explicit link-target behavior; link creation is environment-dependent.",
+      "verifies": "Repair removes the rule entry, symbolic link, and target, leaving only the index file."
     },
     {
       "concerns": [],
-      "evidence": "Prompt explicitly says files containing only line breaks are resolved; the other file contains a violation.",
+      "evidence": "“Files that only contain line breaks are also resolved”; a file containing a violation does not meet the no-violations condition.",
       "fairness": "Prompt-stated",
       "name": "aFileHoldingOnlyLineBreaksIsResolvedWhileAViolationKeepsItsEntry",
-      "qualityCheck": "Clear representative line-break-only case.",
-      "verifies": "Repair removes the line-break-only entry/file and retains the entry whose file contains a violation."
+      "qualityCheck": "Representative line-break and nonempty cases.",
+      "verifies": "Repair removes the entry/file containing only LF characters and retains the entry/file containing `some violation\\n`."
     },
     {
       "concerns": [],
-      "evidence": "The prompt says files containing only line breaks are resolved; Java's line-terminator convention recognizes CR, LF, and CRLF (JLS §3.4), matching the tested forms.",
-      "fairness": "Standard external semantics",
+      "evidence": "“Files that only contain line breaks are also resolved.”",
+      "fairness": "Prompt-stated",
       "name": "aFileOfWindowsLineBreaksIsResolvedLikeOneOfUnixLineBreaks",
-      "qualityCheck": "Useful coverage of common line-ending forms; does not test less common Unicode separators.",
-      "verifies": "Repair removes files containing only CRLF, CR, or LF characters and retains the entry with a violation."
+      "qualityCheck": "Good representative coverage of common newline forms.",
+      "verifies": "Repair removes files containing only CRLF, CR, or LF and retains the entry/file containing `a violation\\r\\n`."
     },
     {
       "concerns": [],
-      "evidence": "Prompt defines an entry with no violations as resolved; the other file contains one violation.",
+      "evidence": "“If an entry is not broken and its file has no violations it is resolved.”",
       "fairness": "Prompt-stated",
       "name": "anEntryHoldingOneViolationIsNotResolvedWhileAnEmptyOneIs",
-      "qualityCheck": "A basic contrast between zero and nonzero violations.",
-      "verifies": "Repair keeps the one-violation entry/file and removes the empty entry/file."
+      "qualityCheck": "Simple boundary case.",
+      "verifies": "Repair retains the file with one violation and removes the empty file and entry."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says entries with the same filename are shared even if nothing exists under that name, and shared entries/files are not touched.",
+      "evidence": "“Entries that point to the same file name are shared, even if nothing exists with that name” and shared entries remain shared.",
       "fairness": "Prompt-stated",
       "name": "aNameRecordedTwiceIsSharedAndNeitherEntryNorFileIsDiscarded",
-      "qualityCheck": "Directly covers identical-name sharing with an existing empty file.",
-      "verifies": "Both entries with identical name `shared` and the empty file remain; the broken entry is removed."
+      "qualityCheck": "Checks same-name sharing with an existing empty file.",
+      "verifies": "Both entries with the same filename remain and the empty shared file remains; the unrelated broken entry is removed."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt says entries pointing to the same file through symbolic links are shared, even if the file is outside the folder, and shared entries/files are not touched.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "Entries reaching the same file are shared “Including through a symbolic or hard link. Even if that file is outside the folder”; shared entries remain shared.",
       "fairness": "Prompt-stated",
       "name": "twoEntriesReachingOneFileByDifferentNamesShareItAndNeitherIsDiscarded",
-      "qualityCheck": "Broad but useful test of two distinct symlink-sharing scenarios.",
-      "verifies": "For an in-store symlink alias, both entries and names remain; for two outside-reaching names resolving to one outside file, both entries and the outside target remain."
+      "qualityCheck": "Excellent alias/outside case; relies on symbolic-link support.",
+      "verifies": "Repair retains entries reaching one in-folder file by a symbolic link; it also retains two entries reaching one outside file by traversal and symbolic-link names, preserving the link and target."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt explicitly includes hard links in same-file sharing and says shared entries are not touched.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "Entries reaching the same file are shared, “Including through a symbolic or hard link.”",
       "fairness": "Prompt-stated",
       "name": "twoEntriesNamingOneFileThroughHardLinksShareItAndNeitherIsDiscarded",
-      "qualityCheck": "Adds the hard-link case not exercised by the symlink tests.",
-      "verifies": "Both entries and hard-link names remain, although the shared file is empty."
+      "qualityCheck": "Hard-link behavior is explicit; hard-link creation may be unsupported.",
+      "verifies": "Both entries and both hard-link names for the same empty in-folder file remain after repair."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says shared entries/files are not touched, while unshared entries with no violations are resolved and discarded.",
+      "evidence": "Same-filename entries are shared, and the store “will not touch any shared entries or files.”",
       "fairness": "Prompt-stated",
       "name": "aSharedNameHoldingNoViolationsIsNotDiscardedEither",
-      "qualityCheck": "Good interaction test for sharing and resolution.",
-      "verifies": "Both entries sharing the empty file remain; the unshared empty entry and file are removed."
+      "qualityCheck": "Covers shared-empty versus unshared-empty.",
+      "verifies": "Two entries sharing an empty file remain, while a distinct resolved entry/file is removed."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says identical filenames are shared even when nothing exists and that shared entries remain shared; repair discards the lone broken entry.",
+      "evidence": "“Entries that point to the same file name are shared, even if nothing exists with that name” and a shared entry remains shared despite another condition.",
       "fairness": "Prompt-stated",
       "name": "anEntryBothSharedAndBrokenStaysSharedAndSurvivesRepair",
-      "qualityCheck": "Direct test of the prompt's shared-plus-broken rule.",
-      "verifies": "Both entries with the same absent name remain while the lone broken entry is removed; only the index remains as a regular file."
+      "qualityCheck": "Directly checks shared-but-absent edge case.",
+      "verifies": "Both entries with the same absent filename remain while the lone broken entry is removed; no data file is created."
     },
     {
       "concerns": [],
-      "evidence": "Prompt explicitly says the store will not touch files that no entry points to.",
+      "evidence": "“The TextFileBasedViolationStore will not touch any shared entries or files that no entry points to.”",
       "fairness": "Prompt-stated",
       "name": "anUnownedFileSurvivesRepairWhileABrokenEntryIsDiscarded",
-      "qualityCheck": "Clear unowned-file check.",
-      "verifies": "Repair removes the broken entry but retains the unowned file and its exact contents."
+      "qualityCheck": "Direct orphan-file check.",
+      "verifies": "Repair removes the broken entry and preserves `notes.txt` with exactly `written by hand`."
     },
     {
       "concerns": [],
-      "evidence": "The prompt says files no entry points to are not touched; the buried file has no entry pointing to it and is not directly in the store folder.",
+      "evidence": "An entry path must be a regular file directly within the folder; files with no entry pointing to them are not touched.",
       "fairness": "Prompt-stated",
       "name": "aFileInsideADirectoryInTheStoreFolderIsNeverACondition",
-      "qualityCheck": "Useful check that repair does not recursively treat buried files as indexed store files.",
-      "verifies": "Repair removes the unrelated broken entry, retains the healthy entry, and leaves a nested unowned file/content intact."
+      "qualityCheck": "Adds an unowned nested-file case.",
+      "verifies": "Repair removes the broken entry, retains the healthy entry, and preserves the unowned nested file's content."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says repair checks on-disk state at initialization even after the same folder was initialized before; after the first repair there are no broken/resolved entries left.",
+      "evidence": "Repair checks the index and folder on disk “even if the same folder was initialized before.”",
       "fairness": "Prompt-stated",
       "name": "aSecondInitializationOfARepairedFolderDiscardsNothing",
-      "qualityCheck": "Checks settled repeated repair behavior; compares filenames rather than every byte.",
-      "verifies": "After a second repair, the surviving entry remains, the filename list equals the post-first-repair list, and only the index and kept file remain."
+      "qualityCheck": "Checks settled/idempotent repair state.",
+      "verifies": "After a second repair initialization, the surviving entry and sorted direct-child file-name list equal their values after the first repair."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt says entries reaching the same file through symbolic links are shared and shared entries/files are not touched; the file has a violation.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "Entries reaching the same file through a symbolic link are shared, and “If an entry is shared and anything else it will remain shared.”",
       "fairness": "Prompt-stated",
       "name": "anEntryReachingAnotherEntrysFileThroughALinkIsNeverMovedAndRepairStaysSettled",
-      "qualityCheck": "Useful repeat-repair check for a shared alias and a valid entry.",
-      "verifies": "Both entries to the violating file remain across two repairs; the filename list stays equal to its post-first-repair value and file contents remain unchanged."
+      "qualityCheck": "Useful repeated-repair check; requires symbolic-link support.",
+      "verifies": "Two entries reaching one violating file by link/direct name remain after two repairs; the index, filenames, and target content remain stable."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says repair discards broken entries while a file with violations is not resolved; `contains` reports whether the store has a rule (`ViolationStore.java:59-60`).",
+      "evidence": "Repair discards broken entries; this assertion checks the resulting `stored.rules` index through the public store API.",
       "fairness": "Prompt-stated",
       "name": "aSeparatelyCreatedStoreObservesTheRepairedIndex",
-      "qualityCheck": "Checks the public API view after disk repair, not just the properties file.",
-      "verifies": "A new store reports `contains(broken rule) == false` and `contains(kept rule) == true` after repair."
+      "qualityCheck": "Checks persisted, user-visible index state.",
+      "verifies": "A separately created store returns `contains(broken rule) == false` and `contains(kept rule) == true` after repair."
     },
     {
       "concerns": [],
-      "evidence": "Prompt names `stored.rules`, requires discarding broken/resolved entries/files, and the kept file contains a violation. Existing index mapping convention is documented at `TextFileBasedViolationStore.java:42-52` and implemented at `:176-185`.",
+      "evidence": "Repair discards broken entries and resolved entries/files; the remaining entry points to a violating file.",
       "fairness": "Prompt-stated",
       "name": "aRepairedFolderHoldsOnlyTheIndexAndTheFilesItsSurvivingEntriesRecord",
-      "qualityCheck": "Good end-state assertion; exact filename continuity is also grounded in the existing mapping convention.",
-      "verifies": "The store contains exactly `stored.rules` and the kept file, and the surviving property still maps to the exact filename `kept`."
+      "qualityCheck": "Direct post-repair folder/index consistency check.",
+      "verifies": "The folder contains exactly `stored.rules` and the kept file, and the kept entry maps to that filename."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says repair discards resolved entries; public `contains` indicates whether a rule is stored (`ViolationStore.java:59-60`).",
+      "evidence": "Repair discards resolved entries and their files; the test checks whether the discarded rule remains in the store.",
       "fairness": "Prompt-stated",
       "name": "aRuleWhoseEntryWasDiscardedIsNoLongerFrozen",
-      "qualityCheck": "Simple API-level check of the repaired index.",
-      "verifies": "A reader initialized after repair reports `contains(resolvedRule) == false`."
+      "qualityCheck": "Public API consequence of index removal.",
+      "verifies": "After repair discards the resolved entry, a new reader returns `false` from `contains(resolvedRule)`."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says files with violations are not resolved and broken entries are discarded; the exact returned line form is established at `TextFileBasedViolationStore.java:198-203` and existing read tests at `TextFileBasedViolationStoreTest.java:79-84`.",
-      "fairness": "Prompt-stated",
+      "evidence": "The file is not resolved because it contains a violation. The list-returning API is at `TextFileBasedViolationStore.java:190-200`, with retrieval behavior tested at `TextFileBasedViolationStoreTest.java:78-91`.",
+      "fairness": "Repo-discoverable",
       "name": "repairKeepsAStillViolatingRuleFrozenWithItsViolations",
-      "qualityCheck": "Checks both index membership and usable violation data.",
-      "verifies": "The reader reports the rule present, returns exactly `one remaining violation`, and the index contains only that rule after the broken entry is removed."
+      "qualityCheck": "Integration check; list retrieval is established by existing tests.",
+      "verifies": "The reader reports the rule present, returns exactly `one remaining violation`, and the index contains only that rule."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says repair removes the resolved entry/file and the store can save violations. Existing save and index behavior is at `TextFileBasedViolationStore.java:146-185`; exact line reading is exercised at `TextFileBasedViolationStoreTest.java:79-84`.",
-      "fairness": "Prompt-stated",
+      "evidence": "The prompt requires forgetting a known rule saved with no violations. Existing save/retrieval behavior is at `TextFileBasedViolationStore.java:146-181,190-200`; the default constructor uses UUID filenames at `TextFileBasedViolationStore.java:95-105`.",
+      "fairness": "Repo-discoverable",
       "name": "aRepairedStoreCanFreezeARuleAgain",
-      "qualityCheck": "Good lifecycle integration check after repair.",
-      "verifies": "After repair, a new store saves the rule; `contains` is true, `getViolations` returns exactly `a new violation`, the index contains only the rule, and the old filename is absent."
+      "qualityCheck": "Good refreeze integration check; the filename assertion follows the default naming strategy.",
+      "verifies": "After repair removes the resolved entry, saving `a new violation` makes the rule present with exactly that violation; the old manually named `resolved` file is absent."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says repair discards the resolved entry. `FreezingArchRule.java:124-139` shows a missing rule is saved and evaluation returns a new success `EvaluationResult`.",
+      "evidence": "Repair discards resolved entries. `FreezingArchRule.java:120-139` stores a missing rule's current result and returns a success result.",
       "fairness": "Repo-discoverable",
       "name": "aRuleDiscardedByRepairFreezesAfreshOnTheNextFreezingArchRuleEvaluation",
-      "qualityCheck": "Useful integration test of the public freezing flow rather than only direct store calls.",
-      "verifies": "The first evaluation after repair has `result.hasViolation() == false`; afterward the store contains the rule and the old filename is absent."
+      "qualityCheck": "End-to-end integration assertion; more expansive than direct store unit tests.",
+      "verifies": "After repair removes the resolved entry, evaluation has `hasViolation() == false`, a reader reports the rule present, and the old `resolved` name is absent."
     },
     {
       "concerns": [],
-      "evidence": "Repair behavior is prompt-stated. Existing `TextFileBasedViolationStore.java:146-181` shows ordinary save keeps the index entry and writes the supplied list; existing empty-list read behavior is tested at `TextFileBasedViolationStoreTest.java:87-92`.",
-      "fairness": "Repo-discoverable",
+      "evidence": "“If using `repair` and saving no violations for a known rule it will forget the rule. Its entry will be removed and its file as well.” Existing empty-list store behavior is tested at `TextFileBasedViolationStoreTest.java:92-99`.",
+      "fairness": "Prompt-stated",
       "name": "storingNoViolationsUnderRepairForgetsTheEntryAndItsFile",
-      "qualityCheck": "Good contrast, though it combines repair behavior with pre-existing ignore-mode save behavior.",
-      "verifies": "An empty-list save under repair removes the known entry/file; under ignore the entry remains and `getViolations` is empty."
+      "qualityCheck": "Useful repair-versus-ignore contrast.",
+      "verifies": "An empty save after repair leaves no entry and only the index; the ignore-configured store retains its entry and returns an empty violation list."
     },
     {
       "concerns": [],
-      "evidence": "Prompt says forgetting a known rule removes its entry/file unless another entry shares the file, in which case only the entry is removed; it explicitly includes files outside the folder.",
+      "evidence": "“Unless another entry is sharing that file. In which case only the entry will be removed. Even if it points outside the folder.”",
       "fairness": "Prompt-stated",
       "name": "forgettingARuleWhoseNameEscapesTheFolderNeverTouchesAnythingOutside",
-      "qualityCheck": "Strong test of the outside-folder sharing exception.",
-      "verifies": "Saving no violations removes only the forgotten entry, retains the shared peer's exact outside-path mapping, and leaves the outside file/content unchanged."
+      "qualityCheck": "Directly checks shared outside-file preservation.",
+      "verifies": "Saving no violations removes only the selected entry; its outside-file peer remains with the exact `../outside.txt` value, and the outside file/content remains."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt says only the forgotten entry is removed when another entry shares the file and explicitly includes symbolic-link sharing; exact read behavior is in `TextFileBasedViolationStore.java:198-203`.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "“Unless another entry is sharing that file. In which case only the entry will be removed.”",
       "fairness": "Prompt-stated",
       "name": "forgettingARuleKeepsTheFileAnotherEntryStillRecords",
-      "qualityCheck": "Useful save-time symbolic-sharing case; related hard-link save coverage is absent.",
-      "verifies": "Saving no violations removes the forgotten entry but retains the keeping entry, link name, target/content, and the keeping rule's exact returned violation."
+      "qualityCheck": "Sharing assertion is fair; symbolic-link setup may be restricted.",
+      "verifies": "An empty save removes only the selected entry; the peer entry, both names, file content, and peer's retrieved violation remain."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt says a known rule saved with no violations is forgotten with its file, and explicitly says resolved symbolic-link targets are deleted as well. Public store API is in `ViolationStore.java:59-74`.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "A shared file means “only the entry will be removed”; sharing includes “through a symbolic or hard link.”",
+      "fairness": "Prompt-stated",
+      "name": "forgettingARuleKeepsTheFileAnotherEntryReachesThroughAHardLink",
+      "qualityCheck": "Hard-link setup may be unsupported by the filesystem.",
+      "verifies": "An empty save removes only the selected entry; the peer entry, both hard-link names, shared content, and peer's retrieved violation remain."
+    },
+    {
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "Repair-mode empty save forgets a known rule and removes its file; the prompt also says a resolved symbolic-link entry's target is deleted.",
       "fairness": "Prompt-stated",
       "name": "forgettingARuleWhoseEntryNamesALinkToAFileNoOtherEntryRecordsDiscardsLinkAndFile",
-      "qualityCheck": "Checks link and target cleanup together with remaining-rule usability.",
-      "verifies": "Saving no violations removes the entry, link name, and target; the other entry/file remains, `contains` is false for forgotten rule, and remaining rule returns its exact violation."
+      "qualityCheck": "Tests link-target deletion on save; requires symbolic-link support.",
+      "verifies": "An empty save removes the selected entry, link, and target; the unrelated kept entry/file remains, the forgotten rule is absent, and the kept violation is retrievable."
     },
     {
-      "concerns": [],
-      "evidence": "Prompt explicitly says failure to delete the file makes save fail and leaves the entry.",
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "“If it cannot delete the file of a rule it is forgetting it will fail to save and leave the entry.”",
       "fairness": "Prompt-stated",
       "name": "forgettingARuleWhoseFileCannotBeDeletedKeepsItsEntry",
-      "qualityCheck": "The behavioral assertion is direct, but its POSIX/privilege setup has an environment assumption noted overall.",
-      "verifies": "If deletion fails, save is rejected and the entry remains mapped to the exact filename; after permissions are restored, a later empty save removes the entry/file."
+      "qualityCheck": "Uses POSIX permissions and optional `setpriv`; can be skipped or fail on unsupported systems.",
+      "verifies": "When deletion is prevented, the probe reports `rejected, still stored` and the index retains the exact mapping; after permissions are restored, empty save removes the entry and file."
     },
     {
       "concerns": [],
-      "evidence": "Prompt explicitly says saving no violations for an unknown rule saves nothing.",
+      "evidence": "“If using `repair` and saving no violations for an unknown rule nothing will be saved.”",
       "fairness": "Prompt-stated",
       "name": "forgettingARuleTheIndexNeverKnewStoresNothingForIt",
-      "qualityCheck": "Direct test of the unknown-rule case.",
-      "verifies": "Saving no violations for an unknown rule leaves the index empty and creates no file beyond `stored.rules`."
+      "qualityCheck": "Direct unknown-rule case.",
+      "verifies": "An empty save for an unknown rule leaves the index empty and the folder containing only the index."
     },
     {
       "concerns": [],
-      "evidence": "Prompt distinguishes files with violations from resolved files and requires discarding broken entries; exact line reading is established at `TextFileBasedViolationStore.java:198-203`.",
-      "fairness": "Prompt-stated",
+      "evidence": "The file is not resolved when it contains a violation; list retrieval behavior is implemented at `TextFileBasedViolationStore.java:190-200` and exercised at `TextFileBasedViolationStoreTest.java:78-91`.",
+      "fairness": "Repo-discoverable",
       "name": "aStillViolatedRuleKeepsItsEntryUnderRepair",
-      "qualityCheck": "Checks the nonempty save path and surviving violation content.",
-      "verifies": "After saving one remaining violation under repair, the index contains only that rule and `getViolations` returns exactly `first violation`."
+      "qualityCheck": "One nonempty save case; existing tests establish retrieval semantics.",
+      "verifies": "A nonempty save retains the rule entry and `getViolations` returns exactly `first violation`."
+    },
+    {
+      "concerns": [
+        "environment_assumption"
+      ],
+      "evidence": "“The TextFileBasedViolationStore will not touch any shared entries or files that no entry points to.”",
+      "fairness": "Prompt-stated",
+      "name": "savingViolationsUnderRepairLeavesAFileAnotherEntrySharesUntouched",
+      "qualityCheck": "Tests several sharing mechanisms; link creation is environment-dependent.",
+      "verifies": "After selected nonempty saves, the index equals its pre-save properties and all same-name, symbolic-link, and hard-link shared files retain their exact original contents."
     },
     {
       "concerns": [],
-      "evidence": "Prompt explicitly says repair checks the index and folder as they are on disk during initialization, even if the same folder was initialized before.",
+      "evidence": "Repair checks the index and folder on disk “even if the same folder was initialized before.”",
       "fairness": "Prompt-stated",
       "name": "repairExaminesTheIndexAsItIsOnDiskAfterAnEarlierInitializationOfTheSameFolder",
-      "qualityCheck": "Directly tests the on-disk re-read requirement.",
-      "verifies": "After ignore initialization, the test replaces the on-disk index; repair then removes the new absent-file entry, leaving the index empty."
+      "qualityCheck": "Direct stale-cache/reinitialization case.",
+      "verifies": "After ignore initialization and an on-disk index replacement, repair removes the newly added absent-file entry, leaving the index empty."
     }
   ],
-  "unfairTestCount": 5,
-  "verdict": "FAIL"
+  "unfairTestCount": 0,
+  "verdict": "PASS"
 }
-Close
+```
 
 # Solution Quality
 Verdict
@@ -886,69 +881,69 @@ Verdict
 FAIL
 Summary
 
-Repair is broadly implemented, but a non-empty repair-mode save can overwrite a file shared by multiple rules.
+Repair correctly handles the principal cases, but aliased directory entries are misclassified as shared instead of broken.
 
 Scores
 
 
 Solution Comprehensiveness
 1/3 — Not Met
-The patch implements the configured ignore/repair modes, reloads the cached index from disk on repair initialization, classifies invalid or missing paths, line-break-only files, and shared references, and removes broken/resolved entries with the described deletion safeguards. However, a shared-file case is not protected across the full repair-mode save path: for a rule that already points to a shared file, saving a non-empty violation list proceeds to write that file. This contradicts the stated requirement not to touch shared entries/files.
+The patch implements the requested `ignore`/`repair` configuration, reloads the cached index from disk during repair initialization, distinguishes broken/resolved/shared entries, preserves unowned files, handles line-break-only contents, and forgets known rules on empty saves while guarding shared files. However, the physical-sharing classifier treats any existing filesystem object as a file: `StoreIntegrity.reachesAFile()` uses `Files.exists`, and `namesDenotingOneFileTwice()` groups matching canonical paths before `findingFor()` checks regular-file ownership. Thus, two entries naming the same directory through different spellings (for example `subdir` and `./subdir`) are marked shared and retained, although each points to a non-regular file and must be broken. This contradicts an explicit requirement, so comprehensiveness is not met.
 
 
 Code Quality
 3/3 — Fully Met
-The production changes are localized to the text-file store and a package-private integrity helper, with corresponding user-guide source and generated HTML updates. The helper separates path ownership, shared-file detection, and repair actions; synchronization and index reload fit the existing per-path cache design. No visible repository-gate violation or unrelated change is apparent. The shared-file write behavior is recorded as a comprehensiveness issue rather than a separate style issue.
+The production changes are organized around a focused integrity helper, use the existing store/index abstractions, synchronize repair and saves against the shared index, and document the new property in both the source guide and generated HTML. Apart from the correctness defect recorded under comprehensiveness, the patch is readable and in scope; no configured-gate violation or unrelated production change is evident.
 
 Issues
 
 high
 Comprehensiveness
-Repair-mode save can overwrite a shared file
+Directories can be mistaken for shared files
 
-With `default.integrity=repair`, if two rule entries point to the same existing file, initializing correctly classifies them as shared. But saving non-empty violations for either rule takes the ordinary `ensureRuleFileName`/`write` branch rather than checking whether another entry shares that file. `ownableTarget` accepts the path because it is the current rule's recorded direct file, so the write changes the content observed by the other rule as well. Preserve the shared file under repair—for example, reject the update before writing—rather than modifying it through one of its entries.
+For entries such as `subdir` and `./subdir`, `Files.exists` is true for both names and canonicalization identifies the same directory. The classifier marks both names shared before checking whether either path is a regular file, so repair preserves both entries instead of discarding them as broken. Restrict physical-file sharing detection to paths that denote regular files (while retaining the explicit same-recorded-name sharing rule for absent names).
 
-Evidence: The description promises: “The TextFileBasedViolationStore will not touch any shared entries or files that no entry points to.” In the patched `TextFileBasedViolationStore.save`, only empty violations in repair mode call `discard`; non-empty violations call `write` on the recorded file, and the existing-file path in `ownableTarget` does not test whether another entry records that same file.
+Evidence: Problem description: “If an entry points to a path that is not a regular file directly within the folder, it is broken.” In `StoreIntegrity`, `reachesAFile()` uses `Files.exists(...)`, and `findingFor()` returns `SHARED` before calling `isOwnedFile()`.
 
 Feedback
 
-The patch provides a thorough integrity reconciliation path: it refreshes the cached index before repair, handles direct-file and symbolic/hard-link identity, distinguishes broken from resolved entries, and keeps unowned files out of repair. The configuration and documentation changes are also scoped to the requested feature.
+The implementation covers the main lifecycle and ownership cases: repair reloads the on-disk index, avoids rewriting shared or unowned files, removes resolved entries and their targets, and handles empty saves without forgetting unknown rules. The configuration and user-guide changes are also appropriately scoped.
 
-One promised shared-file safeguard does not cover ordinary non-empty saves while repair is enabled. A save for one rule can overwrite a file still referenced by another rule, so the other rule's stored violations change too. Please guard that path before accepting the change; otherwise the implementation does not meet the stated shared-file contract.
+One concrete classification error prevents acceptance: distinct entry names that resolve to the same directory are treated as shared because the sharing scan tests existence rather than regular-file identity. Repair therefore retains entries that the stated contract defines as broken. Limit physical sharing checks to regular files; with that correction, the rest of the change appears maintainable.
 
-Completed in 320.6s
+Completed in 346.8s
 
-Hide raw output
+```json
 {
   "completed": true,
   "evaluation": {
     "code_quality": {
       "level": "Fully Met",
       "max_score": 3,
-      "reasoning": "The production changes are localized to the text-file store and a package-private integrity helper, with corresponding user-guide source and generated HTML updates. The helper separates path ownership, shared-file detection, and repair actions; synchronization and index reload fit the existing per-path cache design. No visible repository-gate violation or unrelated change is apparent. The shared-file write behavior is recorded as a comprehensiveness issue rather than a separate style issue.",
+      "reasoning": "The production changes are organized around a focused integrity helper, use the existing store/index abstractions, synchronize repair and saves against the shared index, and document the new property in both the source guide and generated HTML. Apart from the correctness defect recorded under comprehensiveness, the patch is readable and in scope; no configured-gate violation or unrelated production change is evident.",
       "score": 3
     },
     "issues": [
       {
         "criterion": "comprehensiveness",
-        "detail": "With `default.integrity=repair`, if two rule entries point to the same existing file, initializing correctly classifies them as shared. But saving non-empty violations for either rule takes the ordinary `ensureRuleFileName`/`write` branch rather than checking whether another entry shares that file. `ownableTarget` accepts the path because it is the current rule's recorded direct file, so the write changes the content observed by the other rule as well. Preserve the shared file under repair—for example, reject the update before writing—rather than modifying it through one of its entries.",
-        "evidence": "The description promises: “The TextFileBasedViolationStore will not touch any shared entries or files that no entry points to.” In the patched `TextFileBasedViolationStore.save`, only empty violations in repair mode call `discard`; non-empty violations call `write` on the recorded file, and the existing-file path in `ownableTarget` does not test whether another entry records that same file.",
+        "detail": "For entries such as `subdir` and `./subdir`, `Files.exists` is true for both names and canonicalization identifies the same directory. The classifier marks both names shared before checking whether either path is a regular file, so repair preserves both entries instead of discarding them as broken. Restrict physical-file sharing detection to paths that denote regular files (while retaining the explicit same-recorded-name sharing rule for absent names).",
+        "evidence": "Problem description: “If an entry points to a path that is not a regular file directly within the folder, it is broken.” In `StoreIntegrity`, `reachesAFile()` uses `Files.exists(...)`, and `findingFor()` returns `SHARED` before calling `isOwnedFile()`.",
         "severity": "high",
-        "title": "Repair-mode save can overwrite a shared file"
+        "title": "Directories can be mistaken for shared files"
       }
     ],
-    "overall_feedback": "The patch provides a thorough integrity reconciliation path: it refreshes the cached index before repair, handles direct-file and symbolic/hard-link identity, distinguishes broken from resolved entries, and keeps unowned files out of repair. The configuration and documentation changes are also scoped to the requested feature.\n\nOne promised shared-file safeguard does not cover ordinary non-empty saves while repair is enabled. A save for one rule can overwrite a file still referenced by another rule, so the other rule's stored violations change too. Please guard that path before accepting the change; otherwise the implementation does not meet the stated shared-file contract.",
+    "overall_feedback": "The implementation covers the main lifecycle and ownership cases: repair reloads the on-disk index, avoids rewriting shared or unowned files, removes resolved entries and their targets, and handles empty saves without forgetting unknown rules. The configuration and user-guide changes are also appropriately scoped.\n\nOne concrete classification error prevents acceptance: distinct entry names that resolve to the same directory are treated as shared because the sharing scan tests existence rather than regular-file identity. Repair therefore retains entries that the stated contract defines as broken. Limit physical sharing checks to regular files; with that correction, the rest of the change appears maintainable.",
     "solution_comprehensiveness": {
       "level": "Not Met",
       "max_score": 3,
-      "reasoning": "The patch implements the configured ignore/repair modes, reloads the cached index from disk on repair initialization, classifies invalid or missing paths, line-break-only files, and shared references, and removes broken/resolved entries with the described deletion safeguards. However, a shared-file case is not protected across the full repair-mode save path: for a rule that already points to a shared file, saving a non-empty violation list proceeds to write that file. This contradicts the stated requirement not to touch shared entries/files.",
+      "reasoning": "The patch implements the requested `ignore`/`repair` configuration, reloads the cached index from disk during repair initialization, distinguishes broken/resolved/shared entries, preserves unowned files, handles line-break-only contents, and forgets known rules on empty saves while guarding shared files. However, the physical-sharing classifier treats any existing filesystem object as a file: `StoreIntegrity.reachesAFile()` uses `Files.exists`, and `namesDenotingOneFileTwice()` groups matching canonical paths before `findingFor()` checks regular-file ownership. Thus, two entries naming the same directory through different spellings (for example `subdir` and `./subdir`) are marked shared and retained, although each points to a non-regular file and must be broken. This contradicts an explicit requirement, so comprehensiveness is not met.",
       "score": 1
     },
-    "summary": "Repair is broadly implemented, but a non-empty repair-mode save can overwrite a file shared by multiple rules.",
+    "summary": "Repair correctly handles the principal cases, but aliased directory entries are misclassified as shared instead of broken.",
     "verdict": "FAIL"
   },
-  "executionTimeSeconds": 320.574716,
-  "summary": "Repair is broadly implemented, but a non-empty repair-mode save can overwrite a file shared by multiple rules.",
+  "executionTimeSeconds": 346.808052,
+  "summary": "Repair correctly handles the principal cases, but aliased directory entries are misclassified as shared instead of broken.",
   "verdict": "FAIL"
 }
-Close
+```

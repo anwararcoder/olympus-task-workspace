@@ -10,7 +10,7 @@ If an entry points to a path that is not a regular file directly within the fold
 
 If an entry is not broken and its file has no violations it is resolved. Files that only contain line breaks are also resolved.
 
-Entries that point to the same file name are shared, even if nothing exists with that name. If multiple entries point to the same file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder.
+Entries that point to the same file name are shared, even if nothing exists with that name. If multiple entries point to the same regular file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder.
 
 The `TextFileBasedViolationStore` will not touch any shared entries or files that no entry points to. If an entry is shared and anything else it will remain shared.
 
