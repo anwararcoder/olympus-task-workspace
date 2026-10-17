@@ -3159,3 +3159,11 @@ lines" adds an LF entry and leaves the CRLF one pointing at the moved-away file.
 **Also this round:** The single-example invalid-name clause got two more examples in the same test: an unpaired surrogate (Java's path parser rejects it in any locale) and a 300-character name (the OS rejects it, `File name too long`). A null-only variant and a missing-file-only variant each pass the old suite and fail exactly the extended test.
 **Applies to:** Any test of a failure, rejection or rollback clause; any probe or helper whose status string embeds product state.
 **Seen in:** freeze-store-integrity, stable branch (nine-requirement version plus fixes), 2026-10-17. Platform rerun pending.
+
+### A hidden test in the repo's shared test source set must stay on the repo's minimum Java API
+**Trigger:** Self-review before submission: a new test line used `String.repeat` (Java 11) in a file that sits in the module's ordinary `src/test/java`, which the repo compiles with `-source 8 -target 8` and also tests on a real JDK 8 in its CI matrix.
+**Root cause:** The task image has only JDK 25, and Gradle passes `-source/-target 8` without `--release`, so javac resolves APIs against JDK 25. Every local run stayed green (the task's own target, the regular `compileTestJava`, the package's regular tests); the break would only show on a JDK 8 toolchain.
+**Solution:** Before adding a JDK API call to test code, check the repo's minimum supported Java version and use the helper its tests already use for the same job (here Guava `Strings.repeat`) instead of a newer JDK method. A green run in a newer-JDK image is no proof of compatibility; check the diff for APIs newer than the minimum.
+**Verification:** After the switch (identical 300-character string): regular `compileTestJava` builds; the freeze package through the regular `test` task passes 100/100 with both the old and the new test patch; the task target passes 46/46 three times; base 46/46 fail; baseline 42/42; the missing-file-only variant still fails the invalid-name test.
+**Applies to:** Any task whose hidden test file is compiled by a source set the repo also builds on older JDKs.
+**Seen in:** freeze-store-integrity, stable branch, 2026-10-17.
