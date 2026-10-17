@@ -433,6 +433,13 @@ untested (the solution may still pick one). Prompt-stated is necessary but NOT s
 contradicting repo helper is visible.
 **Applies to:** Any challenge that adds difficulty traps on top of a feature whose repo already ships related
 equality/normalization/serialization routines.
+**Refinement (2026-10-17):** The boundary is a contradicting helper versus a silent mechanism. Test Quality flagged a test
+that rewrites an index file between two initializations of one folder and expects repair to see the new content,
+because the repo caches that index per path for the life of the JVM, so reusing the cached copy was "a concrete
+alternative". A cache that only makes a stale read possible contradicts nothing: stating the condition inside the
+existing sentence ("as they are on disk during initialization, even if the same folder was initialized before")
+made the unchanged test fair on the next run. A variant without the reread fails exactly that test.
+**Seen in:** freeze-store-integrity, Test Quality on the nine-requirement version, 2026-10-17 (twice: submit and stable branches).
 
 ### Over-solve from a saturated mechanism is not fixable by adding fair tests
 **Trigger pattern:** Agent runs over-solve (e.g. 50% vs a <=40% target). Failure analysis shows all failures
@@ -3143,3 +3150,12 @@ lines" adds an LF entry and leaves the CRLF one pointing at the moved-away file.
 **Recurrence (2026-10-13, second):** The core cut (about 28 asks, 388 words, 59 tests) failed the count again, and its review summary named five areas (integrity modes, shared files, repair, save behavior, concurrency). Cut to nine asks in one area, `repair`: broken, resolved and shared entries, forgetting on an empty save, and the failed-delete case. Retire `fail` mode with its report and unowned-file scan, and concurrency. Where a kept test ran `fail` before or after a repair, delete only those lines and keep its repair assertions. 292 words, 46 tests. Verified locally: base 46/46 fail, reference 46/46 twice, baseline 42/42, and a variant without the update-permission check, ownership and regular-file checks, locking and the empty-apply skip passes 46/46. Replay of the recorded Nova runs puts the solve-rate floor from cutting at 40% (four runs pass every remaining test), so a lower target needs harder requirements, not further cuts. Each cut deletes evaluated test names (103 of 149 so far); ask support about the sticky manifest before relying on it. Platform rerun pending.
 **Applies to:** Any task failing the requirement count, and any change that moves tests from one configuration surface to another.
 **Seen in:** freeze-store-integrity, after the 2026-10-12 scope rule, 2026-10-13.
+
+### A failure clause promises only what it names: do not pin the state next to it
+**Trigger:** Test Quality FAIL (2 of 46 unfair) on tests three earlier runs had rated fair. One asserted, after a save that could not delete a rule's file, that the file still held its original violation (a byte check plus a probe status that embedded the stored violations), while the prompt said only that the save fails and leaves the entry. The report also called the probe's status string a brittle message, and made two coverage suggestions: a second invalid-name example beyond the null character, and narrowing that same test.
+**Root cause:** The clause names two outcomes (the operation fails, the entry stays); the test also pinned a third (the file is unchanged) that the reference happens to keep. An implementation that empties the file before its delete fails still meets the clause. A pass in earlier runs is no evidence that a co-assertion is stated, since the judge samples differently each run.
+**Solution:** Keep the test name and narrow it to what the clause names: the operation fails, the store still reports the entry, the index maps it to the same file name, and the later recovery path still works. Drop the content check, and compare the probe's status with a constant the probe itself defines, so it reads as the test's own protocol and not a product message. For each such fix build both witnesses: a valid variant the old test wrongly rejected, and a broken variant the new test still catches.
+**Verification:** A variant that empties the file before the failed delete passes the narrowed suite 46/46 and fails the old one only on that test ("still stored with []"). A variant that drops the entry although deletion failed fails the narrowed test ("forgotten"). Reference 46/46 twice, base 46/46 fail, baseline 42/42; test names unchanged.
+**Also this round:** The single-example invalid-name clause got two more examples in the same test: an unpaired surrogate (Java's path parser rejects it in any locale) and a 300-character name (the OS rejects it, `File name too long`). A null-only variant and a missing-file-only variant each pass the old suite and fail exactly the extended test.
+**Applies to:** Any test of a failure, rejection or rollback clause; any probe or helper whose status string embeds product state.
+**Seen in:** freeze-store-integrity, stable branch (nine-requirement version plus fixes), 2026-10-17. Platform rerun pending.
