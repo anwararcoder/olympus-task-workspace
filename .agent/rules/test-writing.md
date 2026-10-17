@@ -121,6 +121,13 @@ The platform predicts likely test paths and flags collisions when your new test 
 - Use contains-style assertions for non-contract diagnostics and implementation-dependent wording.
 - If review data shows repeated `FAIL_TEST_MISMATCH`, audit assertion contract alignment before adding new feature scope.
 
+## Fixing a Test Flagged Unfair
+
+- Never delete or rename a test once the platform has evaluated it: its id stays in the expected set, and a missing id fails a later gate.
+- When the complaint is that the prompt does not state what the test pins, state it: one clause in the description, in the sentence it qualifies and in the words the reviewer searched for, with the test left byte-identical.
+- Prove the clause's scope with a variant of the reference that implements the reviewer's alternative: it must fail exactly the flagged test. Any other test it fails needs the same statement.
+- Prompt text is not enough when a visible repo helper implements the opposite (an equality or normalization routine a solver would reuse): align the reference with that helper or relax the assertion in place.
+
 ## Trap Density Guidelines
 
 - Prefer intersection traps over repetitive type permutations.

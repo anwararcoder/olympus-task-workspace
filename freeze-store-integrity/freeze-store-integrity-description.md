@@ -4,7 +4,7 @@
 
 Ensure the `TextFileBasedViolationStore` maintains the integrity of its `stored.rules` index and files.
 
-Setting `default.integrity` to `repair` will check the index and folder during initialization. Defaulting to `ignore` which checks nothing.
+Setting `default.integrity` to `repair` will check the index and folder as they are on disk during initialization, even if the same folder was initialized before. Defaulting to `ignore` which checks nothing.
 
 If an entry points to a path that is not a regular file directly within the folder, it is broken. This also applies if the file name is not a valid path.
 

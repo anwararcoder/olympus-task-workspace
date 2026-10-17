@@ -85,7 +85,9 @@ rule wins. Update this digest when a log entry is promoted (see `.agent/rules/pr
   equal neighbours where a block is asserted, unguessable values).
 - Mutation-prove every discriminator: prove the mutation applied, and it must fail for the intended
   reason only. Replay saved passers: each FP discriminator fails exactly its own class.
-- Never rename or delete a test node id after the platform evaluated it; make it fair in place.
+- Never rename or delete a test node id after the platform evaluated it; make it fair in place. When the prompt does not
+  state what it pins, add one description clause and keep the test byte-identical; prompt text is not enough against a
+  visible repo helper that does the opposite.
 - Unguessable test file names with a random hex token; never the word "challenge".
 - Match the repo's style and run its own lint/checkstyle gate (it also runs on generated sources).
 
