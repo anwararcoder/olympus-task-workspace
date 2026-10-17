@@ -86,6 +86,10 @@ rule wins. Update this digest when a log entry is promoted (see `.agent/rules/pr
 - Mutation-prove every discriminator: prove the mutation applied, and it must fail for the intended
   reason only. Replay saved passers: each FP discriminator fails exactly its own class.
 - Never rename or delete a test node id after the platform evaluated it; make it fair in place.
+- Assert only the outcomes a clause names. Test Quality flags co-assertions on the state next to it
+  (what a failed operation left behind, what a discarded entry pointed to). Check the saved runs'
+  failure bodies first: narrow the test when that state is incidental, or state it in the existing
+  sentence when it is a safety property no run fails, and fix every test of the class at once.
 - Unguessable test file names with a random hex token; never the word "challenge".
 - Match the repo's style and run its own lint/checkstyle gate (it also runs on generated sources).
 

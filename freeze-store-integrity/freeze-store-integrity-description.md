@@ -14,7 +14,7 @@ Entries that point to the same file name are shared, even if nothing exists with
 
 The `TextFileBasedViolationStore` will not touch any shared entries or files that no entry points to. If an entry is shared and anything else it will remain shared.
 
-When set to `repair` broken entries will be discarded.
+When set to `repair` broken entries will be discarded without touching whatever they point to.
 
 When set to `repair` resolved entries and the file they point to will be discarded. If a resolved entry is a symbolic link the file it points to will be deleted as well.
 

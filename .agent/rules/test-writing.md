@@ -251,5 +251,6 @@ Requirements:
 - Tests verify things not in description (surprise tests)
 - Not matching repo's existing test style
 - Exact-text assertions on messages the description never pins (T7)
+- Co-assertions on state the clause does not name, such as what a failed operation left behind or what a discarded entry pointed to (T5): narrow the test when the state is incidental, or state the outcome in the description when it is a safety property, and fix every test of that class in one round
 - Order- or timing-dependent assertions that flip under Verify Flakiness (T2)
 - Test directories, files, or `test.sh` comments named after the challenge/quest/program (leak rule)
