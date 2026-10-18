@@ -53,8 +53,10 @@ rule wins. Update this digest when a log entry is promoted (see `.agent/rules/pr
   boolean setter, nil-vs-empty results, format tokens from external specs (inline them).
 - Scope absolute words ("every", "never", "all") to exactly what tests assert; carve out real
   exceptions.
-- When you change one sentence, reread its neighbours: an added type qualifier once turned an adjacent
-  sentence into a 77% solvability blocker.
+- When you change one sentence, reread its neighbours and re-judge every test fixture it reaches: an
+  added type qualifier once turned an adjacent sentence into a 77% solvability blocker, and a
+  clarifying sentence once made an absolute-path fixture read two ways (narrow it to what both
+  readings agree on).
 - A clause must be true at every stage it covers, including base code paths.
 - Keep the load-bearing token, cut the framing (description-quality vs interface-alignment gates).
 - Behaviourally simple, deeply hard: target "100% clear, brutally hard to execute"; over-clarity that

@@ -39,6 +39,10 @@ outcome in every failing run marks a clause the description never stated or stat
 discoverability defect, class 2), even when several such clauses coexist; a spread of different
 outcomes marks real difficulty. Clarify only the first kind, and replay the nearest run with only that
 fix to prove it passes before spending a batch.
+After a clarification, re-judge every test fixture the new words reach under both the reference's
+convention and the repo's own: a sentence that settles one cluster can make another fixture read two
+ways ("judged by the file it finally leads to" turned an absolute-name fixture unfair). Narrow such a
+fixture to the variant both readings agree on before the upload, and count the runs it was failing.
 
 ## Nearest-Agent Selection Rules
 
