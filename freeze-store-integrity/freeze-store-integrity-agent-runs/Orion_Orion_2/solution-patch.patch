@@ -1,0 +1,808 @@
+diff --git a/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java b/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java
+index fd2bcc5..3e7ee07 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java
++++ b/archunit/src/main/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStore.java
+@@ -20,8 +20,13 @@ import java.io.FileInputStream;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.nio.file.Files;
++import java.nio.file.InvalidPathException;
++import java.nio.file.NoSuchFileException;
++import java.nio.file.Path;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Properties;
++import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.regex.Pattern;
+@@ -33,7 +38,6 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+-import static com.google.common.io.Files.toByteArray;
+ import static com.tngtech.archunit.PublicAPI.Usage.ACCESS;
+ import static com.tngtech.archunit.PublicAPI.Usage.INHERITANCE;
+ import static com.tngtech.archunit.library.freeze.FreezingArchRule.ensureUnixLineBreaks;
+@@ -59,7 +63,11 @@ import static java.util.stream.Collectors.toList;
+  * default.path=...               # string: the path of the folder where violation files will be stored
+  * default.allowStoreCreation=... # boolean: whether to allow creating a new index file
+  * default.allowStoreUpdate=...   # boolean: whether to allow updating any store file
++ * default.integrity=...          # ignore (default) or repair: whether to repair the store during initialization
+  * </code></pre>
++ * In repair mode, broken index entries are removed, and entries without violations are removed together with their files.
++ * Entries sharing a file name or referring to the same file are left untouched, as are unreferenced files.
++ * Saving an empty list of violations forgets the rule and deletes its file unless another entry shares it.
+  */
+ @PublicAPI(usage = ACCESS)
+ public final class TextFileBasedViolationStore implements ViolationStore {
+@@ -73,6 +81,8 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+     private static final String ALLOW_STORE_CREATION_DEFAULT = "false";
+     private static final String ALLOW_STORE_UPDATE_PROPERTY_NAME = "default.allowStoreUpdate";
+     private static final String ALLOW_STORE_UPDATE_DEFAULT = "true";
++    private static final String INTEGRITY_PROPERTY_NAME = "default.integrity";
++    private static final String INTEGRITY_DEFAULT = "ignore";
+ 
+     private static final ConcurrentHashMap<String, FileSyncedProperties> STORED_RULES_BY_PATH = new ConcurrentHashMap<>();
+ 
+@@ -80,6 +90,7 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+ 
+     private boolean storeCreationAllowed;
+     private boolean storeUpdateAllowed;
++    private boolean repairIntegrity;
+     private File storeFolder;
+     private FileSyncedProperties storedRules;
+ 
+@@ -105,12 +116,82 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+     public void initialize(Properties properties) {
+         storeCreationAllowed = Boolean.parseBoolean(properties.getProperty(ALLOW_STORE_CREATION_PROPERTY_NAME, ALLOW_STORE_CREATION_DEFAULT));
+         storeUpdateAllowed = Boolean.parseBoolean(properties.getProperty(ALLOW_STORE_UPDATE_PROPERTY_NAME, ALLOW_STORE_UPDATE_DEFAULT));
++        String integrity = properties.getProperty(INTEGRITY_PROPERTY_NAME, INTEGRITY_DEFAULT);
++        checkInitialization("ignore".equals(integrity) || "repair".equals(integrity),
++                "Unknown store integrity mode '%s' (expected 'ignore' or 'repair')", integrity);
++        repairIntegrity = "repair".equals(integrity);
+         String path = properties.getProperty(STORE_PATH_PROPERTY_NAME, STORE_PATH_DEFAULT);
+         storeFolder = new File(path);
+         File storedRulesFile = getStoredRulesFile();
+         log.trace("Initializing {} at {}", TextFileBasedViolationStore.class.getSimpleName(), storedRulesFile.getAbsolutePath());
+         storedRules = getOrCreateStoredRules(storedRulesFile);
+         checkInitialization(storedRules.initializationSuccessful(), "Cannot create rule store at %s", storedRulesFile.getAbsolutePath());
++        if (repairIntegrity) {
++            repairStore();
++        }
++    }
++
++    private void repairStore() {
++        synchronized (storedRules) {
++            storedRules.reload();
++            Properties rules = storedRules.copy();
++            Set<String> sharedFileNames = findSharedFileNames(rules);
++            for (String ruleDescription : rules.stringPropertyNames()) {
++                String fileName = rules.getProperty(ruleDescription);
++                if (sharedFileNames.contains(fileName)) {
++                    continue;
++                }
++                if (isBroken(fileName)) {
++                    storedRules.remove(ruleDescription);
++                } else if (readStoreFile(fileName).chars().allMatch(character -> character == '\n' || character == '\r')) {
++                    deleteRuleFile(fileName);
++                    storedRules.remove(ruleDescription);
++                }
++            }
++        }
++    }
++
++    private Set<String> findSharedFileNames(Properties rules) {
++        List<String> fileNames = rules.stringPropertyNames().stream().map(rules::getProperty).collect(toList());
++        Set<String> sharedFileNames = new HashSet<>();
++        for (int index = 0; index < fileNames.size(); index++) {
++            for (int otherIndex = index + 1; otherIndex < fileNames.size(); otherIndex++) {
++                String fileName = fileNames.get(index);
++                String otherFileName = fileNames.get(otherIndex);
++                if (pointToSameFile(fileName, otherFileName)) {
++                    sharedFileNames.add(fileName);
++                    sharedFileNames.add(otherFileName);
++                }
++            }
++        }
++        return sharedFileNames;
++    }
++
++    private boolean pointToSameFile(String fileName, String otherFileName) {
++        if (fileName.equals(otherFileName)) {
++            return true;
++        }
++        try {
++            return Files.isSameFile(resolveRuleFile(fileName), resolveRuleFile(otherFileName));
++        } catch (IOException | InvalidPathException e) {
++            return false;
++        }
++    }
++
++    private boolean isBroken(String fileName) {
++        try {
++            Path ruleFile = resolveRuleFile(fileName);
++            Path folder = storeFolder.toPath().toRealPath();
++            return !Files.isRegularFile(ruleFile)
++                    || !folder.equals(ruleFile.toAbsolutePath().getParent().toRealPath())
++                    || !folder.equals(ruleFile.toRealPath().getParent());
++        } catch (IOException | InvalidPathException e) {
++            return true;
++        }
++    }
++
++    private Path resolveRuleFile(String fileName) {
++        return storeFolder.toPath().resolve(fileName);
+     }
+ 
+     private FileSyncedProperties getOrCreateStoredRules(File storedRulesFile) {
+@@ -150,17 +231,56 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+                     "Updating frozen violations is disabled (enable by configuration %s.%s=true)",
+                     ViolationStoreFactory.FREEZE_STORE_PROPERTY_NAME, ALLOW_STORE_UPDATE_PROPERTY_NAME));
+         }
+-        String ruleFileName = ensureRuleFileName(rule);
+-        write(violations, new File(storeFolder, ruleFileName));
++        synchronized (storedRules) {
++            if (repairIntegrity && violations.isEmpty()) {
++                forgetRule(rule);
++            } else {
++                String ruleFileName = ensureRuleFileName(rule);
++                write(violations, resolveRuleFile(ruleFileName));
++            }
++        }
+     }
+ 
+-    private void write(List<String> violations, File ruleDetails) {
++    private void forgetRule(ArchRule rule) {
++        String ruleDescription = ensureUnixLineBreaks(rule.getDescription());
++        String fileName = storedRules.getProperty(ruleDescription);
++        if (fileName == null) {
++            return;
++        }
++        if (!findSharedFileNames(storedRules.copy()).contains(fileName)) {
++            deleteRuleFile(fileName);
++        }
++        storedRules.remove(ruleDescription);
++    }
++
++    private void deleteRuleFile(String fileName) {
++        try {
++            Path ruleFile = resolveRuleFile(fileName);
++            Path target = realPathIfExists(ruleFile);
++            Files.deleteIfExists(target);
++            if (!target.equals(ruleFile)) {
++                Files.deleteIfExists(ruleFile);
++            }
++        } catch (IOException | InvalidPathException e) {
++            throw new StoreUpdateFailedException(e);
++        }
++    }
++
++    private Path realPathIfExists(Path file) throws IOException {
++        try {
++            return file.toRealPath();
++        } catch (NoSuchFileException e) {
++            return file;
++        }
++    }
++
++    private void write(List<String> violations, Path ruleDetails) {
+         StringBuilder builder = new StringBuilder();
+         for (String violation : violations) {
+             builder.append(escape(violation)).append("\n");
+         }
+         try {
+-            Files.write(ruleDetails.toPath(), builder.toString().getBytes(UTF_8));
++            Files.write(ruleDetails, builder.toString().getBytes(UTF_8));
+         } catch (IOException e) {
+             throw new StoreUpdateFailedException(e);
+         }
+@@ -204,7 +324,7 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+ 
+     private String readStoreFile(String fileName) {
+         try {
+-            String result = new String(toByteArray(new File(storeFolder, fileName)), UTF_8);
++            String result = new String(Files.readAllBytes(resolveRuleFile(fileName)), UTF_8);
+             return ensureUnixLineBreaks(result);
+         } catch (IOException e) {
+             throw new StoreReadException(e);
+@@ -213,7 +333,7 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+ 
+     private static class FileSyncedProperties {
+         private final File propertiesFile;
+-        private final Properties loadedProperties;
++        private Properties loadedProperties;
+ 
+         FileSyncedProperties(File file) {
+             propertiesFile = initializePropertiesFile(file);
+@@ -254,11 +374,24 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+             return result;
+         }
+ 
+-        boolean containsKey(String propertyName) {
++        synchronized void reload() {
++            if (initializePropertiesFile(propertiesFile) == null) {
++                throw new StoreInitializationFailedException(String.format("Cannot create rule store at %s", propertiesFile.getAbsolutePath()));
++            }
++            loadedProperties = loadRulesFrom(propertiesFile);
++        }
++
++        synchronized Properties copy() {
++            Properties result = new Properties();
++            result.putAll(loadedProperties);
++            return result;
++        }
++
++        synchronized boolean containsKey(String propertyName) {
+             return loadedProperties.containsKey(ensureUnixLineBreaks(propertyName));
+         }
+ 
+-        String getProperty(String propertyName) {
++        synchronized String getProperty(String propertyName) {
+             return loadedProperties.getProperty(ensureUnixLineBreaks(propertyName));
+         }
+ 
+@@ -273,6 +406,12 @@ public final class TextFileBasedViolationStore implements ViolationStore {
+             return null;
+         }
+ 
++        synchronized void remove(String key) {
++            if (loadedProperties.remove(key) != null) {
++                syncFileSystem();
++            }
++        }
++
+         private void syncFileSystem() {
+             try (FileOutputStream outputStream = new FileOutputStream(propertiesFile)) {
+                 loadedProperties.store(outputStream, "");
+diff --git a/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreConcurrencyTest.java b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreConcurrencyTest.java
+index 96dbd8c..07a4e9a 100644
+--- a/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreConcurrencyTest.java
++++ b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreConcurrencyTest.java
+@@ -74,6 +74,27 @@ public class TextFileBasedViolationStoreConcurrencyTest {
+         }
+     }
+ 
++    @Test
++    public void is_safe_when_repair_initialization_and_saves_run_concurrently() throws Exception {
++        int ruleCount = 20;
++        Properties properties = defaultStoreProperties();
++        properties.setProperty("default.integrity", "repair");
++
++        runConcurrently(ruleCount, (ruleIndex, startSignal) -> {
++            ViolationStore instanceStore = new TextFileBasedViolationStore();
++            startSignal.await();
++            instanceStore.initialize(properties);
++            instanceStore.save(rule("concurrent rule " + ruleIndex), ImmutableList.of("violation " + ruleIndex));
++        });
++
++        assertThat(readProperties(new File(configuredFolder, "stored.rules"))).hasSize(ruleCount);
++        ViolationStore readerStore = new TextFileBasedViolationStore();
++        readerStore.initialize(properties);
++        for (int ruleIndex = 0; ruleIndex < ruleCount; ruleIndex++) {
++            assertThat(readerStore.getViolations(rule("concurrent rule " + ruleIndex))).containsExactly("violation " + ruleIndex);
++        }
++    }
++
+     @SuppressWarnings("resource") // only available in Java 19 and later
+     private void runConcurrently(int taskCount, ConcurrentTask task) throws Exception {
+         ExecutorService executor = Executors.newFixedThreadPool(8);
+diff --git a/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreIntegrityTest.java b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreIntegrityTest.java
+new file mode 100644
+index 0000000..40e5414
+--- /dev/null
++++ b/archunit/src/test/java/com/tngtech/archunit/library/freeze/TextFileBasedViolationStoreIntegrityTest.java
+@@ -0,0 +1,479 @@
++package com.tngtech.archunit.library.freeze;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.file.FileSystemException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Properties;
++import java.util.stream.Stream;
++
++import com.google.common.collect.ImmutableList;
++import com.tngtech.archunit.lang.ArchRule;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.Arguments;
++import org.junit.jupiter.params.provider.MethodSource;
++import org.junit.jupiter.params.provider.NullAndEmptySource;
++import org.junit.jupiter.params.provider.NullSource;
++import org.junit.jupiter.params.provider.ValueSource;
++import org.opentest4j.TestAbortedException;
++
++import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
++import static java.nio.charset.StandardCharsets.UTF_8;
++import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++class TextFileBasedViolationStoreIntegrityTest {
++    @TempDir
++    Path temporaryFolder;
++
++    private Path storeFolder;
++
++    @BeforeEach
++    void setUp() throws IOException {
++        storeFolder = Files.createDirectory(temporaryFolder.resolve("store"));
++    }
++
++    @ParameterizedTest
++    @NullSource
++    @ValueSource(strings = "ignore")
++    void ignores_integrity_by_default_and_when_configured(String integrity) throws IOException {
++        Path resolved = writeFile("resolved", "\n\r\n");
++        Path orphan = writeFile("orphan", "");
++        Path directory = Files.createDirectory(storeFolder.resolve("directory"));
++        writeIndex("resolved rule", "resolved", "missing rule", "missing", "directory rule", "directory", "invalid rule", "invalid\0name");
++        byte[] originalIndex = Files.readAllBytes(indexFile());
++
++        TextFileBasedViolationStore store = initializeStore(integrity);
++
++        assertThat(store.contains(rule("resolved rule"))).isTrue();
++        assertThat(store.contains(rule("missing rule"))).isTrue();
++        assertThat(store.contains(rule("directory rule"))).isTrue();
++        assertThat(store.contains(rule("invalid rule"))).isTrue();
++        assertThat(Files.readAllBytes(indexFile())).isEqualTo(originalIndex);
++        assertThat(resolved).hasContent("\n\r\n");
++        assertThat(orphan).exists();
++        assertThat(directory).isDirectory();
++    }
++
++    @Test
++    void repair_discards_broken_entries_without_deleting_their_targets() throws IOException {
++        Path valid = writeFile("valid", "violation\n");
++        Path directory = Files.createDirectory(storeFolder.resolve("directory"));
++        Path nested = Files.write(directory.resolve("nested"), new byte[0]);
++        Path relativeOutside = Files.write(temporaryFolder.resolve("relative-outside"), new byte[0]);
++        Path absoluteOutside = Files.write(temporaryFolder.resolve("absolute-outside"), new byte[0]);
++        writeIndex("valid rule", "valid", "missing rule", "missing", "directory rule", "directory", "nested rule", "directory/nested",
++                "relative outside rule", "../relative-outside", "absolute outside rule", absoluteOutside.toString(),
++                "invalid rule", "invalid\0name", "empty name rule", "");
++
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        assertThat(readIndex()).containsOnlyKeys("valid rule");
++        assertThat(store.contains(rule("valid rule"))).isTrue();
++        assertThat(store.contains(rule("missing rule"))).isFalse();
++        assertThat(valid).hasContent("violation\n");
++        assertThat(directory).isDirectory();
++        assertThat(nested).exists();
++        assertThat(relativeOutside).exists();
++        assertThat(absoluteOutside).exists();
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"", "\n", "\n\n", "\r\n", "\r", "\r\n\n\r"})
++    void repair_discards_resolved_entries_and_their_files_but_not_orphans(String contents) throws IOException {
++        Path resolved = writeFile("resolved", contents);
++        Path valid = writeFile("valid", "violation\n");
++        Path emptyOrphan = writeFile("empty-orphan", "");
++        Path nonemptyOrphan = writeFile("nonempty-orphan", "unreferenced\n");
++        writeIndex("resolved rule", "resolved", "valid rule", "valid");
++
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        assertThat(store.contains(rule("resolved rule"))).isFalse();
++        assertThat(readIndex()).containsOnlyKeys("valid rule");
++        assertThat(resolved).doesNotExist();
++        assertThat(valid).hasContent("violation\n");
++        assertThat(emptyOrphan).exists();
++        assertThat(nonemptyOrphan).hasContent("unreferenced\n");
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"violation\n", " \n", "\t\r\n", "\\\n"})
++    void repair_preserves_files_with_violations(String contents) throws IOException {
++        Path violations = writeFile("violations", contents);
++        writeIndex("some rule", "violations");
++
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        assertThat(store.contains(rule("some rule"))).isTrue();
++        assertThat(readIndex()).containsEntry("some rule", "violations");
++        assertThat(Files.readAllBytes(violations)).isEqualTo(contents.getBytes(UTF_8));
++    }
++
++    @Test
++    void repair_reloads_the_disk_index_even_if_the_folder_was_initialized_before() throws IOException {
++        Path oldFile = writeFile("old", "old violation\n");
++        writeIndex("old rule", "old");
++        TextFileBasedViolationStore previousStore = initializeStore("ignore");
++        Path resolved = writeFile("resolved", "");
++        writeFile("current", "current violation\n");
++        writeIndex("resolved rule", "resolved", "current rule", "current", "missing rule", "missing");
++
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        assertThat(readIndex()).containsOnlyKeys("current rule");
++        assertThat(store.contains(rule("current rule"))).isTrue();
++        assertThat(store.contains(rule("old rule"))).isFalse();
++        assertThat(previousStore.contains(rule("current rule"))).isTrue();
++        assertThat(previousStore.contains(rule("old rule"))).isFalse();
++        assertThat(resolved).doesNotExist();
++        assertThat(oldFile).hasContent("old violation\n");
++    }
++
++    @Test
++    void repair_rechecks_the_disk_index_and_files_on_every_initialization() throws IOException {
++        Path violations = writeFile("violations", "violation\n");
++        writeIndex("some rule", "violations");
++        TextFileBasedViolationStore store = initializeStore("repair");
++        Files.write(violations, "\n".getBytes(UTF_8));
++        writeFile("new", "new violation\n");
++        writeIndex("some rule", "violations", "new rule", "new", "missing rule", "missing");
++
++        store.initialize(storeProperties("repair"));
++
++        assertThat(readIndex()).containsOnlyKeys("new rule");
++        assertThat(store.contains(rule("some rule"))).isFalse();
++        assertThat(store.contains(rule("new rule"))).isTrue();
++        assertThat(violations).doesNotExist();
++    }
++
++    @Test
++    void repair_recreates_a_missing_index_without_reusing_cached_entries() throws IOException {
++        Path violations = writeFile("violations", "violation\n");
++        writeIndex("some rule", "violations");
++        TextFileBasedViolationStore store = initializeStore("repair");
++        Files.delete(indexFile());
++
++        store.initialize(storeProperties("repair"));
++
++        assertThat(indexFile()).isRegularFile();
++        assertThat(readIndex()).isEmpty();
++        assertThat(store.contains(rule("some rule"))).isFalse();
++        assertThat(violations).hasContent("violation\n");
++    }
++
++    @Test
++    void repair_uses_index_entries_as_stored_even_with_windows_line_breaks_in_descriptions() throws IOException {
++        Path resolved = writeFile("resolved", "");
++        Path shared = writeFile("shared", "\n");
++        writeIndex("resolved\r\nrule", "resolved", "broken\r\nrule", "missing", "first\r\nrule", "shared", "second rule", "shared");
++
++        initializeStore("repair");
++
++        assertThat(readIndex()).containsOnlyKeys("first\r\nrule", "second rule");
++        assertThat(readIndex()).containsEntry("first\r\nrule", "shared");
++        assertThat(resolved).doesNotExist();
++        assertThat(shared).hasContent("\n");
++    }
++
++    @ParameterizedTest
++    @NullAndEmptySource
++    @ValueSource(strings = {"\n", "violation\n"})
++    void repair_preserves_entries_sharing_a_file_name_even_when_missing_or_resolved(String contents) throws IOException {
++        if (contents != null) {
++            writeFile("shared", contents);
++        }
++        writeIndex("first rule", "shared", "second rule", "shared", "broken rule", "missing");
++
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        assertThat(readIndex()).containsOnlyKeys("first rule", "second rule");
++        assertThat(store.contains(rule("first rule"))).isTrue();
++        assertThat(store.contains(rule("second rule"))).isTrue();
++        assertThat(Files.exists(storeFolder.resolve("shared"))).isEqualTo(contents != null);
++        if (contents != null) {
++            assertThat(Files.readAllBytes(storeFolder.resolve("shared"))).isEqualTo(contents.getBytes(UTF_8));
++        }
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"invalid\0name", "directory", "../outside"})
++    void repair_preserves_shared_entries_even_when_broken(String fileName) throws IOException {
++        Files.createDirectory(storeFolder.resolve("directory"));
++        Path outside = Files.write(temporaryFolder.resolve("outside"), new byte[0]);
++        writeIndex("first rule", fileName, "second rule", fileName, "broken rule", "missing");
++
++        initializeStore("repair");
++
++        assertThat(readIndex()).containsOnlyKeys("first rule", "second rule");
++        assertThat(readIndex()).containsEntry("first rule", fileName).containsEntry("second rule", fileName);
++        assertThat(outside).exists();
++        assertThat(storeFolder.resolve("directory")).isDirectory();
++    }
++
++    @ParameterizedTest
++    @MethodSource("sharedFiles")
++    void repair_preserves_entries_sharing_a_file_through_links(boolean symbolic, boolean outside, String contents) throws IOException {
++        Path target = Files.write((outside ? temporaryFolder : storeFolder).resolve("target"), contents.getBytes(UTF_8));
++        Path alias = createLink("alias", target, symbolic);
++        String targetFileName = outside ? target.toString() : "target";
++        writeIndex("target rule", targetFileName, "alias rule", "alias", "broken rule", "missing");
++
++        initializeStore("repair");
++
++        assertThat(readIndex()).containsOnlyKeys("target rule", "alias rule");
++        assertThat(readIndex()).containsEntry("target rule", targetFileName).containsEntry("alias rule", "alias");
++        assertThat(Files.readAllBytes(target)).isEqualTo(contents.getBytes(UTF_8));
++        assertThat(Files.readAllBytes(alias)).isEqualTo(contents.getBytes(UTF_8));
++        assertThat(Files.exists(alias, NOFOLLOW_LINKS)).isTrue();
++    }
++
++    static Stream<Arguments> sharedFiles() {
++        return Stream.of(true, false).flatMap(symbolic -> Stream.of(true, false)
++                .flatMap(outside -> Stream.of("", "violation\n").map(contents -> Arguments.of(symbolic, outside, contents))));
++    }
++
++    @Test
++    void repair_deletes_a_resolved_symbolic_link_and_its_target() throws IOException {
++        Path target = writeFile("target", "\n");
++        Path alias = createLink("alias", target, true);
++        writeIndex("some rule", "alias");
++
++        initializeStore("repair");
++
++        assertThat(readIndex()).isEmpty();
++        assertThat(target).doesNotExist();
++        assertThat(Files.exists(alias, NOFOLLOW_LINKS)).isFalse();
++    }
++
++    @Test
++    void repair_discards_broken_symbolic_links_without_deleting_them_or_their_targets() throws IOException {
++        Path outside = Files.write(temporaryFolder.resolve("outside"), new byte[0]);
++        Path outsideLink = createLink("outside-link", outside, true);
++        Path danglingLink = createLink("dangling-link", storeFolder.resolve("missing"), true);
++        writeIndex("outside rule", "outside-link", "dangling rule", "dangling-link");
++
++        initializeStore("repair");
++
++        assertThat(readIndex()).isEmpty();
++        assertThat(outside).exists();
++        assertThat(Files.isSymbolicLink(outsideLink)).isTrue();
++        assertThat(Files.isSymbolicLink(danglingLink)).isTrue();
++    }
++
++    @Test
++    void repair_discards_links_outside_the_store_root_even_if_their_targets_are_inside() throws IOException {
++        Path nestedTarget = writeFile("nested-target", "");
++        Path outsideTarget = writeFile("outside-target", "");
++        Path directory = Files.createDirectory(storeFolder.resolve("directory"));
++        Path nestedLink = createLink(directory.resolve("link"), nestedTarget, true);
++        Path outsideLink = createLink(temporaryFolder.resolve("outside-link"), outsideTarget, true);
++        writeIndex("nested rule", "directory/link", "outside rule", outsideLink.toString());
++
++        initializeStore("repair");
++
++        assertThat(readIndex()).isEmpty();
++        assertThat(nestedTarget).exists();
++        assertThat(outsideTarget).exists();
++        assertThat(Files.isSymbolicLink(nestedLink)).isTrue();
++        assertThat(Files.isSymbolicLink(outsideLink)).isTrue();
++    }
++
++    @Test
++    void repair_deletes_only_the_indexed_hard_link_of_a_resolved_file() throws IOException {
++        Path target = writeFile("unindexed", "");
++        Path alias = createLink("alias", target, false);
++        writeIndex("some rule", "alias");
++
++        initializeStore("repair");
++
++        assertThat(readIndex()).isEmpty();
++        assertThat(target).exists();
++        assertThat(alias).doesNotExist();
++    }
++
++    @Test
++    void saving_no_violations_for_an_unknown_rule_does_not_create_an_entry_or_file() throws IOException {
++        TextFileBasedViolationStore store = new TextFileBasedViolationStore(description -> {
++            throw new AssertionError("No file name should be requested");
++        });
++        store.initialize(storeProperties("repair"));
++        byte[] originalIndex = Files.readAllBytes(indexFile());
++
++        store.save(rule("unknown rule"), ImmutableList.of());
++
++        assertThat(store.contains(rule("unknown rule"))).isFalse();
++        assertThat(Files.readAllBytes(indexFile())).isEqualTo(originalIndex);
++        assertThat(storeFolder.toFile().list()).containsExactly("stored.rules");
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"some rule", "multi\nline rule", "multi\r\nline rule"})
++    void saving_no_violations_for_a_known_rule_forgets_the_rule_and_its_file(String description) throws IOException {
++        TextFileBasedViolationStore store = initializeStore("repair");
++        ArchRule rule = rule(description);
++        store.save(rule, ImmutableList.of("violation"));
++        Path violations = storeFolder.resolve((String) readIndex().values().iterator().next());
++
++        store.save(rule, ImmutableList.of());
++
++        assertThat(store.contains(rule)).isFalse();
++        assertThat(readIndex()).isEmpty();
++        assertThat(violations).doesNotExist();
++    }
++
++    @Test
++    void saving_no_violations_forgets_a_rule_even_if_its_file_is_already_missing() throws IOException {
++        writeFile("violations", "violation\n");
++        writeIndex("some rule", "violations");
++        TextFileBasedViolationStore store = initializeStore("repair");
++        Files.delete(storeFolder.resolve("violations"));
++
++        store.save(rule("some rule"), ImmutableList.of());
++
++        assertThat(store.contains(rule("some rule"))).isFalse();
++        assertThat(readIndex()).isEmpty();
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"shared", "missing", "invalid\0name", "../outside"})
++    void saving_no_violations_removes_only_the_entry_when_its_file_name_is_shared(String fileName) throws IOException {
++        Path shared = writeFile("shared", "\n");
++        Path outside = Files.write(temporaryFolder.resolve("outside"), new byte[0]);
++        writeIndex("first rule", fileName, "second rule", fileName);
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        store.save(rule("first rule"), ImmutableList.of());
++
++        assertThat(store.contains(rule("first rule"))).isFalse();
++        assertThat(store.contains(rule("second rule"))).isTrue();
++        assertThat(readIndex()).containsOnlyKeys("second rule").containsEntry("second rule", fileName);
++        assertThat(shared).hasContent("\n");
++        assertThat(outside).exists();
++    }
++
++    @ParameterizedTest
++    @MethodSource("sharedFiles")
++    void saving_no_violations_preserves_shared_links_then_deletes_only_the_last_referenced_path(
++            boolean symbolic, boolean outside, String contents) throws IOException {
++        Path target = Files.write((outside ? temporaryFolder : storeFolder).resolve("target"), contents.getBytes(UTF_8));
++        Path alias = createLink("alias", target, symbolic);
++        writeIndex("target rule", target.toString(), "alias rule", "alias");
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        store.save(rule("target rule"), ImmutableList.of());
++
++        assertThat(readIndex()).containsOnlyKeys("alias rule");
++        assertThat(Files.exists(alias, NOFOLLOW_LINKS)).isTrue();
++        assertThat(Files.readAllBytes(target)).isEqualTo(contents.getBytes(UTF_8));
++
++        store.save(rule("alias rule"), ImmutableList.of());
++
++        assertThat(readIndex()).isEmpty();
++        assertThat(Files.exists(alias, NOFOLLOW_LINKS)).isFalse();
++        assertThat(Files.exists(target)).isEqualTo(!symbolic);
++    }
++
++    @Test
++    void saving_no_violations_deletes_an_outside_file_when_its_last_shared_entry_is_forgotten() throws IOException {
++        Path outside = Files.write(temporaryFolder.resolve("outside"), new byte[0]);
++        writeIndex("first rule", "../outside", "second rule", "../outside");
++        TextFileBasedViolationStore store = initializeStore("repair");
++
++        store.save(rule("first rule"), ImmutableList.of());
++        assertThat(outside).exists();
++
++        store.save(rule("second rule"), ImmutableList.of());
++
++        assertThat(readIndex()).isEmpty();
++        assertThat(outside).doesNotExist();
++    }
++
++    @Test
++    void saving_no_violations_fails_and_leaves_the_entry_if_the_file_cannot_be_deleted() throws IOException {
++        writeFile("violations", "violation\n");
++        writeIndex("some rule", "violations");
++        TextFileBasedViolationStore store = initializeStore("repair");
++        Files.delete(storeFolder.resolve("violations"));
++        Path directory = Files.createDirectory(storeFolder.resolve("violations"));
++        Path child = Files.write(directory.resolve("child"), new byte[0]);
++        byte[] originalIndex = Files.readAllBytes(indexFile());
++
++        assertThatThrownBy(() -> store.save(rule("some rule"), ImmutableList.of()))
++                .isInstanceOf(StoreUpdateFailedException.class)
++                .hasCauseInstanceOf(IOException.class);
++
++        assertThat(store.contains(rule("some rule"))).isTrue();
++        assertThat(Files.readAllBytes(indexFile())).isEqualTo(originalIndex);
++        assertThat(child).exists();
++    }
++
++    private TextFileBasedViolationStore initializeStore(String integrity) {
++        TextFileBasedViolationStore store = new TextFileBasedViolationStore();
++        store.initialize(storeProperties(integrity));
++        return store;
++    }
++
++    private Properties storeProperties(String integrity) {
++        Properties properties = new Properties();
++        properties.setProperty("default.path", storeFolder.toString());
++        properties.setProperty("default.allowStoreCreation", "true");
++        if (integrity != null) {
++            properties.setProperty("default.integrity", integrity);
++        }
++        return properties;
++    }
++
++    private Path writeFile(String fileName, String contents) throws IOException {
++        return Files.write(storeFolder.resolve(fileName), contents.getBytes(UTF_8));
++    }
++
++    private Path createLink(String fileName, Path target, boolean symbolic) throws IOException {
++        return createLink(storeFolder.resolve(fileName), target, symbolic);
++    }
++
++    private Path createLink(Path link, Path target, boolean symbolic) throws IOException {
++        try {
++            return symbolic ? Files.createSymbolicLink(link, target) : Files.createLink(link, target);
++        } catch (UnsupportedOperationException e) {
++            throw new TestAbortedException("File system does not support links", e);
++        } catch (FileSystemException e) {
++            if (symbolic && System.getProperty("os.name").startsWith("Windows")) {
++                throw new TestAbortedException("Creating symbolic links requires privileges on Windows", e);
++            }
++            throw e;
++        }
++    }
++
++    private void writeIndex(String... keyValuePairs) throws IOException {
++        Properties properties = new Properties();
++        for (int index = 0; index < keyValuePairs.length; index += 2) {
++            properties.setProperty(keyValuePairs[index], keyValuePairs[index + 1]);
++        }
++        try (OutputStream output = Files.newOutputStream(indexFile())) {
++            properties.store(output, "");
++        }
++    }
++
++    private Properties readIndex() throws IOException {
++        Properties properties = new Properties();
++        try (InputStream input = Files.newInputStream(indexFile())) {
++            properties.load(input);
++        }
++        return properties;
++    }
++
++    private Path indexFile() {
++        return storeFolder.resolve("stored.rules");
++    }
++
++    private ArchRule rule(String description) {
++        return classes().should().bePublic().as(description);
++    }
++}
+diff --git a/docs/userguide/008_The_Library_API.adoc b/docs/userguide/008_The_Library_API.adoc
+index 10ed830..38c6020 100644
+--- a/docs/userguide/008_The_Library_API.adoc
++++ b/docs/userguide/008_The_Library_API.adoc
+@@ -481,12 +481,29 @@ freeze.store.default.allowStoreCreation=true
+ # can be set to false to forbid updates of the violations stored for frozen rules
+ # default is true
+ freeze.store.default.allowStoreUpdate=false
++
++# can be set to repair to maintain the integrity of the violation store
++# default is ignore (no integrity checks)
++freeze.store.default.integrity=repair
+ ----
+ 
+ This can help in CI environments to prevent misconfiguration:
+ For example, a CI build should probably never create a new the violation store, but operate on
+ an existing one.
+ 
++With `freeze.store.default.integrity=repair`, initialization checks the current index and files on disk,
++even if the same store folder was initialized before.
++Entries with invalid paths, missing files, or files that are not regular files directly within the store folder are removed from the index.
++Entries whose files contain no violations (including files containing only line breaks) are removed together with their files.
++For symbolic links to resolved files, both the link and its target are deleted.
++Entries sharing a file name or referring to the same file, including through symbolic or hard links, are left untouched,
++even if they would otherwise be broken or resolved. Unreferenced files are never cleaned up.
++
++In repair mode, saving an empty list of violations forgets a known rule and deletes its file, including a symbolic link's target.
++If another entry shares that file, only the rule's index entry is removed.
++If the file cannot be deleted, saving fails and the index entry is retained.
++Saving an empty list for an unknown rule does not create an entry or a file.
++
+ As mentioned in <<Overriding configuration>>, these properties can be passed as system properties as needed.
+ For example to allow the creation of the violation store in a specific environment, it is possible to pass the system property via
+ 

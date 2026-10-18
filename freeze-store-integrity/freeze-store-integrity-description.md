@@ -10,14 +10,14 @@ If an entry points to a path that is not a regular file directly within the fold
 
 If an entry is not broken and its file has no violations it is resolved. Files that only contain line breaks are also resolved.
 
-Entries that point to the same file name are shared, even if nothing exists with that name. If multiple entries point to the same regular file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder.
+Entries that point to the same file name are shared, even if nothing exists with that name. If multiple entries point to the same file they are also shared. Including through a symbolic or hard link. Even if that file is outside the folder.
 
-The `TextFileBasedViolationStore` will not touch any shared entries or files that no entry points to, nor anything a broken entry points to. If an entry is shared and anything else it will remain shared.
+The `TextFileBasedViolationStore` will not touch any shared entries or files that no entry points to. If an entry is shared and anything else it will remain shared.
 
 When set to `repair` broken entries will be discarded.
 
 When set to `repair` resolved entries and the file they point to will be discarded. If a resolved entry is a symbolic link the file it points to will be deleted as well.
 
-If using `repair` and saving no violations for a known rule it will forget the rule. Its entry will be removed and its file as well. If its entry is a symbolic link the file it points to will be deleted too. Unless another entry is sharing that file or its entry is broken. In which case only the entry will be removed. Even if it points outside the folder. If using `repair` and saving no violations for an unknown rule nothing will be saved.
+If using `repair` and saving no violations for a known rule it will forget the rule. Its entry will be removed and its file as well. Unless another entry is sharing that file. In which case only the entry will be removed. Even if it points outside the folder. If using `repair` and saving no violations for an unknown rule nothing will be saved.
 
 If it cannot delete the file of a rule it is forgetting it will fail to save and leave the entry.
